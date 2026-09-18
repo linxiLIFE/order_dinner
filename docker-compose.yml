@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: order-dinner-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-order_dinner}
+      POSTGRES_USER: ${POSTGRES_USER:-order_dinner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - order-dinner
+
+  app:
+    build:
+      context: .
+    image: order-dinner:local
+    container_name: order-dinner-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-order_dinner}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-order_dinner}
+    expose:
+      - "3000"
+    networks:
+      - order-dinner
+      - love-web_love-network
+
+networks:
+  order-dinner:
+    name: order-dinner-network
+  love-web_love-network:
+    external: true

@@ -1,0 +1,10 @@
+{
+  "name": "餐厅点单台",
+  "short_name": "点单台",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "lang": "zh-CN",
+  "icons": []
+}

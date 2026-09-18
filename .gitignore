@@ -1,0 +1,15 @@
+node_modules/
+web/dist/
+server/dist/
+release/
+.env
+.env.*
+!.env.example
+android/
+ios/
+*.log
+.DS_Store
+
+# Local deployment material and credentials
+.deploy/
+doc/LIVE_*.md
