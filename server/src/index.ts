@@ -82,6 +82,7 @@ type ItemRow = {
   returned_quantity: number;
   returned_made_quantity: number;
   note: string;
+  option_snapshot: unknown;
   batch_no: number;
   batch_kind: string;
   created_at: string;
@@ -118,6 +119,84 @@ function calculateTotals(items: ItemRow[]): Totals {
   );
 }
 
+function marginPercent(revenueFen: number, costFen: number): number {
+  return revenueFen > 0 ? Math.round(((revenueFen - costFen) / revenueFen) * 10000) / 100 : 0;
+}
+
+type DishOptionGroup = {
+  id: string;
+  name: string;
+  required: boolean;
+  allow_multiple: boolean;
+  options: Array<{ id: string; label: string }>;
+};
+
+async function dishOptionGroups(client: DbClient, dishId: string): Promise<DishOptionGroup[]> {
+  const result = await client.query<DishOptionGroup>(
+    `SELECT g.id, g.name, g.required, g.allow_multiple,
+            COALESCE((
+              SELECT json_agg(json_build_object('id', o.id, 'label', o.label) ORDER BY o.sort_order, o.id)
+              FROM dish_options o
+              WHERE o.group_id = g.id AND o.active = true
+            ), '[]'::json) AS options
+     FROM dish_option_groups g
+     WHERE g.dish_id = $1 AND g.active = true
+     ORDER BY g.sort_order, g.name, g.id`,
+    [dishId]
+  );
+  return result.rows;
+}
+
+function optionSelections(
+  groups: DishOptionGroup[],
+  rawSelections: unknown,
+  customNote: unknown
+): { note: string; snapshot: Array<Record<string, unknown>> } {
+  const requested = Array.isArray(rawSelections) ? rawSelections : [];
+  const snapshot: Array<Record<string, unknown>> = [];
+  const noteParts: string[] = [];
+  for (const group of groups) {
+    const row = requested.find((value) => text((value as { groupId?: unknown })?.groupId) === group.id) as { optionIds?: unknown } | undefined;
+    const optionIds = Array.from(new Set(Array.isArray(row?.optionIds) ? row.optionIds.map((id) => text(id)).filter(Boolean) : []));
+    if (group.required && !optionIds.length) fail(`请选择${group.name}`);
+    if (!group.allow_multiple && optionIds.length > 1) fail(`${group.name}只能选择一项`);
+    const selected = optionIds.map((id) => group.options.find((option) => option.id === id)).filter(Boolean) as Array<{ id: string; label: string }>;
+    if (selected.length !== optionIds.length) fail(`${group.name}包含无效选项`);
+    if (selected.length) {
+      noteParts.push(`${group.name}：${selected.map((option) => option.label).join("、")}`);
+      snapshot.push({ groupId: group.id, groupName: group.name, optionIds, labels: selected.map((option) => option.label) });
+    }
+  }
+  const note = text(customNote).slice(0, 300);
+  if (note) noteParts.push(`备注：${note}`);
+  return { note: noteParts.join("；").slice(0, 500), snapshot };
+}
+
+async function replaceDishOptionGroups(client: DbClient, dishId: string, rawGroups: unknown): Promise<void> {
+  const groups = Array.isArray(rawGroups) ? rawGroups.slice(0, 20) : [];
+  await client.query(`DELETE FROM dish_option_groups WHERE dish_id = $1`, [dishId]);
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+    const rawGroup = groups[groupIndex] as { name?: unknown; required?: unknown; allowMultiple?: unknown; options?: unknown };
+    const name = text(rawGroup?.name).slice(0, 40);
+    if (!name) fail("备注问题名称不能为空");
+    const rawOptions = Array.isArray(rawGroup?.options) ? rawGroup.options.slice(0, 30) : [];
+    const labels = Array.from(new Set(rawOptions.map((value) => text((value as { label?: unknown })?.label).slice(0, 40)).filter(Boolean)));
+    if (!labels.length) fail(`“${name}”至少需要一个选项`);
+    if (Boolean(rawGroup?.required) && !labels.length) fail(`“${name}”至少需要一个选项`);
+    const group = await client.query<{ id: string }>(
+      `INSERT INTO dish_option_groups (dish_id, name, required, allow_multiple, sort_order)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [dishId, name, Boolean(rawGroup?.required), Boolean(rawGroup?.allowMultiple), groupIndex]
+    );
+    for (let optionIndex = 0; optionIndex < labels.length; optionIndex += 1) {
+      await client.query(
+        `INSERT INTO dish_options (group_id, label, sort_order) VALUES ($1, $2, $3)`,
+        [group.rows[0].id, labels[optionIndex], optionIndex]
+      );
+    }
+  }
+}
+
 async function orderItems(client: DbClient, orderId: string): Promise<ItemRow[]> {
   const result = await client.query<ItemRow>(
     `SELECT oi.*, ob.batch_no, ob.kind AS batch_kind
@@ -135,6 +214,7 @@ async function orderDetails(client: DbClient, orderId: string): Promise<Record<s
     id: string;
     table_id: string | null;
     table_number: number | null;
+    table_name: string | null;
     customer_id: string | null;
     customer_name: string | null;
     customer_phone: string | null;
@@ -147,8 +227,12 @@ async function orderDetails(client: DbClient, orderId: string): Promise<Record<s
     parent_order_id: string | null;
     opened_at: string;
     settled_at: string | null;
+    ended_at: string | null;
+    end_reason: string;
+    order_note: string;
   }>(
-    `SELECT o.*, t.number AS table_number, c.name AS customer_name, c.phone AS customer_phone,
+    `SELECT o.*, t.number AS table_number, t.name AS table_name,
+            c.name AS customer_name, c.phone AS customer_phone,
             c.points_balance
      FROM orders o
      LEFT JOIN restaurant_tables t ON t.id = o.table_id
@@ -160,10 +244,39 @@ async function orderDetails(client: DbClient, orderId: string): Promise<Record<s
   if (!order) fail("订单不存在", 404);
   const items = await orderItems(client, orderId);
   const totals = calculateTotals(items);
+  const settlementResult = await client.query(
+    `SELECT s.id, s.version, s.gross_fen, s.gift_fen, s.return_fen,
+            s.manual_discount_fen, s.points_discount_fen, s.received_fen,
+            s.payment_method, s.earned_points, s.redeemed_points, s.reason,
+            s.status, s.settled_at, e.name AS operator_name
+     FROM settlements s LEFT JOIN employees e ON e.id = s.operator_id
+     WHERE s.order_id = $1 ORDER BY s.version DESC, s.settled_at DESC`,
+    [orderId]
+  );
+  const activeSettlement = settlementResult.rows.find((row) => row.status === "ACTIVE") as {
+    gross_fen?: number;
+    gift_fen?: number;
+    return_fen?: number;
+    manual_discount_fen?: number;
+    points_discount_fen?: number;
+  } | undefined;
+  const settledRevenueFen = activeSettlement
+    ? Number(activeSettlement.gross_fen || 0)
+      - Number(activeSettlement.gift_fen || 0)
+      - Number(activeSettlement.return_fen || 0)
+      - Number(activeSettlement.manual_discount_fen || 0)
+      - Number(activeSettlement.points_discount_fen || 0)
+    : 0;
+  const revenueFen = order.status === "OPEN"
+    ? totals.subtotalFen
+    : order.status === "SETTLED"
+      ? settledRevenueFen
+      : null;
   return {
     id: order.id,
     tableId: order.table_id,
     tableNumber: order.table_number,
+    tableName: order.table_name,
     customer: order.customer_id
       ? { id: order.customer_id, name: order.customer_name, phone: maskPhone(order.customer_phone), points: order.points_balance }
       : { id: null, name: order.guest_label || "散客", phone: null, points: 0 },
@@ -174,6 +287,9 @@ async function orderDetails(client: DbClient, orderId: string): Promise<Record<s
     parentOrderId: order.parent_order_id,
     openedAt: order.opened_at,
     settledAt: order.settled_at,
+    endedAt: order.ended_at,
+    endReason: order.end_reason,
+    orderNote: order.order_note,
     items: items.map((item) => ({
       id: item.id,
       dishId: item.dish_id,
@@ -187,11 +303,16 @@ async function orderDetails(client: DbClient, orderId: string): Promise<Record<s
       returnedMadeQuantity: item.returned_made_quantity,
       availableQuantity: Math.max(0, item.quantity - item.gifted_quantity - item.returned_quantity),
       note: item.note,
+      optionSnapshot: item.option_snapshot || [],
       batchNo: item.batch_no,
       batchKind: item.batch_kind,
       createdAt: item.created_at
     })),
-    totals
+    totals,
+    revenueFen,
+    grossProfitFen: revenueFen === null ? null : revenueFen - totals.costFen,
+    grossMarginPercent: revenueFen === null ? null : marginPercent(revenueFen, totals.costFen),
+    settlements: settlementResult.rows
   };
 }
 
@@ -273,18 +394,28 @@ async function currentOrder(client: DbClient, orderId: string, lock = false) {
 }
 
 function printOrderPayload(order: Record<string, unknown>, items: Array<Record<string, unknown>>, title: string) {
+  const createdAt = new Date().toISOString();
   return {
     title,
     orderId: order.id,
     tableNumber: order.tableNumber,
+    tableName: order.tableName,
     peopleCount: order.peopleCount,
     customer: (order.customer as { name?: string; phone?: string | null } | undefined)?.name || "散客",
     phone: (order.customer as { phone?: string | null } | undefined)?.phone || null,
-    createdAt: new Date().toISOString(),
+    orderNote: text(order.orderNote),
+    openedAt: order.openedAt || null,
+    settledAt: order.settledAt || null,
+    createdAt,
+    layout: {
+      dishNameSize: "LARGE",
+      showItemPrice: title === "结账小票"
+    },
     items: items.map((item) => ({
       name: item.name,
       quantity: item.quantity,
       unit: item.unit,
+      priceFen: Number(item.priceFen ?? item.price_fen ?? 0),
       note: item.note || ""
     }))
   };
@@ -340,7 +471,7 @@ app.get("/api/auth/me", requireAuth, (req: AuthenticatedRequest, res) => {
 app.get("/api/tables", requireAuth, async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT t.id, t.number, t.seats, t.status, t.sort_order,
+      `SELECT t.id, t.number, t.name, t.seats, t.status, t.sort_order,
               o.id AS order_id, o.people_count, o.opened_at,
               c.id AS customer_id, c.name AS customer_name, c.phone AS customer_phone,
               COALESCE((SELECT SUM((quantity - returned_quantity) * price_fen - gifted_quantity * price_fen)
@@ -353,6 +484,7 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
     res.json({ tables: result.rows.map((row) => ({
       id: row.id,
       number: row.number,
+      name: row.name,
       seats: row.seats,
       status: row.status,
       order: row.order_id
@@ -372,6 +504,27 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
   }
 });
 
+app.post("/api/tables", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const number = positiveInt(req.body?.number, 0);
+    const seats = positiveInt(req.body?.seats, 4);
+    if (!number) fail("桌号必须是大于零的整数");
+    const name = text(req.body?.name) || `${number}号桌`;
+    const existing = await pool.query(`SELECT 1 FROM restaurant_tables WHERE number = $1`, [number]);
+    if (existing.rows[0]) fail("桌号已存在");
+    const result = await pool.query<{ id: string }>(
+      `INSERT INTO restaurant_tables (number, name, seats, sort_order)
+       VALUES ($1, $2, $3, $1) RETURNING id`,
+      [number, name, seats]
+    );
+    await logOperation(pool, user.id, "CREATE_TABLE", "TABLE", result.rows[0].id, { number, name, seats });
+    res.status(201).json({ tableId: result.rows[0].id });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
 app.post("/api/tables/:tableId/open", requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const user = currentUser(req);
@@ -380,8 +533,8 @@ app.post("/api/tables/:tableId/open", requireAuth, async (req: AuthenticatedRequ
     const response = await withTransaction(async (client) => {
       const previous = await readIdempotent(client, `open:${tableId}`, requestKey);
       if (previous) return previous;
-      const tableResult = await client.query<{ id: string; number: number; status: string }>(
-        `SELECT id, number, status FROM restaurant_tables WHERE id = $1 FOR UPDATE`,
+      const tableResult = await client.query<{ id: string; number: number; name: string; status: string }>(
+        `SELECT id, number, name, status FROM restaurant_tables WHERE id = $1 FOR UPDATE`,
         [tableId]
       );
       const table = tableResult.rows[0];
@@ -402,10 +555,10 @@ app.post("/api/tables/:tableId/open", requireAuth, async (req: AuthenticatedRequ
       const order = await client.query<{ id: string }>(
         `INSERT INTO orders (table_id, customer_id, guest_label, people_count, created_by)
          VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-        [tableId, customerId, customerId ? null : "散客", positiveInt(req.body?.people, 2), user.id]
+        [tableId, customerId, customerId ? null : (customerName || "散客"), positiveInt(req.body?.people, 2), user.id]
       );
       await client.query(`UPDATE restaurant_tables SET status = 'OCCUPIED', updated_at = now() WHERE id = $1`, [tableId]);
-      await logOperation(client, user.id, "OPEN_TABLE", "ORDER", order.rows[0].id, { tableId, tableNumber: table.number });
+      await logOperation(client, user.id, "OPEN_TABLE", "ORDER", order.rows[0].id, { tableId, tableNumber: table.number, tableName: table.name });
       const result = await orderDetails(client, order.rows[0].id);
       await saveIdempotent(client, `open:${tableId}`, requestKey, user.id, result);
       return result;
@@ -416,9 +569,185 @@ app.post("/api/tables/:tableId/open", requireAuth, async (req: AuthenticatedRequ
   }
 });
 
+app.delete("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const tableId = routeParam(req, "tableId");
+    await withTransaction(async (client) => {
+      const table = await client.query<{ id: string; number: number; name: string; status: string }>(
+        `SELECT id, number, name, status FROM restaurant_tables WHERE id = $1 FOR UPDATE`,
+        [tableId]
+      );
+      if (!table.rows[0]) fail("桌台不存在", 404);
+      if (table.rows[0].status === "OCCUPIED") fail("使用中的桌台不能删除，请先结束当前账单");
+      const history = await client.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM orders WHERE table_id = $1`,
+        [tableId]
+      );
+      if (Number(history.rows[0]?.count || 0) > 0) fail("已有订单记录的桌台不能删除，可改名或停用");
+      await client.query(`DELETE FROM restaurant_tables WHERE id = $1`, [tableId]);
+      await logOperation(client, user.id, "DELETE_TABLE", "TABLE", tableId, { number: table.rows[0].number, name: table.rows[0].name });
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.get("/api/orders/search", requireAuth, async (req, res) => {
+  try {
+    const params: unknown[] = [];
+    const conditions: string[] = [];
+    const add = (value: unknown) => {
+      params.push(value);
+      return `$${params.length}`;
+    };
+    const from = text(req.query.from);
+    const to = text(req.query.to);
+    const status = text(req.query.status);
+    const keyword = text(req.query.q);
+    const paymentMethod = text(req.query.paymentMethod);
+    const minFenText = text(req.query.minFen);
+    const maxFenText = text(req.query.maxFen);
+    if (from) conditions.push(`o.business_date >= ${add(from)}::date`);
+    if (to) conditions.push(`o.business_date <= ${add(to)}::date`);
+    if (["OPEN", "SETTLED", "REVERSED", "VOID"].includes(status)) conditions.push(`o.status = ${add(status)}`);
+    if (paymentMethod) conditions.push(`COALESCE(last_settlement.payment_method, '') = ${add(paymentMethod)}`);
+    if (keyword) {
+      const pattern = add(`%${keyword}%`);
+      conditions.push(`(
+        o.id::text ILIKE ${pattern}
+        OR COALESCE(c.name, o.guest_label, '') ILIKE ${pattern}
+        OR COALESCE(c.phone, '') ILIKE ${pattern}
+        OR COALESCE(t.name, '') ILIKE ${pattern}
+        OR COALESCE(t.number::text, '') ILIKE ${pattern}
+      )`);
+    }
+    if (minFenText) {
+      const minFen = Number(minFenText);
+      if (!Number.isFinite(minFen) || minFen < 0) fail("最低金额格式不正确");
+      conditions.push(`(
+        CASE WHEN o.status = 'SETTLED' THEN COALESCE(last_settlement.gross_fen - last_settlement.gift_fen - last_settlement.return_fen - last_settlement.manual_discount_fen - last_settlement.points_discount_fen, 0)
+             WHEN o.status = 'OPEN' THEN current_total.current_fen ELSE 0 END
+      ) >= ${add(Math.round(minFen))}`);
+    }
+    if (maxFenText) {
+      const maxFen = Number(maxFenText);
+      if (!Number.isFinite(maxFen) || maxFen < 0) fail("最高金额格式不正确");
+      conditions.push(`(
+        CASE WHEN o.status = 'SETTLED' THEN COALESCE(last_settlement.gross_fen - last_settlement.gift_fen - last_settlement.return_fen - last_settlement.manual_discount_fen - last_settlement.points_discount_fen, 0)
+             WHEN o.status = 'OPEN' THEN current_total.current_fen ELSE 0 END
+      ) <= ${add(Math.round(maxFen))}`);
+    }
+    const result = await pool.query(
+      `SELECT o.id, o.table_id, t.number AS table_number, t.name AS table_name,
+              o.customer_id, COALESCE(c.name, o.guest_label, '散客') AS customer_name,
+              c.phone AS customer_phone, o.people_count, o.status, o.business_date,
+              o.opened_at, o.settled_at, o.ended_at, o.end_reason,
+              CASE WHEN o.status = 'SETTLED' THEN COALESCE(last_settlement.gross_fen - last_settlement.gift_fen - last_settlement.return_fen - last_settlement.manual_discount_fen - last_settlement.points_discount_fen, 0)
+                   WHEN o.status = 'OPEN' THEN current_total.current_fen ELSE 0 END::int AS amount_fen,
+              CASE WHEN o.status = 'SETTLED' THEN COALESCE(last_settlement.gross_fen - last_settlement.gift_fen - last_settlement.return_fen - last_settlement.manual_discount_fen - last_settlement.points_discount_fen, 0)
+                   WHEN o.status = 'OPEN' THEN current_total.current_fen ELSE NULL END::int AS revenue_fen,
+              COALESCE(cost_total.cost_fen, 0)::int AS cost_fen,
+              last_settlement.payment_method, last_settlement.status AS settlement_status,
+              last_settlement.id AS settlement_id,
+              COALESCE(item_total.item_count, 0)::int AS item_count
+       FROM orders o
+       LEFT JOIN restaurant_tables t ON t.id = o.table_id
+       LEFT JOIN customers c ON c.id = o.customer_id
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(SUM(GREATEST(0, (oi.quantity - oi.returned_quantity) * oi.price_fen - oi.gifted_quantity * oi.price_fen)), 0)::int AS current_fen
+         FROM order_items oi WHERE oi.order_id = o.id
+       ) current_total ON true
+       LEFT JOIN LATERAL (
+         SELECT s.id, s.received_fen, s.gross_fen, s.gift_fen, s.return_fen,
+                s.manual_discount_fen, s.points_discount_fen, s.payment_method, s.status
+         FROM settlements s WHERE s.order_id = o.id AND s.status = 'ACTIVE'
+         ORDER BY s.version DESC, s.settled_at DESC LIMIT 1
+       ) last_settlement ON true
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(SUM((oi.quantity - oi.returned_quantity + oi.returned_made_quantity) * oi.cost_fen), 0) AS cost_fen
+         FROM order_items oi WHERE oi.order_id = o.id
+       ) cost_total ON true
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(SUM(oi.quantity), 0) AS item_count
+         FROM order_items oi WHERE oi.order_id = o.id
+       ) item_total ON true
+       ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+       ORDER BY o.opened_at DESC LIMIT 200`,
+      params
+    );
+    res.json({
+      orders: result.rows.map((row) => ({
+        ...row,
+        customer_phone: maskPhone(row.customer_phone),
+        amount_fen: Number(row.amount_fen || 0),
+        item_count: Number(row.item_count || 0),
+        revenue_fen: row.revenue_fen === null || row.revenue_fen === undefined ? null : Number(row.revenue_fen),
+        cost_fen: Number(row.cost_fen || 0),
+        gross_profit_fen: row.revenue_fen === null || row.revenue_fen === undefined
+          ? null
+          : Number(row.revenue_fen || 0) - Number(row.cost_fen || 0),
+        gross_margin_percent: row.revenue_fen === null || row.revenue_fen === undefined
+          ? null
+          : marginPercent(Number(row.revenue_fen || 0), Number(row.cost_fen || 0))
+      }))
+    });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
 app.get("/api/orders/:orderId", requireAuth, async (req, res) => {
   try {
     res.json({ order: await orderDetails(pool, routeParam(req, "orderId")) });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.patch("/api/orders/:orderId/note", requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const orderId = routeParam(req, "orderId");
+    const note = text(req.body?.note).slice(0, 500);
+    const response = await withTransaction(async (client) => {
+      const order = await currentOrder(client, orderId, true);
+      if (order.status !== "OPEN") fail("只有进行中的订单可以修改备注");
+      await client.query(`UPDATE orders SET order_note = $1, updated_at = now() WHERE id = $2`, [note, orderId]);
+      await logOperation(client, user.id, "UPDATE_ORDER_NOTE", "ORDER", orderId, { note });
+      return orderDetails(client, orderId);
+    });
+    res.json({ order: response });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.post("/api/orders/:orderId/end", requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const orderId = routeParam(req, "orderId");
+    const requestKey = text(req.body?.idempotencyKey) || randomKey();
+    const response = await withTransaction(async (client) => {
+      const previous = await readIdempotent(client, `end:${orderId}`, requestKey);
+      if (previous) return previous;
+      const order = await currentOrder(client, orderId, true);
+      if (order.status !== "OPEN") fail("订单已结束，请刷新后操作");
+      await client.query(
+        `UPDATE orders SET status = 'VOID', ended_at = now(), ended_by = $1, end_reason = $2, updated_at = now()
+         WHERE id = $3`,
+        [user.id, text(req.body?.reason) || "未结账直接结束", orderId]
+      );
+      if (order.table_id) {
+        await client.query(`UPDATE restaurant_tables SET status = 'AVAILABLE', updated_at = now() WHERE id = $1`, [order.table_id]);
+      }
+      await logOperation(client, user.id, "END_ORDER_WITHOUT_PAYMENT", "ORDER", orderId, { reason: text(req.body?.reason) });
+      const details = await orderDetails(client, orderId);
+      await saveIdempotent(client, `end:${orderId}`, requestKey, user.id, details);
+      return details;
+    });
+    res.json({ order: response });
   } catch (error) {
     publicError(res, error);
   }
@@ -462,14 +791,15 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
         );
         const dish = dishResult.rows[0];
         if (!dish) fail("菜品不存在或已停售");
-        const note = text(raw?.note);
+        const groups = await dishOptionGroups(client, dish.id);
+        const options = optionSelections(groups, raw?.options, raw?.note);
         const item = await client.query<{ id: string }>(
           `INSERT INTO order_items
-           (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, quantity, note)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
-          [batch.rows[0].id, orderId, dish.id, dish.name, dish.category_name || "未分类", dish.unit, dish.price_fen, dish.cost_fen, quantity, note]
+           (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, quantity, note, option_snapshot)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb) RETURNING id`,
+          [batch.rows[0].id, orderId, dish.id, dish.name, dish.category_name || "未分类", dish.unit, dish.price_fen, dish.cost_fen, quantity, options.note, JSON.stringify(options.snapshot)]
         );
-        inserted.push({ id: item.rows[0].id, name: dish.name, unit: dish.unit, quantity, note });
+        inserted.push({ id: item.rows[0].id, name: dish.name, unit: dish.unit, priceFen: dish.price_fen, quantity, note: options.note });
       }
       await client.query(`UPDATE orders SET order_version = order_version + 1, updated_at = now() WHERE id = $1`, [orderId]);
       const details = await orderDetails(client, orderId);
@@ -478,7 +808,7 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
         orderId,
         batch.rows[0].id,
         "KITCHEN",
-        printOrderPayload(details, inserted, "备菜单"),
+        { ...printOrderPayload(details, inserted, "备菜单"), batchNo: batch.rows[0].batch_no },
         2
       );
       await logOperation(client, user.id, "ADD_ITEMS", "ORDER", orderId, { batchNo: batch.rows[0].batch_no, items: inserted });
@@ -553,10 +883,18 @@ app.post("/api/orders/:orderId/items/:itemId/return", requireAuth, async (req: A
       const returnItem = {
         name: item.dish_name,
         unit: item.unit,
+        priceFen: item.price_fen,
         quantity,
         note: `${made ? "已制作" : "未制作"}${text(req.body?.reason) ? `，${text(req.body.reason)}` : ""}`
       };
-      await makePrintJobs(client, orderId, batch.rows[0].id, "RETURN", printOrderPayload(details, [returnItem], "退菜单"), 2);
+      await makePrintJobs(
+        client,
+        orderId,
+        batch.rows[0].id,
+        "RETURN",
+        { ...printOrderPayload(details, [returnItem], "退菜单"), batchNo: batch.rows[0].batch_no },
+        2
+      );
       await logOperation(client, user.id, "RETURN_ITEM", "ORDER_ITEM", itemId, {
         orderId,
         quantity,
@@ -595,7 +933,9 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
         if (targetReceived > totals.subtotalFen) fail("目标实收不能高于应收");
         manualDiscountFen = totals.subtotalFen - targetReceived;
       }
-      const requestedPoints = cents(req.body?.pointsToRedeem);
+      const usePoints = req.body?.usePoints === undefined
+        ? cents(req.body?.pointsToRedeem) > 0
+        : Boolean(req.body.usePoints);
       let customerBalance = 0;
       if (order.customer_id) {
         const customerResult = await client.query<{ points_balance: number }>(
@@ -603,13 +943,13 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
           [order.customer_id]
         );
         customerBalance = customerResult.rows[0]?.points_balance ?? 0;
-      } else if (requestedPoints > 0) {
+      } else if (usePoints) {
         fail("散客不能使用积分");
       }
-      if (requestedPoints % redeemPoints !== 0) fail(`积分抵扣必须按 ${redeemPoints} 分使用`);
-      const maxPoints = Math.floor(Math.max(0, totals.subtotalFen - manualDiscountFen) / redeemFen) * redeemPoints;
-      if (requestedPoints > customerBalance) fail("可用积分不足");
-      if (requestedPoints > maxPoints) fail("积分抵扣不能超过当前应收");
+      if (usePoints && !enabled) fail("积分功能未开启");
+      const maxByBalance = Math.floor(customerBalance / redeemPoints) * redeemPoints;
+      const maxByAmount = Math.floor(Math.max(0, totals.subtotalFen - manualDiscountFen) / redeemFen) * redeemPoints;
+      const requestedPoints = usePoints ? Math.min(maxByBalance, maxByAmount) : 0;
       const pointsDiscountFen = Math.floor(requestedPoints / redeemPoints) * redeemFen;
       const receivedFen = totals.subtotalFen - manualDiscountFen - pointsDiscountFen;
       const paidFen = cents(req.body?.receivedFen, receivedFen);
@@ -755,9 +1095,11 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
       }
       const newOrder = await client.query<{ id: string }>(
         `INSERT INTO orders
-         (table_id, customer_id, guest_label, people_count, status, parent_order_id, created_by, business_date)
-         VALUES ($1, $2, $3, $4, 'OPEN', $5, $6, $7) RETURNING id`,
-        [original.table_id, original.customer_id, original.guest_label, original.people_count, orderId, user.id, original.business_date]
+         (table_id, customer_id, guest_label, people_count, status, parent_order_id, created_by, business_date, order_note)
+         SELECT table_id, customer_id, guest_label, people_count, 'OPEN', $1, $2, business_date, order_note
+         FROM orders WHERE id = $3
+         RETURNING id`,
+        [orderId, user.id, orderId]
       );
       const newOrderId = newOrder.rows[0].id;
       const batches = await client.query<{ id: string; batch_no: number; kind: string }>(
@@ -780,10 +1122,10 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
         await client.query(
           `INSERT INTO order_items
            (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, quantity,
-            gifted_quantity, returned_quantity, returned_made_quantity, note)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+            gifted_quantity, returned_quantity, returned_made_quantity, note, option_snapshot)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb)`,
           [copiedBatchId, newOrderId, item.dish_id, item.dish_name, item.category_name, item.unit, item.price_fen, item.cost_fen,
-            item.quantity, item.gifted_quantity, item.returned_quantity, item.returned_made_quantity, item.note]
+            item.quantity, item.gifted_quantity, item.returned_quantity, item.returned_made_quantity, item.note, JSON.stringify(item.option_snapshot || [])]
         );
       }
       if (original.table_id) {
@@ -823,6 +1165,40 @@ app.post("/api/categories", requireAuth, requireRole("OWNER"), async (req: Authe
   }
 });
 
+app.patch("/api/categories/:categoryId", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const categoryId = routeParam(req, "categoryId");
+    const name = text(req.body?.name);
+    if (!name) fail("分类名称不能为空");
+    const result = await pool.query<{ id: string; name: string }>(
+      `UPDATE categories SET name = $1, updated_at = now() WHERE id = $2 AND active = true RETURNING id, name`,
+      [name, categoryId]
+    );
+    if (!result.rows[0]) fail("分类不存在", 404);
+    await logOperation(pool, user.id, "UPDATE_CATEGORY", "CATEGORY", categoryId, { name });
+    res.json({ category: result.rows[0] });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.delete("/api/categories/:categoryId", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const categoryId = routeParam(req, "categoryId");
+    const result = await pool.query<{ id: string }>(
+      `UPDATE categories SET active = false, updated_at = now() WHERE id = $1 AND active = true RETURNING id`,
+      [categoryId]
+    );
+    if (!result.rows[0]) fail("分类不存在", 404);
+    await logOperation(pool, user.id, "ARCHIVE_CATEGORY", "CATEGORY", categoryId);
+    res.json({ ok: true });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
 app.get("/api/dishes", requireAuth, async (req, res) => {
   try {
     const query = text(req.query.q);
@@ -839,13 +1215,35 @@ app.get("/api/dishes", requireAuth, async (req, res) => {
     }
     const result = await pool.query(
       `SELECT d.id, d.category_id, c.name AS category_name, d.name, d.pinyin, d.unit,
-              d.price_fen, d.cost_fen, d.image_url, d.on_sale, d.sort_order
+              d.price_fen, d.cost_fen, d.image_url, d.on_sale, d.sort_order,
+              CASE WHEN d.price_fen > 0
+                   THEN ROUND(((d.price_fen - d.cost_fen)::numeric / d.price_fen) * 10000) / 100
+                   ELSE 0 END AS gross_margin_percent,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'id', g.id,
+                  'name', g.name,
+                  'required', g.required,
+                  'allowMultiple', g.allow_multiple,
+                  'options', COALESCE((
+                    SELECT json_agg(json_build_object('id', o.id, 'label', o.label) ORDER BY o.sort_order, o.id)
+                    FROM dish_options o
+                    WHERE o.group_id = g.id AND o.active = true
+                  ), '[]'::json)
+                ) ORDER BY g.sort_order, g.name, g.id)
+                FROM dish_option_groups g
+                WHERE g.dish_id = d.id AND g.active = true
+              ), '[]'::json) AS option_groups
        FROM dishes d LEFT JOIN categories c ON c.id = d.category_id
        WHERE ${conditions.join(" AND ")}
        ORDER BY c.sort_order NULLS LAST, d.sort_order, d.name`,
       params
     );
-    res.json({ dishes: result.rows });
+    res.json({ dishes: result.rows.map((row) => ({
+      ...row,
+      gross_margin_percent: Number(row.gross_margin_percent || 0),
+      option_groups: row.option_groups || []
+    })) });
   } catch (error) {
     publicError(res, error);
   }
@@ -887,7 +1285,11 @@ app.patch("/api/dishes/:dishId", requireAuth, requireRole("OWNER"), async (req: 
       values.push(value);
       fields.push(`${column} = $${values.length}`);
     };
-    if (req.body?.name !== undefined) add("name", text(req.body.name));
+    if (req.body?.name !== undefined) {
+      const name = text(req.body.name);
+      if (!name) fail("菜品名称不能为空");
+      add("name", name);
+    }
     if (req.body?.categoryId !== undefined) add("category_id", text(req.body.categoryId) || null);
     if (req.body?.pinyin !== undefined) add("pinyin", text(req.body.pinyin));
     if (req.body?.unit !== undefined) add("unit", text(req.body.unit) || "份");
@@ -919,6 +1321,23 @@ app.delete("/api/dishes/:dishId", requireAuth, requireRole("OWNER"), async (req:
   }
 });
 
+app.put("/api/dishes/:dishId/options", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const dishId = routeParam(req, "dishId");
+    await withTransaction(async (client) => {
+      const dish = await client.query(`SELECT id FROM dishes WHERE id = $1 FOR UPDATE`, [dishId]);
+      if (!dish.rows[0]) fail("菜品不存在", 404);
+      await replaceDishOptionGroups(client, dishId, req.body?.groups ?? req.body?.optionGroups);
+      await client.query(`UPDATE dishes SET updated_at = now() WHERE id = $1`, [dishId]);
+      await logOperation(client, user.id, "UPDATE_DISH_OPTIONS", "DISH", dishId, { groups: req.body?.groups ?? req.body?.optionGroups ?? [] });
+    });
+    res.json({ ok: true, groups: await dishOptionGroups(pool, dishId) });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
 app.patch("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
   try {
     const user = currentUser(req);
@@ -929,6 +1348,11 @@ app.patch("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req:
       fields.push(`${column} = $${values.length}`);
     };
     if (req.body?.number !== undefined) add("number", positiveInt(req.body.number));
+    if (req.body?.name !== undefined) {
+      const tableName = text(req.body.name);
+      if (!tableName) fail("桌台名称不能为空");
+      add("name", tableName);
+    }
     if (req.body?.seats !== undefined) add("seats", positiveInt(req.body.seats, 4));
     if (req.body?.status !== undefined && ["AVAILABLE", "DISABLED"].includes(text(req.body.status))) add("status", text(req.body.status));
     if (!fields.length) fail("没有要修改的内容");
@@ -999,7 +1423,7 @@ async function statsData(from: string, to: string) {
               COALESCE(SUM(oi.returned_made_quantity * oi.cost_fen), 0) AS loss_fen
        FROM active a JOIN order_items oi ON oi.order_id = a.order_id GROUP BY a.order_id
      )
-     SELECT COALESCE(SUM(a.received_fen), 0) AS revenue_fen,
+     SELECT COALESCE(SUM(a.gross_fen - a.gift_fen - a.return_fen - a.manual_discount_fen - a.points_discount_fen), 0) AS revenue_fen,
             COUNT(*)::int AS order_count,
             COALESCE(SUM(a.people_count), 0)::int AS people_count,
             COALESCE(SUM(a.gross_fen - a.gift_fen - a.return_fen - a.manual_discount_fen - a.points_discount_fen), 0) AS due_fen,
@@ -1146,6 +1570,8 @@ app.post("/api/employees", requireAuth, requireRole("OWNER"), async (req: Authen
     const password = text(req.body?.password);
     const name = text(req.body?.name) || username;
     if (!username || password.length < 8) fail("收银员账号和至少 8 位密码不能为空");
+    const existing = await pool.query(`SELECT 1 FROM employees WHERE username = $1`, [username]);
+    if (existing.rows[0]) fail("员工账号已存在");
     const result = await pool.query<{ id: string }>(
       `INSERT INTO employees (username, name, password_hash, role) VALUES ($1, $2, $3, 'CASHIER') RETURNING id`,
       [username, name, await bcrypt.hash(password, 12)]
@@ -1185,15 +1611,26 @@ app.patch("/api/employees/:employeeId", requireAuth, requireRole("OWNER"), async
 
 app.get("/api/print-jobs", requireAuth, async (req, res) => {
   try {
-    const status = ["PENDING", "CLAIMED", "SENT", "FAILED", "NEEDS_CHECK"].includes(text(req.query.status))
-      ? text(req.query.status)
-      : "PENDING";
+    const requestedStatus = text(req.query.status);
+    const status = requestedStatus === "ALL"
+      ? "ALL"
+      : ["PENDING", "CLAIMED", "SENT", "FAILED", "NEEDS_CHECK"].includes(requestedStatus)
+        ? requestedStatus
+        : "PENDING";
     const limit = Math.min(100, Math.max(1, positiveInt(req.query.limit, 30)));
+    const params: unknown[] = [];
+    const conditions = [] as string[];
+    if (status !== "ALL") {
+      params.push(status);
+      conditions.push(`pj.status = $${params.length}`);
+    }
+    params.push(limit);
     const result = await pool.query(
-      `SELECT id, order_id, batch_id, kind, copy_no, payload, status, device_id, attempts,
-              last_error, claimed_at, sent_at, created_at
-       FROM print_jobs WHERE status = $1 ORDER BY created_at LIMIT $2`,
-      [status, limit]
+      `SELECT pj.id, pj.order_id, pj.batch_id, pj.kind, pj.copy_no, pj.payload, pj.status, pj.device_id, pj.attempts,
+              pj.last_error, pj.claimed_at, pj.sent_at, pj.created_at
+       FROM print_jobs pj ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+       ORDER BY pj.created_at DESC LIMIT $${params.length}`,
+      params
     );
     res.json({ jobs: result.rows });
   } catch (error) {
@@ -1249,6 +1686,48 @@ app.post("/api/print-jobs/:jobId/retry", requireAuth, async (req, res) => {
     );
     if (!result.rows[0]) fail("当前打印任务不可重试");
     res.json({ ok: true });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.post("/api/print-jobs/:jobId/reprint", requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const jobId = routeParam(req, "jobId");
+    const result = await withTransaction(async (client) => {
+      const originalResult = await client.query<{
+        id: string;
+        order_id: string | null;
+        batch_id: string | null;
+        kind: "KITCHEN" | "RETURN" | "RECEIPT";
+        copy_no: number;
+        payload: Record<string, unknown>;
+        status: string;
+      }>(
+        `SELECT id, order_id, batch_id, kind, copy_no, payload, status
+         FROM print_jobs WHERE id = $1 FOR UPDATE`,
+        [jobId]
+      );
+      const original = originalResult.rows[0];
+      if (!original) fail("打印任务不存在", 404);
+      if (!["SENT", "FAILED", "NEEDS_CHECK"].includes(original.status)) fail("当前打印任务还不能补打");
+      const payload = {
+        ...original.payload,
+        title: `${text(original.payload?.title) || "打印任务"}（补打）`,
+        reprintOf: original.id,
+        createdAt: new Date().toISOString(),
+        copyNo: original.copy_no
+      };
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO print_jobs (order_id, batch_id, kind, copy_no, payload)
+         VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id`,
+        [original.order_id, original.batch_id, original.kind, original.copy_no, JSON.stringify(payload)]
+      );
+      await logOperation(client, user.id, "REPRINT_JOB", "PRINT_JOB", inserted.rows[0].id, { originalJobId: original.id });
+      return { jobId: inserted.rows[0].id };
+    });
+    res.status(201).json(result);
   } catch (error) {
     publicError(res, error);
   }

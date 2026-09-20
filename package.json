@@ -10,7 +10,7 @@
     "dev:api": "tsx watch server/src/index.ts",
     "dev:web": "vite --config web/vite.config.ts",
     "build": "npm run build:web && npm run build:server",
-    "build:web": "vite build --config web/vite.config.ts",
+    "build:web": "tsc -p tsconfig.json --noEmit && vite build --config web/vite.config.ts",
     "build:server": "tsc -p server/tsconfig.json",
     "start": "node server/dist/index.js",
     "test": "npm run build && node --test test/*.test.mjs",

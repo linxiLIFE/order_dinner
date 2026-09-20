@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS employees (
 CREATE TABLE IF NOT EXISTS restaurant_tables (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   number integer NOT NULL UNIQUE CHECK (number > 0),
+  name text NOT NULL,
   seats integer NOT NULL DEFAULT 4 CHECK (seats > 0),
   status text NOT NULL DEFAULT 'AVAILABLE' CHECK (status IN ('AVAILABLE', 'OCCUPIED', 'DISABLED')),
   sort_order integer NOT NULL DEFAULT 0,
@@ -60,6 +61,32 @@ CREATE TABLE IF NOT EXISTS dishes (
 
 CREATE INDEX IF NOT EXISTS dishes_search_idx ON dishes (name, pinyin);
 
+CREATE TABLE IF NOT EXISTS dish_option_groups (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  dish_id uuid NOT NULL REFERENCES dishes(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  required boolean NOT NULL DEFAULT false,
+  allow_multiple boolean NOT NULL DEFAULT false,
+  sort_order integer NOT NULL DEFAULT 0,
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS dish_option_groups_dish_idx ON dish_option_groups (dish_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS dish_options (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  group_id uuid NOT NULL REFERENCES dish_option_groups(id) ON DELETE CASCADE,
+  label text NOT NULL,
+  sort_order integer NOT NULL DEFAULT 0,
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS dish_options_group_idx ON dish_options (group_id, sort_order);
+
 CREATE TABLE IF NOT EXISTS orders (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   table_id uuid REFERENCES restaurant_tables(id),
@@ -73,6 +100,10 @@ CREATE TABLE IF NOT EXISTS orders (
   created_by uuid REFERENCES employees(id),
   opened_at timestamptz NOT NULL DEFAULT now(),
   settled_at timestamptz,
+  ended_at timestamptz,
+  ended_by uuid REFERENCES employees(id),
+  end_reason text NOT NULL DEFAULT '',
+  order_note text NOT NULL DEFAULT '',
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -104,6 +135,7 @@ CREATE TABLE IF NOT EXISTS order_items (
   returned_quantity integer NOT NULL DEFAULT 0 CHECK (returned_quantity >= 0),
   returned_made_quantity integer NOT NULL DEFAULT 0 CHECK (returned_made_quantity >= 0),
   note text NOT NULL DEFAULT '',
+  option_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
   CHECK (gifted_quantity <= quantity),
   CHECK (returned_quantity <= quantity),
@@ -210,12 +242,23 @@ const settings = {
 export async function migrateAndSeed(): Promise<void> {
   await pool.query(schema);
 
+  // 这些列同时兼容已部署的旧版本数据库；CREATE TABLE IF NOT EXISTS
+  // 不会给已有表补列，所以这里必须使用可重复执行的增量迁移。
+  await pool.query(`ALTER TABLE restaurant_tables ADD COLUMN IF NOT EXISTS name text`);
+  await pool.query(`UPDATE restaurant_tables SET name = number::text || '号桌' WHERE name IS NULL OR btrim(name) = ''`);
+  await pool.query(`ALTER TABLE restaurant_tables ALTER COLUMN name SET NOT NULL`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS ended_at timestamptz`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS ended_by uuid REFERENCES employees(id)`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS end_reason text NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_note text NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS option_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb`);
+
   for (let number = 1; number <= 12; number += 1) {
     await pool.query(
-      `INSERT INTO restaurant_tables (number, seats, sort_order)
-       VALUES ($1, 4, $1)
+      `INSERT INTO restaurant_tables (number, name, seats, sort_order)
+       VALUES ($1, $2, 4, $1)
        ON CONFLICT (number) DO NOTHING`,
-      [number]
+      [number, `${number}号桌`]
     );
   }
   await pool.query(
