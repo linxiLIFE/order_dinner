@@ -1,5 +1,6 @@
 import "dotenv/config";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
@@ -58,6 +59,27 @@ function text(value: unknown, fallback = ""): string {
 
 function routeParam(req: Request, name: string): string {
   return text(req.params[name]);
+}
+
+function printerTokenHash(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+async function requirePrinterDevice(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const deviceId = text(req.header("x-printer-device-id"));
+    const token = text(req.header("x-printer-token"));
+    if (!deviceId || !token) fail("打印设备认证信息不完整", 401);
+    const result = await pool.query(
+      `UPDATE printer_devices SET last_seen_at = now(), updated_at = now()
+       WHERE id = $1 AND token_hash = $2 AND active = true RETURNING id`,
+      [deviceId, printerTokenHash(token)]
+    );
+    if (!result.rows[0]) fail("打印设备认证已失效，请重新配置", 401);
+    next();
+  } catch (error) {
+    publicError(res, error);
+  }
 }
 
 function normalizedPhone(value: unknown): string | null {
@@ -1627,7 +1649,7 @@ app.get("/api/print-jobs", requireAuth, async (req, res) => {
     params.push(limit);
     const result = await pool.query(
       `SELECT pj.id, pj.order_id, pj.batch_id, pj.kind, pj.copy_no, pj.payload, pj.status, pj.device_id, pj.attempts,
-              pj.last_error, pj.claimed_at, pj.sent_at, pj.created_at
+              pj.last_error, pj.manual_requested_at, pj.claimed_at, pj.sent_at, pj.created_at
        FROM print_jobs pj ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
        ORDER BY pj.created_at DESC LIMIT $${params.length}`,
       params
@@ -1638,18 +1660,47 @@ app.get("/api/print-jobs", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/print-jobs/claim", requireAuth, async (req: AuthenticatedRequest, res) => {
+app.post("/api/print-devices/register", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
   try {
-    const deviceId = text(req.body?.deviceId);
-    if (!deviceId) fail("打印设备编号不能为空");
+    const user = currentUser(req);
+    const deviceId = text(req.body?.deviceId).slice(0, 120);
+    const name = text(req.body?.name).slice(0, 120) || "安卓打印设备";
+    if (!deviceId) fail("请选择打印设备");
+    const printerToken = crypto.randomBytes(32).toString("hex");
+    await pool.query(
+      `INSERT INTO printer_devices (id, name, token_hash, active, created_by)
+       VALUES ($1, $2, $3, true, $4)
+       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, token_hash = EXCLUDED.token_hash,
+         active = true, created_by = EXCLUDED.created_by, updated_at = now()`,
+      [deviceId, name, printerTokenHash(printerToken), user.id]
+    );
+    await logOperation(pool, user.id, "REGISTER_PRINTER_DEVICE", "PRINTER_DEVICE", null, { deviceId, name });
+    res.json({ deviceId, name, printerToken });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.post("/api/print-jobs/claim", requirePrinterDevice, async (req, res) => {
+  try {
+    const deviceId = text(req.header("x-printer-device-id"));
+    const sessionStartedAt = text(req.body?.sessionStartedAt);
+    const sessionDate = new Date(sessionStartedAt);
+    if (!sessionStartedAt || Number.isNaN(sessionDate.getTime())) fail("打印连接时间不正确");
     const result = await withTransaction(async (client) => {
       const job = await client.query(
-        `SELECT id FROM print_jobs WHERE status IN ('PENDING', 'FAILED')
-         ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1`
+        `SELECT id FROM print_jobs
+         WHERE status = 'PENDING'
+           AND (manual_requested_at IS NOT NULL OR created_at >= $1::timestamptz)
+         ORDER BY CASE WHEN manual_requested_at IS NOT NULL THEN 0 ELSE 1 END,
+                  COALESCE(manual_requested_at, created_at), created_at
+         FOR UPDATE SKIP LOCKED LIMIT 1`,
+        [sessionDate.toISOString()]
       );
       if (!job.rows[0]) return null;
       const updated = await client.query(
-        `UPDATE print_jobs SET status = 'CLAIMED', device_id = $1, attempts = attempts + 1, claimed_at = now()
+        `UPDATE print_jobs SET status = 'CLAIMED', device_id = $1, attempts = attempts + 1,
+           claimed_at = now(), manual_requested_at = NULL
          WHERE id = $2 RETURNING id, order_id, batch_id, kind, copy_no, payload, attempts`,
         [deviceId, job.rows[0].id]
       );
@@ -1661,14 +1712,14 @@ app.post("/api/print-jobs/claim", requireAuth, async (req: AuthenticatedRequest,
   }
 });
 
-app.post("/api/print-jobs/:jobId/ack", requireAuth, async (req, res) => {
+app.post("/api/print-jobs/:jobId/ack", requirePrinterDevice, async (req, res) => {
   try {
     const status = text(req.body?.status);
     if (!["SENT", "FAILED", "NEEDS_CHECK"].includes(status)) fail("打印回执状态不正确");
     const result = await pool.query(
       `UPDATE print_jobs SET status = $1, last_error = $2, sent_at = CASE WHEN $1 = 'SENT' THEN now() ELSE sent_at END
-       WHERE id = $3 RETURNING id, status`,
-      [status, text(req.body?.error) || null, routeParam(req, "jobId")]
+       WHERE id = $3 AND device_id = $4 AND status = 'CLAIMED' RETURNING id, status`,
+      [status, text(req.body?.error) || null, routeParam(req, "jobId"), text(req.header("x-printer-device-id"))]
     );
     if (!result.rows[0]) fail("打印任务不存在", 404);
     res.json({ job: result.rows[0] });
@@ -1680,11 +1731,30 @@ app.post("/api/print-jobs/:jobId/ack", requireAuth, async (req, res) => {
 app.post("/api/print-jobs/:jobId/retry", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `UPDATE print_jobs SET status = 'PENDING', device_id = NULL, last_error = NULL, claimed_at = NULL
+      `UPDATE print_jobs SET status = 'PENDING', device_id = NULL, last_error = NULL,
+         claimed_at = NULL, manual_requested_at = now()
        WHERE id = $1 AND status IN ('FAILED', 'NEEDS_CHECK') RETURNING id`,
       [routeParam(req, "jobId")]
     );
     if (!result.rows[0]) fail("当前打印任务不可重试");
+    res.json({ ok: true });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.post("/api/print-jobs/:jobId/dispatch", requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const jobId = routeParam(req, "jobId");
+    const result = await pool.query(
+      `UPDATE print_jobs SET status = 'PENDING', device_id = NULL, last_error = NULL,
+         claimed_at = NULL, manual_requested_at = now()
+       WHERE id = $1 AND status IN ('PENDING', 'FAILED', 'NEEDS_CHECK') RETURNING id`,
+      [jobId]
+    );
+    if (!result.rows[0]) fail("当前打印任务不能手动打印");
+    await logOperation(pool, user.id, "DISPATCH_PRINT_JOB", "PRINT_JOB", jobId);
     res.json({ ok: true });
   } catch (error) {
     publicError(res, error);
@@ -1720,8 +1790,8 @@ app.post("/api/print-jobs/:jobId/reprint", requireAuth, async (req: Authenticate
         copyNo: original.copy_no
       };
       const inserted = await client.query<{ id: string }>(
-        `INSERT INTO print_jobs (order_id, batch_id, kind, copy_no, payload)
-         VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id`,
+        `INSERT INTO print_jobs (order_id, batch_id, kind, copy_no, payload, manual_requested_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, now()) RETURNING id`,
         [original.order_id, original.batch_id, original.kind, original.copy_no, JSON.stringify(payload)]
       );
       await logOperation(client, user.id, "REPRINT_JOB", "PRINT_JOB", inserted.rows[0].id, { originalJobId: original.id });

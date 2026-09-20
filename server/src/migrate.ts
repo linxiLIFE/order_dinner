@@ -194,12 +194,24 @@ CREATE TABLE IF NOT EXISTS print_jobs (
   device_id text,
   attempts integer NOT NULL DEFAULT 0,
   last_error text,
+  manual_requested_at timestamptz,
   claimed_at timestamptz,
   sent_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS print_jobs_queue_idx ON print_jobs (status, created_at);
+
+CREATE TABLE IF NOT EXISTS printer_devices (
+  id text PRIMARY KEY,
+  name text NOT NULL,
+  token_hash text NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  last_seen_at timestamptz,
+  created_by uuid REFERENCES employees(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS operation_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -252,6 +264,7 @@ export async function migrateAndSeed(): Promise<void> {
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS end_reason text NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_note text NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS option_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS manual_requested_at timestamptz`);
 
   for (let number = 1; number <= 12; number += 1) {
     await pool.query(

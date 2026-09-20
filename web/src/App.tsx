@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { Capacitor, registerPlugin } from "@capacitor/core";
 import { api, businessDate, formatTime, getToken, money, requestKey, setToken, type User } from "./api.js";
 
 type Page = "tables" | "orders" | "customers" | "dishes" | "stats" | "print" | "settings";
@@ -118,10 +119,20 @@ type PrintJob = {
   device_id: string | null;
   attempts: number;
   last_error: string | null;
+  manual_requested_at: string | null;
   claimed_at: string | null;
   sent_at: string | null;
   created_at: string;
 };
+type PairedPrinter = { id: string; name: string };
+type PrinterHostState = { enabled: boolean; connected: boolean; deviceId: string; deviceName: string; message: string };
+interface PrinterHostPlugin {
+  listPaired(): Promise<{ devices: PairedPrinter[] }>;
+  configure(options: { deviceId: string; deviceName: string; printerToken: string; serverUrl: string }): Promise<PrinterHostState>;
+  stop(): Promise<PrinterHostState>;
+  status(): Promise<PrinterHostState>;
+}
+const PrinterHost = registerPlugin<PrinterHostPlugin>("PrinterHost");
 
 function cartLineNote(line: CartLine): string {
   const optionNotes = line.selections.flatMap((selection) => {
@@ -773,13 +784,13 @@ function PrintManagementPage({ setMessage }: { setMessage: (message: string) => 
     }
   }
   useEffect(() => { void load(); }, [status]);
-  async function retry(job: PrintJob) {
-    try { await api(`/api/print-jobs/${job.id}/retry`, { method: "POST" }); await load(); setMessage("打印任务已重新加入队列"); } catch (error) { setMessage(errorText(error)); }
+  async function dispatch(job: PrintJob) {
+    try { await api(`/api/print-jobs/${job.id}/dispatch`, { method: "POST" }); await load(); setMessage("已发送手动打印指令；设备离线时任务会继续保留"); } catch (error) { setMessage(errorText(error)); }
   }
   async function reprint(job: PrintJob) {
     try { await api(`/api/print-jobs/${job.id}/reprint`, { method: "POST" }); setStatus("PENDING"); setMessage("已生成补打任务"); } catch (error) { setMessage(errorText(error)); }
   }
-  return <section className="page-section"><div className="section-heading"><div><h2>打印管理</h2><p className="muted">查看待打印、已打印和异常任务；预览不会改变打印状态。</p></div><button className="secondary" onClick={() => void load()} disabled={busy}>刷新</button></div><div className="print-tabs">{tabs.map(([key, label]) => <button key={key} className={status === key ? "category-chip selected" : "category-chip"} onClick={() => setStatus(key)}>{label}</button>)}</div><div className="content-card"><table><thead><tr><th>生成时间</th><th>类型</th><th>桌台</th><th>订单号</th><th>份数</th><th>状态</th><th>设备</th><th>操作</th></tr></thead><tbody>{jobs.map((job) => { const payload = job.payload || {}; return <tr key={job.id}><td>{formatTime(job.created_at)}</td><td>{printKindText(job.kind)}{payload.reprintOf ? "（补打）" : ""}</td><td>{String(payload.tableName || (payload.tableNumber ? `${payload.tableNumber}号桌` : "无桌台"))}</td><td className="mono-text">{job.order_id ? job.order_id.slice(0, 8) : "—"}</td><td>{job.copy_no}</td><td><span className={`status-pill ${job.status === "SENT" ? "green" : job.status === "FAILED" || job.status === "NEEDS_CHECK" ? "red" : "gray"}`}>{printStatusText(job.status)}</span></td><td>{job.device_id || "—"}</td><td className="table-actions"><button className="text-button" onClick={() => setSelected(job)}>预览</button>{job.status === "SENT" && <button className="text-button" onClick={() => void reprint(job)}>重新打印</button>}{(job.status === "FAILED" || job.status === "NEEDS_CHECK") && <button className="text-button" onClick={() => void retry(job)}>重试</button>}</td></tr>; })}</tbody></table>{!jobs.length && <div className="empty">当前没有{tabs.find(([key]) => key === status)?.[1] || "打印"}任务</div>}</div>{selected && <PrintPreviewDialog job={selected} onClose={() => setSelected(null)} />}</section>;
+  return <section className="page-section"><div className="section-heading"><div><h2>打印管理</h2><p className="muted">打印机离线或失败的任务不会在重连时自动补打，需要在这里手动点击打印。</p></div><button className="secondary" onClick={() => void load()} disabled={busy}>刷新</button></div><div className="print-tabs">{tabs.map(([key, label]) => <button key={key} className={status === key ? "category-chip selected" : "category-chip"} onClick={() => setStatus(key)}>{label}</button>)}</div><div className="content-card"><table><thead><tr><th>生成时间</th><th>类型</th><th>桌台</th><th>订单号</th><th>份数</th><th>状态</th><th>设备</th><th>操作</th></tr></thead><tbody>{jobs.map((job) => { const payload = job.payload || {}; return <tr key={job.id}><td>{formatTime(job.created_at)}</td><td>{printKindText(job.kind)}{payload.reprintOf ? "（补打）" : ""}</td><td>{String(payload.tableName || (payload.tableNumber ? `${payload.tableNumber}号桌` : "无桌台"))}</td><td className="mono-text">{job.order_id ? job.order_id.slice(0, 8) : "—"}</td><td>{job.copy_no}</td><td><span className={`status-pill ${job.status === "SENT" ? "green" : job.status === "FAILED" || job.status === "NEEDS_CHECK" ? "red" : "gray"}`}>{printStatusText(job.status)}</span></td><td>{job.device_id || "—"}</td><td className="table-actions"><button className="text-button" onClick={() => setSelected(job)}>预览</button>{job.status === "SENT" ? <button className="text-button" onClick={() => void reprint(job)}>重新打印</button> : job.status !== "CLAIMED" ? <button className="text-button" onClick={() => void dispatch(job)}>{job.status === "PENDING" ? "打印" : "重新打印"}</button> : null}</td></tr>; })}</tbody></table>{!jobs.length && <div className="empty">当前没有{tabs.find(([key]) => key === status)?.[1] || "打印"}任务</div>}</div>{selected && <PrintPreviewDialog job={selected} onClose={() => setSelected(null)} />}</section>;
 }
 
 function PrintPreviewDialog({ job, onClose }: { job: PrintJob; onClose: () => void }) {
@@ -805,6 +816,86 @@ function StatsPage({ setMessage }: { setMessage: (message: string) => void }) {
 
 function Metric({ label, value }: { label: string; value: string }) { return <div className="metric-card"><span>{label}</span><strong>{value}</strong></div>; }
 
+function AndroidPrinterPanel({ setMessage }: { setMessage: (message: string) => void }) {
+  const [devices, setDevices] = useState<PairedPrinter[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [state, setState] = useState<PrinterHostState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const isAndroid = Capacitor.getPlatform() === "android";
+
+  async function refreshStatus() {
+    if (!isAndroid) return;
+    try {
+      const next = await PrinterHost.status();
+      setState(next);
+      if (next.deviceId) setSelectedId(next.deviceId);
+    } catch (error) {
+      setMessage(errorText(error));
+    }
+  }
+
+  async function loadPaired() {
+    setBusy(true);
+    try {
+      const result = await PrinterHost.listPaired();
+      setDevices(result.devices);
+      await refreshStatus();
+      if (!selectedId && result.devices[0]) setSelectedId(result.devices[0].id);
+      if (!result.devices.length) setMessage("请先在安卓系统蓝牙设置中完成打印机配对");
+    } catch (error) {
+      setMessage(errorText(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!isAndroid) return;
+    void loadPaired();
+    const timer = window.setInterval(() => { void refreshStatus(); }, 5000);
+    return () => window.clearInterval(timer);
+  }, [isAndroid]);
+
+  async function enable() {
+    const device = devices.find((candidate) => candidate.id === selectedId);
+    if (!device) return setMessage("请选择已配对的打印机");
+    setBusy(true);
+    try {
+      const registration = await api<{ printerToken: string }>("/api/print-devices/register", {
+        method: "POST",
+        body: JSON.stringify({ deviceId: device.id, name: device.name })
+      });
+      const next = await PrinterHost.configure({
+        deviceId: device.id,
+        deviceName: device.name,
+        printerToken: registration.printerToken,
+        serverUrl: window.location.origin
+      });
+      setState(next);
+      setMessage("安卓打印服务已启用；只自动打印连接后新生成的任务");
+    } catch (error) {
+      setMessage(errorText(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stop() {
+    setBusy(true);
+    try {
+      setState(await PrinterHost.stop());
+      setMessage("安卓打印服务已停用");
+    } catch (error) {
+      setMessage(errorText(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!isAndroid) return null;
+  return <div className="content-card printer-host-card"><div className="printer-host-heading"><div><h3>安卓打印主机</h3><p className="muted">先在系统蓝牙中配对打印机。断线期间产生的任务不会在重连后自动补打。</p></div><span className={`status-pill ${state?.connected ? "green" : state?.enabled ? "red" : "gray"}`}>{state?.connected ? "已连接" : state?.enabled ? "连接中" : "未启用"}</span></div><div className="printer-host-controls"><label>已配对打印机<select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}><option value="">请选择</option>{devices.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.id}</option>)}</select></label><button type="button" className="secondary" onClick={() => void loadPaired()} disabled={busy}>刷新设备</button><button type="button" className="primary" onClick={() => void enable()} disabled={busy || !selectedId}>启用打印</button>{state?.enabled && <button type="button" className="secondary danger-outline" onClick={() => void stop()} disabled={busy}>停用</button>}</div>{state?.message && <p className="printer-host-message">{state.message}</p>}</div>;
+}
+
 function SettingsPage({ setMessage }: { setMessage: (message: string) => void }) {
   const [settings, setSettings] = useState<Settings>({});
   const [tables, setTables] = useState<Table[]>([]);
@@ -822,7 +913,7 @@ function SettingsPage({ setMessage }: { setMessage: (message: string) => void })
   async function addEmployee(event: FormEvent) { event.preventDefault(); try { await api("/api/employees", { method: "POST", body: JSON.stringify(employeeForm) }); setEmployeeForm({ username: "", name: "", password: "" }); await load(); setMessage("员工账号已开通"); } catch (error) { setMessage(errorText(error)); } }
   async function toggleEmployee(employee: Employee) { try { await api(`/api/employees/${employee.id}`, { method: "PATCH", body: JSON.stringify({ active: !employee.active }) }); await load(); setMessage(employee.active ? "员工账号已停用" : "员工账号已启用"); } catch (error) { setMessage(errorText(error)); } }
   if (!loaded) return <section className="page-section"><div className="loading">正在读取设置…</div></section>;
-  return <section className="page-section"><div className="section-heading"><div><h2>设置</h2><p className="muted">店铺、积分规则、打印设备、桌台和员工账号</p></div></div><div className="settings-layout"><div className="content-card"><h3>店铺与小票</h3><div className="form-grid"><label>店名<input value={value("store_name")} onChange={(event) => setSettings({ ...settings, store_name: event.target.value })} /></label><label>小票尾注<input value={value("receipt_footer")} onChange={(event) => setSettings({ ...settings, receipt_footer: event.target.value })} /></label><label>打印设备编号<input value={value("printer_device_id")} onChange={(event) => setSettings({ ...settings, printer_device_id: event.target.value })} placeholder="由安卓打印服务填写" /></label><label>打印设备名称<input value={value("printer_device_name")} onChange={(event) => setSettings({ ...settings, printer_device_name: event.target.value })} /></label></div></div><div className="content-card"><h3>积分规则</h3><label className="toggle-row"><input type="checkbox" checked={Boolean(settings.points_enabled)} onChange={(event) => setSettings({ ...settings, points_enabled: event.target.checked })} />启用积分</label><div className="form-grid three"><label>每多少分获得 1 分<small>按实收金额计算，填写分</small><input type="number" min="1" value={value("points_earn_fen", "100")} onChange={(event) => setSettings({ ...settings, points_earn_fen: Number(event.target.value) })} /></label><label>多少积分抵 1 元<input type="number" min="1" value={value("points_redeem_points", "10")} onChange={(event) => setSettings({ ...settings, points_redeem_points: Number(event.target.value) })} /></label><label>每个抵扣单位金额（分）<input type="number" min="1" value={value("points_redeem_fen", "100")} onChange={(event) => setSettings({ ...settings, points_redeem_fen: Number(event.target.value) })} /></label></div></div><div className="content-card"><h3>桌台管理</h3><p className="muted">桌台有历史订单时不能物理删除，可改名或停用以保留历史记录。</p><div className="table-settings">{tables.map((table) => <TableSetting key={table.id} table={table} onSave={saveTable} onDelete={() => setDeleteTarget(table)} />)}</div><AddTableForm onAdd={addTable} /></div><div className="content-card"><h3>员工账号</h3><p className="muted">开通后员工使用自己的账号登录；停用不会删除历史操作记录。</p><form className="employee-form" noValidate onSubmit={addEmployee}><label>登录账号<input value={employeeForm.username} onChange={(event) => setEmployeeForm({ ...employeeForm, username: event.target.value })} /></label><label>员工姓名<input value={employeeForm.name} onChange={(event) => setEmployeeForm({ ...employeeForm, name: event.target.value })} /></label><label>初始密码<small>至少 8 位</small><input type="password" value={employeeForm.password} onChange={(event) => setEmployeeForm({ ...employeeForm, password: event.target.value })} /></label><button className="primary">开通账号</button></form><div className="employee-list">{employees.map((employee) => <div className="employee-row" key={employee.id}><div><strong>{employee.name}</strong><span>{employee.username} · {employee.role === "OWNER" ? "老板" : "收银员"}</span></div><span className={employee.active ? "status-pill green" : "status-pill gray"}>{employee.active ? "启用" : "停用"}</span>{employee.role !== "OWNER" && <button type="button" className="secondary" onClick={() => void toggleEmployee(employee)}>{employee.active ? "停用" : "启用"}</button>}</div>)}</div></div><button className="primary" type="button" onClick={() => void saveSettings()}>保存店铺与积分设置</button></div>{deleteTarget && <ConfirmDialog title="删除桌台" message={`确定删除“${deleteTarget.name}”？只有从未产生订单且当前空闲的桌台可以删除。`} confirmText="确认删除" danger onClose={() => setDeleteTarget(null)} onConfirm={() => void deleteTable()} />}</section>;
+  return <section className="page-section"><div className="section-heading"><div><h2>设置</h2><p className="muted">店铺、积分规则、打印设备、桌台和员工账号</p></div></div><div className="settings-layout"><AndroidPrinterPanel setMessage={setMessage} /><div className="content-card"><h3>店铺与小票</h3><div className="form-grid"><label>店名<input value={value("store_name")} onChange={(event) => setSettings({ ...settings, store_name: event.target.value })} /></label><label>小票尾注<input value={value("receipt_footer")} onChange={(event) => setSettings({ ...settings, receipt_footer: event.target.value })} /></label><label>打印设备编号<input value={value("printer_device_id")} onChange={(event) => setSettings({ ...settings, printer_device_id: event.target.value })} placeholder="由安卓打印服务填写" /></label><label>打印设备名称<input value={value("printer_device_name")} onChange={(event) => setSettings({ ...settings, printer_device_name: event.target.value })} /></label></div></div><div className="content-card"><h3>积分规则</h3><label className="toggle-row"><input type="checkbox" checked={Boolean(settings.points_enabled)} onChange={(event) => setSettings({ ...settings, points_enabled: event.target.checked })} />启用积分</label><div className="form-grid three"><label>每多少分获得 1 分<small>按实收金额计算，填写分</small><input type="number" min="1" value={value("points_earn_fen", "100")} onChange={(event) => setSettings({ ...settings, points_earn_fen: Number(event.target.value) })} /></label><label>多少积分抵 1 元<input type="number" min="1" value={value("points_redeem_points", "10")} onChange={(event) => setSettings({ ...settings, points_redeem_points: Number(event.target.value) })} /></label><label>每个抵扣单位金额（分）<input type="number" min="1" value={value("points_redeem_fen", "100")} onChange={(event) => setSettings({ ...settings, points_redeem_fen: Number(event.target.value) })} /></label></div></div><div className="content-card"><h3>桌台管理</h3><p className="muted">桌台有历史订单时不能物理删除，可改名或停用以保留历史记录。</p><div className="table-settings">{tables.map((table) => <TableSetting key={table.id} table={table} onSave={saveTable} onDelete={() => setDeleteTarget(table)} />)}</div><AddTableForm onAdd={addTable} /></div><div className="content-card"><h3>员工账号</h3><p className="muted">开通后员工使用自己的账号登录；停用不会删除历史操作记录。</p><form className="employee-form" noValidate onSubmit={addEmployee}><label>登录账号<input value={employeeForm.username} onChange={(event) => setEmployeeForm({ ...employeeForm, username: event.target.value })} /></label><label>员工姓名<input value={employeeForm.name} onChange={(event) => setEmployeeForm({ ...employeeForm, name: event.target.value })} /></label><label>初始密码<small>至少 8 位</small><input type="password" value={employeeForm.password} onChange={(event) => setEmployeeForm({ ...employeeForm, password: event.target.value })} /></label><button className="primary">开通账号</button></form><div className="employee-list">{employees.map((employee) => <div className="employee-row" key={employee.id}><div><strong>{employee.name}</strong><span>{employee.username} · {employee.role === "OWNER" ? "老板" : "收银员"}</span></div><span className={employee.active ? "status-pill green" : "status-pill gray"}>{employee.active ? "启用" : "停用"}</span>{employee.role !== "OWNER" && <button type="button" className="secondary" onClick={() => void toggleEmployee(employee)}>{employee.active ? "停用" : "启用"}</button>}</div>)}</div></div><button className="primary" type="button" onClick={() => void saveSettings()}>保存店铺与积分设置</button></div>{deleteTarget && <ConfirmDialog title="删除桌台" message={`确定删除“${deleteTarget.name}”？只有从未产生订单且当前空闲的桌台可以删除。`} confirmText="确认删除" danger onClose={() => setDeleteTarget(null)} onConfirm={() => void deleteTable()} />}</section>;
 }
 
 function TableSetting({ table, onSave, onDelete }: { table: Table; onSave: (table: Table, values: { name: string; number: number; seats: number }) => Promise<void>; onDelete: () => void }) {
