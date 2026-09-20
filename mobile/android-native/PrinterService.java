@@ -262,8 +262,11 @@ public class PrinterService extends Service {
         command(output, 0x1D, 0x21, 0x11);
         line(output, payload.optString("title", receipt ? "结账小票" : "备菜单"));
         command(output, 0x1D, 0x21, 0x00);
+        command(output, 0x1B, 0x61, 0x01);
+        command(output, 0x1D, 0x21, 0x11);
+        line(output, tableName(payload));
+        command(output, 0x1D, 0x21, 0x00);
         command(output, 0x1B, 0x61, 0x00);
-        line(output, "桌台：" + tableName(payload));
         line(output, "人数：" + payload.optInt("peopleCount", 0) + "    顾客：" + payload.optString("customer", "散客"));
         if (payload.has("batchNo")) line(output, "批次：第 " + payload.optInt("batchNo") + " 批");
         if (receipt) {
@@ -273,24 +276,22 @@ public class PrinterService extends Service {
             line(output, "时间：" + formatTime(payload.optString("createdAt", "")));
         }
         String orderNote = payload.optString("orderNote", "");
-        if (!orderNote.isEmpty()) line(output, "本单备注：" + orderNote);
+        if (!receipt && !orderNote.isEmpty()) line(output, "本单备注：" + orderNote);
         separator(output);
         JSONArray items = payload.optJSONArray("items");
         if (items != null) {
             for (int index = 0; index < items.length(); index += 1) {
                 JSONObject item = items.getJSONObject(index);
-                command(output, 0x1D, 0x21, 0x11);
-                line(output, item.optString("name", "菜品"));
-                command(output, 0x1D, 0x21, 0x00);
                 int quantity = item.optInt("quantity", 0);
                 String unit = item.optString("unit", "份");
                 int priceFen = item.optInt("priceFen", 0);
+                command(output, 0x1D, 0x21, 0x01);
+                line(output, item.optString("name", "菜品") + " × " + quantity + " " + unit);
+                command(output, 0x1D, 0x21, 0x00);
                 if (receipt) {
-                    line(output, "  × " + quantity + " " + unit + "  单价 " + money(priceFen) + "  小计 " + money(priceFen * quantity));
-                } else {
-                    line(output, "  × " + quantity + " " + unit);
+                    line(output, "  单价 " + money(priceFen) + "  小计 " + money(priceFen * quantity));
                 }
-                String note = item.optString("note", "");
+                String note = formatItemNote(item.optString("note", ""));
                 if (!note.isEmpty()) line(output, "  " + note);
             }
         }
@@ -298,15 +299,10 @@ public class PrinterService extends Service {
             JSONObject totals = payload.optJSONObject("totals");
             if (totals != null) {
                 separator(output);
-                line(output, "原价：" + money(totals.optInt("grossFen")));
-                line(output, "赠送：-" + money(totals.optInt("giftFen")));
-                line(output, "退菜：-" + money(totals.optInt("returnFen")));
-                line(output, "人工减免：-" + money(totals.optInt("manualDiscountFen")));
-                line(output, "积分抵扣：-" + money(totals.optInt("pointsDiscountFen")));
+                line(output, "应收：" + money(totals.optInt("dueFen", totals.optInt("receivedFen"))));
                 command(output, 0x1D, 0x21, 0x01);
                 line(output, "实收：" + money(totals.optInt("receivedFen")));
                 command(output, 0x1D, 0x21, 0x00);
-                line(output, "收款方式：" + payload.optString("paymentMethod", "—"));
             }
         }
         String footer = payload.optString("footer", "");
@@ -340,6 +336,23 @@ public class PrinterService extends Service {
         if (!name.isEmpty()) return name;
         int number = payload.optInt("tableNumber", 0);
         return number > 0 ? number + "号桌" : "无桌台";
+    }
+
+    private String formatItemNote(String raw) {
+        if (raw == null || raw.trim().isEmpty()) return "";
+        String[] parts = raw.split("[；;]");
+        StringBuilder result = new StringBuilder();
+        for (String value : parts) {
+            String part = value.trim();
+            if (part.isEmpty()) continue;
+            if (parts.length == 1 && (part.startsWith("备注：") || part.startsWith("备注:"))) {
+                part = part.substring(3).trim();
+            }
+            if (part.isEmpty()) continue;
+            if (result.length() > 0) result.append('，');
+            result.append(part);
+        }
+        return result.toString();
     }
 
     private String money(int fen) {

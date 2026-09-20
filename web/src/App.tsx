@@ -143,8 +143,18 @@ function cartLineNote(line: CartLine): string {
       .map((option) => option.label);
     return labels.length ? [`${group.name}：${labels.join("、")}`] : [];
   });
-  if (line.customNote) optionNotes.push(`备注：${line.customNote}`);
-  return optionNotes.join("；");
+  if (line.customNote) optionNotes.push(optionNotes.length ? `备注：${line.customNote}` : line.customNote);
+  return optionNotes.join("，");
+}
+
+function formatItemNote(note: string): string {
+  const parts = note.split(/[；;]/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 1) return parts[0].replace(/^备注[：:]\s*/, "");
+  return parts.join("，");
+}
+
+function tableDisplayName(tableName: string | null | undefined, tableNumber: number | null | undefined): string {
+  return tableName || (tableNumber ? `${tableNumber}号桌` : "无桌台");
 }
 
 function errorText(error: unknown): string {
@@ -319,6 +329,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
   const [search, setSearch] = useState("");
   const [cart, setCart] = useState<Record<string, CartLine>>({});
   const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
   const [optionTarget, setOptionTarget] = useState<Dish | null>(null);
   const [noteTarget, setNoteTarget] = useState<{ key: string; note: string } | null>(null);
   const [orderNoteOpen, setOrderNoteOpen] = useState(false);
@@ -497,22 +508,27 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
   const displayCost = order.totals.costFen + cartCost;
   const displayMargin = displayRevenue > 0 ? Math.round(((displayRevenue - displayCost) / displayRevenue) * 10000) / 100 : 0;
   const open = order.status === "OPEN";
+  const activeSettlement = order.settlements.find((settlement) => settlement.status === "ACTIVE");
+  const previewTotalFen = open ? displayRevenue : activeSettlement?.received_fen ?? order.totals.subtotalFen;
+  const previewTotalLabel = open ? "当前应收" : activeSettlement ? "实收" : "账单金额";
+  const nativePreviewAction = Capacitor.isNativePlatform();
   return <section className="page-section order-page">
-    <div className="section-heading order-heading"><div><button className="back-button" onClick={goBack}>‹ 桌台</button><h2>{order.tableName || (order.tableNumber ? `${order.tableNumber}号桌` : "账单")} <span className={`status-pill ${open ? "green" : "gray"}`}>{statusText(order.status)}</span></h2><p className="muted">{order.customer.name} · {order.peopleCount} 人 · 开台 {formatTime(order.openedAt)}{order.customer.phone ? ` · ${order.customer.phone}` : " · 未填写手机号"}</p>{order.orderNote && <p className="order-note"><span>本单备注：</span>{order.orderNote}</p>}</div><div className="heading-actions">{open && <button className="secondary" onClick={() => setOrderNoteOpen(true)} disabled={busy}>本单备注</button>}{order.status === "SETTLED" && user.role === "OWNER" && <button className="secondary" onClick={() => setConfirmAction("reopen")} disabled={busy}>撤销重结</button>}{open && <><button className="secondary danger-outline" onClick={() => setConfirmAction("end")} disabled={busy}>直接结束</button><button className="primary" onClick={() => setCheckoutOpen(true)} disabled={busy || !order.items.length}>结账 {money(order.totals.subtotalFen)}</button></>}</div></div>
+    <div className="section-heading order-heading"><div><button className="back-button" onClick={goBack}>‹ 桌台</button><h2>{order.tableName || (order.tableNumber ? `${order.tableNumber}号桌` : "账单")} <span className={`status-pill ${open ? "green" : "gray"}`}>{statusText(order.status)}</span></h2><p className="muted">{order.customer.name} · {order.peopleCount} 人 · 开台 {formatTime(order.openedAt)}{order.customer.phone ? ` · ${order.customer.phone}` : " · 未填写手机号"}</p>{order.orderNote && <p className="order-note"><span>本单备注：</span>{order.orderNote}</p>}</div><div className="heading-actions"><button className={`secondary preview-full-order-button${nativePreviewAction ? " native-preview-full-order-button" : ""}`} onClick={() => setPreviewOpen(true)}>预览全单</button>{open && <button className="secondary" onClick={() => setOrderNoteOpen(true)} disabled={busy}>本单备注</button>}{order.status === "SETTLED" && user.role === "OWNER" && <button className="secondary" onClick={() => setConfirmAction("reopen")} disabled={busy}>撤销重结</button>}{open && <><button className="secondary danger-outline" onClick={() => setConfirmAction("end")} disabled={busy}>直接结束</button><button className="primary" onClick={() => setCheckoutOpen(true)} disabled={busy || !order.items.length}>结账 {money(order.totals.subtotalFen)}</button></>}</div></div>
     <div className="order-layout">
       <div className="catalog-panel">
         <div className="search-row"><input placeholder="搜索菜名、拼音或首字母" value={search} onChange={(event) => setSearch(event.target.value)} /><button className="secondary" onClick={() => setSearch("")}>清空</button></div>
-        <div className="category-row"><button className={!categoryId ? "category-chip selected" : "category-chip"} onClick={() => setCategoryId("")}>全部</button>{categories.map((category) => <button className={categoryId === category.id ? "category-chip selected" : "category-chip"} key={category.id} onClick={() => setCategoryId(category.id)}>{category.name}</button>)}</div>
+        <div className="category-row" role="group" aria-label="按分类浏览菜品"><button aria-pressed={!categoryId} className={!categoryId ? "category-chip selected" : "category-chip"} onClick={() => setCategoryId("")}>全部</button>{categories.map((category) => <button aria-pressed={categoryId === category.id} className={categoryId === category.id ? "category-chip selected" : "category-chip"} key={category.id} onClick={() => setCategoryId(category.id)}>{category.name}</button>)}</div>
         <div className="dish-grid">{visibleDishes.map((dish) => { const quantity = Object.values(cart).filter((line) => line.dish.id === dish.id).reduce((sum, line) => sum + line.quantity, 0); return <button className="dish-card" key={dish.id} onClick={() => addDish(dish)} disabled={!open || busy}><span className="dish-name">{dish.name}</span><span className="dish-meta">{dish.unit} · {money(dish.price_fen)}</span><span className="dish-margin">毛利率 {dish.gross_margin_percent}%{dish.option_groups.length ? " · 可选口味" : ""}</span>{quantity > 0 && <span className="dish-quantity-badge">{quantity}</span>}</button>; })}</div>
         {!visibleDishes.length && <div className="empty">暂无匹配菜品，请在“菜品”中配置。</div>}
       </div>
       <aside className="current-order">
         <div className="order-card-heading"><h3>订单总览</h3><span>{order.items.length} 项已提交</span></div>
-        <div className="order-lines">{order.items.map((item) => <div className="order-line" key={item.id}><div className="line-main"><strong>{item.name}</strong><span>{money(item.priceFen)} × {item.quantity}</span>{item.note && <small>备注：{item.note}</small>}{(item.giftedQuantity > 0 || item.returnedQuantity > 0) && <small className="line-flags">{item.giftedQuantity ? `赠${item.giftedQuantity}` : ""}{item.returnedQuantity ? ` 退${item.returnedQuantity}` : ""}</small>}</div>{open && <div className="line-actions"><button onClick={() => setActionTarget({ item, action: "gift" })} disabled={!item.availableQuantity}>赠送</button><button onClick={() => setActionTarget({ item, action: "return" })} disabled={item.returnedQuantity >= item.quantity}>退菜</button></div>}</div>)}</div>
+        <div className="order-lines">{order.items.map((item) => <div className="order-line" key={item.id}><div className="line-main"><strong>{item.name}</strong><span>{money(item.priceFen)} × {item.quantity}</span>{item.note && <small>{formatItemNote(item.note)}</small>}{(item.giftedQuantity > 0 || item.returnedQuantity > 0) && <small className="line-flags">{item.giftedQuantity ? `赠${item.giftedQuantity}` : ""}{item.returnedQuantity ? ` 退${item.returnedQuantity}` : ""}</small>}</div>{open && <div className="line-actions"><button onClick={() => setActionTarget({ item, action: "gift" })} disabled={!item.availableQuantity}>赠送</button><button onClick={() => setActionTarget({ item, action: "return" })} disabled={item.returnedQuantity >= item.quantity}>退菜</button></div>}</div>)}</div>
         {Object.keys(cart).length > 0 && <div className="cart-box"><div className="order-card-heading"><h3>待提交</h3><span>{money(cartTotal)}</span></div>{Object.values(cart).map((line) => { const note = cartLineNote(line); return <div className="cart-line" key={line.key}><div><strong>{line.dish.name}</strong><small className={note ? "line-note" : "line-note placeholder"}>{note || "点击备注填写口味"}</small></div><button onClick={() => editNote(line.key)}>备注</button><div className="quantity"><button onClick={() => changeCart(line.key, -1)}>−</button><span>{line.quantity}</span><button onClick={() => changeCart(line.key, 1)}>＋</button></div></div>; })}<button className="primary wide" onClick={submitItems} disabled={busy}>提交并打印两份</button></div>}
         <div className="order-total"><span>当前应收</span><strong>{money(displayRevenue)}</strong><small>原价 {money(order.totals.grossFen + cartTotal)} · 赠送 {money(order.totals.giftFen)} · 退菜 {money(order.totals.returnFen)}</small><div className="order-margin">本单毛利率 <strong>{displayMargin}%</strong></div></div>
       </aside>
     </div>
+    {previewOpen && <OrderPreviewDialog order={order} cartLines={Object.values(cart)} totalFen={previewTotalFen} totalLabel={previewTotalLabel} onClose={() => setPreviewOpen(false)} />}
     {checkoutOpen && <CheckoutPanel order={order} onClose={() => setCheckoutOpen(false)} onDone={async (nextOrder, message) => { setOrder(nextOrder); setCheckoutOpen(false); setMessage(message); await refreshTables(); }} />}
     {optionTarget && <DishOptionsDialog dish={optionTarget} onClose={() => setOptionTarget(null)} onSubmit={(selections, note) => { addConfiguredDish(optionTarget, selections, note); setOptionTarget(null); }} />}
     {noteTarget && <NoteDialog note={noteTarget.note} title="填写自定义备注" onClose={() => setNoteTarget(null)} onSubmit={saveNote} />}
@@ -521,6 +537,44 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
     {confirmAction === "reopen" && <ConfirmDialog title="撤销并重新开账" message="原账单、积分冲销和新账单都会保留，是否继续？" confirmText="确认撤销重结" busy={busy} onClose={() => setConfirmAction(null)} onConfirm={() => void reopen()} />}
     {confirmAction === "end" && <ConfirmDialog title="直接结束本单" message="本单将释放桌台，不生成结账或收款记录；订单仍会保留在订单查询中。" confirmText="直接结束" danger busy={busy} onClose={() => setConfirmAction(null)} onConfirm={() => void endWithoutPayment()} />}
   </section>;
+}
+
+function OrderPreviewDialog({ order, cartLines, totalFen, totalLabel, onClose }: {
+  order: Order;
+  cartLines: CartLine[];
+  totalFen: number;
+  totalLabel: string;
+  onClose: () => void;
+}) {
+  const rows = [
+    ...order.items.map((item) => ({
+      key: item.id,
+      name: item.name,
+      quantity: item.quantity,
+      unit: item.unit,
+      priceFen: item.priceFen,
+      note: item.note,
+      state: "已提交"
+    })),
+    ...cartLines.map((line) => ({
+      key: line.key,
+      name: line.dish.name,
+      quantity: line.quantity,
+      unit: line.dish.unit,
+      priceFen: line.dish.price_fen,
+      note: cartLineNote(line),
+      state: "待提交"
+    }))
+  ];
+  return <Dialog title="全单预览" description={`${tableDisplayName(order.tableName, order.tableNumber)} · ${order.peopleCount} 人 · ${rows.length} 项`} onClose={onClose} className="order-preview-modal">
+    {rows.length > 0 ? <div className="order-preview-list">{rows.map((row) => <div className="order-preview-row" key={row.key}>
+      <div className="order-preview-main"><strong>{row.name}</strong><span>{row.quantity} {row.unit} × {money(row.priceFen)}<b>{money(row.quantity * row.priceFen)}</b></span></div>
+      <span className={`status-pill ${row.state === "待提交" ? "gray" : "green"}`}>{row.state}</span>
+      {row.note && <small>{formatItemNote(row.note)}</small>}
+    </div>)}</div> : <div className="empty">还没有选择菜品</div>}
+    <div className="order-preview-total"><span>{totalLabel}</span><strong>{money(totalFen)}</strong></div>
+    <div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button></div>
+  </Dialog>;
 }
 
 function DishOptionsDialog({ dish, onClose, onSubmit }: { dish: Dish; onClose: () => void; onSubmit: (selections: DishOptionSelection[], note: string) => void }) {
@@ -798,9 +852,10 @@ function PrintPreviewDialog({ job, onClose }: { job: PrintJob; onClose: () => vo
   const items = Array.isArray(payload.items) ? payload.items as Array<Record<string, unknown>> : [];
   const totals = payload.totals && typeof payload.totals === "object" ? payload.totals as Record<string, unknown> : null;
   const isReceipt = job.kind === "RECEIPT";
-  const hasOrderNote = Boolean(payload.orderNote);
   const hasFooter = Boolean(payload.footer);
-  return <Dialog title="打印结果预览" description={`${printKindText(job.kind)} · ${printStatusText(job.status)}`} onClose={onClose} className="print-preview-modal"><div className="print-paper"><div className="print-paper-title">{String(payload.title || printKindText(job.kind))}</div><div>桌台：{String(payload.tableName || (payload.tableNumber ? `${payload.tableNumber}号桌` : "无桌台"))}</div><div>人数：{String(payload.peopleCount || "—")}　顾客：{String(payload.customer || "散客")}</div>{payload.batchNo ? <div>批次：第 {String(payload.batchNo)} 批</div> : null}{isReceipt ? <><div>开台时间：{formatTime(String(payload.openedAt || ""))}</div><div>结账时间：{formatTime(String(payload.settledAt || payload.createdAt || ""))}</div></> : <div>时间：{formatTime(String(payload.createdAt || job.created_at))}</div>}{hasOrderNote ? <div className="print-order-note">本单备注：{String(payload.orderNote)}</div> : null}<hr />{items.map((item, index) => { const quantity = Number(item.quantity || 0); const priceFen = Number(item.priceFen || 0); return <div className="print-line" key={`${String(item.name)}-${index}`}><div className="print-line-main"><strong>{String(item.name)}</strong><span>× {quantity} {item.unit ? String(item.unit) : ""}</span>{isReceipt && <b>{money(priceFen * quantity)}</b>}</div>{isReceipt && <div className="print-unit-price">单价 {money(priceFen)}</div>}{item.note ? <div className="print-item-note">备注：{String(item.note)}</div> : null}</div>; })}{totals && <><hr /><div>原价：{money(Number(totals.grossFen))}</div><div>赠送：-{money(Number(totals.giftFen))}</div><div>退菜：-{money(Number(totals.returnFen))}</div><div>人工减免：-{money(Number(totals.manualDiscountFen))}</div><div>积分抵扣：-{money(Number(totals.pointsDiscountFen))}</div><div className="print-total">实收：{money(Number(totals.receivedFen))}</div><div>收款方式：{String(payload.paymentMethod || "—")}</div></>}{hasFooter ? <><hr /><div className="print-footer">{String(payload.footer)}</div></> : null}</div><div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button></div></Dialog>;
+  const orderNote = isReceipt ? "" : String(payload.orderNote || "");
+  const tableName = String(payload.tableName || (payload.tableNumber ? `${payload.tableNumber}号桌` : "无桌台"));
+  return <Dialog title="打印结果预览" description={`${printKindText(job.kind)} · ${printStatusText(job.status)}`} onClose={onClose} className="print-preview-modal"><div className="print-paper"><div className="print-paper-title">{String(payload.title || printKindText(job.kind))}</div><div className="print-table-name">{tableName}</div><div>人数：{String(payload.peopleCount || "—")}　顾客：{String(payload.customer || "散客")}</div>{payload.batchNo ? <div>批次：第 {String(payload.batchNo)} 批</div> : null}{isReceipt ? <><div>开台时间：{formatTime(String(payload.openedAt || ""))}</div><div>结账时间：{formatTime(String(payload.settledAt || payload.createdAt || ""))}</div></> : <div>时间：{formatTime(String(payload.createdAt || job.created_at))}</div>}{orderNote && <div className="print-order-note">本单备注：{orderNote}</div>}<hr />{items.map((item, index) => { const quantity = Number(item.quantity || 0); const priceFen = Number(item.priceFen || 0); const note = formatItemNote(String(item.note || "")); return <div className="print-line" key={`${String(item.name)}-${index}`}><div className="print-line-main"><strong>{String(item.name)}</strong><span>× {quantity} {item.unit ? String(item.unit) : ""}</span>{isReceipt && <b>{money(priceFen * quantity)}</b>}</div>{isReceipt && <div className="print-unit-price">单价 {money(priceFen)}</div>}{note && <div className="print-item-note">{note}</div>}</div>; })}{totals && <><hr /><div>应收：{money(Number(totals.dueFen ?? totals.receivedFen ?? 0))}</div><div className="print-total">实收：{money(Number(totals.receivedFen || 0))}</div></>}{hasFooter ? <><hr /><div className="print-footer">{String(payload.footer)}</div></> : null}</div><div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button></div></Dialog>;
 }
 
 function StatsPage({ setMessage }: { setMessage: (message: string) => void }) {

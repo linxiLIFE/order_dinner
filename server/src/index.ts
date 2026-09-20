@@ -190,8 +190,8 @@ function optionSelections(
     }
   }
   const note = text(customNote).slice(0, 300);
-  if (note) noteParts.push(`备注：${note}`);
-  return { note: noteParts.join("；").slice(0, 500), snapshot };
+  if (note) noteParts.push(snapshot.length ? `备注：${note}` : note);
+  return { note: noteParts.join("，").slice(0, 500), snapshot };
 }
 
 async function replaceDishOptionGroups(client: DbClient, dishId: string, rawGroups: unknown): Promise<void> {
@@ -425,12 +425,14 @@ function printOrderPayload(order: Record<string, unknown>, items: Array<Record<s
     peopleCount: order.peopleCount,
     customer: (order.customer as { name?: string; phone?: string | null } | undefined)?.name || "散客",
     phone: (order.customer as { phone?: string | null } | undefined)?.phone || null,
-    orderNote: text(order.orderNote),
+    orderNote: title === "结账小票" ? "" : text(order.orderNote),
     openedAt: order.openedAt || null,
     settledAt: order.settledAt || null,
     createdAt,
     layout: {
+      tableNameSize: "LARGE",
       dishNameSize: "LARGE",
+      quantityInline: true,
       showItemPrice: title === "结账小票"
     },
     items: items.map((item) => ({
@@ -1031,6 +1033,7 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
           returnFen: totals.returnFen,
           manualDiscountFen,
           pointsDiscountFen,
+          dueFen: receivedFen,
           receivedFen
         },
         paymentMethod,
