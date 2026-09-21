@@ -42,8 +42,21 @@ else
 fi
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "chmod 600 '$remote_root/.env'"
 
-echo "部署前备份数据库"
-ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "ORDER_DINNER_ROOT='$remote_root' '$remote_release/scripts/backup.sh'"
+echo "检查现有数据库并按需备份"
+remote_db_check='set -euo pipefail; sudo docker info >/dev/null; names="$(sudo docker container ls --all --format "{{.Names}}")"; if printf "%s\n" "$names" | grep -Fxq "order-dinner-db"; then sudo docker inspect -f "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" order-dinner-db; else printf "%s\n" "__NO_ORDER_DINNER_DB__"; fi'
+if ! db_state="$(ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "$remote_db_check")"; then
+  echo "无法可靠检查远端 Docker/数据库状态，为保护数据已中止部署" >&2
+  exit 1
+fi
+if [[ "$db_state" == "__NO_ORDER_DINNER_DB__" ]]; then
+  echo "首次部署：未发现数据库容器，跳过备份"
+elif [[ "$db_state" != "running|healthy" ]]; then
+  echo "数据库容器状态异常（$db_state），为保护数据已中止部署" >&2
+  exit 1
+else
+  echo "数据库健康，开始部署前备份"
+  ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "ORDER_DINNER_ROOT='$remote_root' '$remote_release/scripts/backup.sh'"
+fi
 
 echo "启动数据库与应用容器"
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo docker network inspect love-web_love-network >/dev/null && sudo env ORDER_DINNER_BUILD_CONTEXT='$remote_release' docker compose --project-directory '$remote_root' --env-file '$remote_root/.env' -f '$remote_release/docker-compose.yml' up -d --build"

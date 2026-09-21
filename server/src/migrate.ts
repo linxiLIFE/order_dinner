@@ -92,6 +92,8 @@ CREATE INDEX IF NOT EXISTS dish_options_group_idx ON dish_options (group_id, sor
 CREATE TABLE IF NOT EXISTS orders (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   table_id uuid REFERENCES restaurant_tables(id),
+  table_number_snapshot integer,
+  table_name_snapshot text,
   customer_id uuid REFERENCES customers(id),
   guest_label text,
   people_count integer NOT NULL DEFAULT 2 CHECK (people_count > 0),
@@ -274,6 +276,13 @@ export async function migrateAndSeed(): Promise<void> {
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS ended_by uuid REFERENCES employees(id)`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS end_reason text NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_note text NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS table_number_snapshot integer`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS table_name_snapshot text`);
+  await pool.query(
+    `UPDATE orders o SET table_number_snapshot = t.number, table_name_snapshot = t.name
+     FROM restaurant_tables t WHERE t.id = o.table_id
+       AND (o.table_number_snapshot IS NULL OR o.table_name_snapshot IS NULL)`
+  );
   await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS option_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS manual_requested_at timestamptz`);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS auth_version integer NOT NULL DEFAULT 0`);
@@ -339,10 +348,8 @@ export async function migrateAndSeed(): Promise<void> {
     [username, passwordHash]
   );
 
-  if (process.env.SEED_DEMO_DATA === "true") {
-    await seedOtherCategoryDishes();
-    await seedDemoDishes();
-  }
+  await seedProductionMenu();
+  if (process.env.SEED_DEMO_DATA === "true") await seedDemoDishes();
 
   await pruneExpiredIdempotencyKeys();
 }
@@ -351,8 +358,8 @@ export async function pruneExpiredIdempotencyKeys(): Promise<void> {
   await pool.query(`DELETE FROM idempotency_keys WHERE created_at < now() - interval '90 days'`);
 }
 
-async function seedOtherCategoryDishes(): Promise<void> {
-  const migrationName = "20260920_other_category_menu_v2_demo_only";
+async function seedProductionMenu(): Promise<void> {
+  const migrationName = "20260921_initial_53_production_menu";
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -373,8 +380,7 @@ async function seedOtherCategoryDishes(): Promise<void> {
     const categoryId = categoryResult.rows[0]?.id;
     if (!categoryId) throw new Error("创建其他分类失败");
     if (!categoryResult.rows[0].active) {
-      await client.query("COMMIT");
-      return;
+      await client.query(`UPDATE categories SET active = true, updated_at = now() WHERE id = $1`, [categoryId]);
     }
 
     for (const [name, priceFen, costFen] of OTHER_CATEGORY_DISHES) {

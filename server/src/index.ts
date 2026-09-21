@@ -10,7 +10,17 @@ import { pool, withReadOnlySnapshot, withTransaction, type DbClient } from "./db
 import { migrateAndSeed, pruneExpiredIdempotencyKeys } from "./migrate.js";
 import { createToken, requireAuth, requireRole } from "./auth.js";
 import type { AuthenticatedRequest, AuthUser } from "./types.js";
-import { idempotencyLockKey, normalizeCustomerPhone, redactFinancialDetails, requireNonNegativeInteger, requirePositiveInteger } from "./domain.js";
+import {
+  averageFen,
+  csvDocument,
+  fenAsYuan,
+  idempotencyLockKey,
+  normalizeCustomerPhone,
+  ratioPercent,
+  redactFinancialDetails,
+  requireNonNegativeInteger,
+  requirePositiveInteger
+} from "./domain.js";
 import {
   businessDate,
   getSettings,
@@ -58,6 +68,72 @@ function text(value: unknown, fallback = ""): string {
 
 function routeParam(req: Request, name: string): string {
   return text(req.params[name]);
+}
+
+type StoreEvent = {
+  type: string;
+  orderId?: string;
+  newOrderId?: string;
+  tableId?: string | null;
+};
+
+type EventTicket = { employeeId: string; authVersion: number; expiresAt: number; tokenExpiresAt: number };
+type EventStream = {
+  response: Response;
+  heartbeat: ReturnType<typeof setInterval>;
+  employeeId: string;
+  authVersion: number;
+  tokenExpiresAt: number;
+  validating: boolean;
+};
+const eventTickets = new Map<string, EventTicket>();
+const eventStreams = new Set<EventStream>();
+
+function closeEventStream(stream: EventStream): void {
+  clearInterval(stream.heartbeat);
+  eventStreams.delete(stream);
+  if (!stream.response.destroyed && !stream.response.writableEnded) stream.response.end();
+}
+
+async function validateEventStream(stream: EventStream): Promise<void> {
+  if (!eventStreams.has(stream)) return;
+  if (stream.response.destroyed || stream.response.writableEnded || Date.now() >= stream.tokenExpiresAt) {
+    closeEventStream(stream);
+    return;
+  }
+  if (stream.validating) return;
+  stream.validating = true;
+  try {
+    const result = await pool.query<{ active: boolean; auth_version: number }>(
+      `SELECT active, auth_version FROM employees WHERE id = $1`,
+      [stream.employeeId]
+    );
+    const employee = result.rows[0];
+    if (!employee?.active || employee.auth_version !== stream.authVersion) {
+      closeEventStream(stream);
+      return;
+    }
+    if (!stream.response.write(": keep-alive\n\n")) closeEventStream(stream);
+  } catch {
+    closeEventStream(stream);
+  } finally {
+    stream.validating = false;
+  }
+}
+
+function broadcastUpdate(event: StoreEvent): void {
+  const message = `data: ${JSON.stringify({ ...event, at: new Date().toISOString() })}\n\n`;
+  for (const stream of eventStreams) {
+    try {
+      if (stream.response.destroyed || stream.response.writableEnded) {
+        closeEventStream(stream);
+        continue;
+      }
+      if (!stream.response.write(message)) closeEventStream(stream);
+    } catch {
+      closeEventStream(stream);
+    }
+  }
 }
 
 function printerTokenHash(token: string): string {
@@ -282,7 +358,8 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     end_reason: string;
     order_note: string;
   }>(
-    `SELECT o.*, t.number AS table_number, t.name AS table_name,
+    `SELECT o.*, COALESCE(o.table_number_snapshot, t.number) AS table_number,
+            COALESCE(o.table_name_snapshot, t.name) AS table_name,
             c.name AS customer_name, c.phone AS customer_phone,
             c.points_balance
      FROM orders o
@@ -468,6 +545,14 @@ async function makePrintJobs(
   }
 }
 
+async function expireStalePrintClaims(client: DbClient = pool): Promise<void> {
+  await client.query(
+    `UPDATE print_jobs SET status = 'NEEDS_CHECK',
+       last_error = COALESCE(NULLIF(last_error, ''), '打印设备领取超时，打印结果未知')
+     WHERE status = 'CLAIMED' AND (claimed_at IS NULL OR claimed_at < now() - interval '5 minutes')`
+  );
+}
+
 async function currentOrder(client: DbClient, orderId: string, lock = false) {
   const result = await client.query<{
     id: string;
@@ -633,6 +718,74 @@ app.get("/api/auth/me", requireAuth, (req: AuthenticatedRequest, res) => {
   res.json({ user: currentUser(req) });
 });
 
+app.post("/api/auth/event-ticket", requireAuth, (req: AuthenticatedRequest, res) => {
+  const user = currentUser(req);
+  const now = Date.now();
+  for (const [ticket, value] of eventTickets) {
+    if (value.expiresAt <= now) eventTickets.delete(ticket);
+  }
+  if (eventTickets.size >= 4096) {
+    res.status(429).json({ error: "实时同步连接过多，请稍后重试" });
+    return;
+  }
+  const ticket = crypto.randomBytes(32).toString("hex");
+  eventTickets.set(ticket, {
+    employeeId: user.id,
+    authVersion: user.authVersion || 0,
+    expiresAt: now + 30_000,
+    tokenExpiresAt: req.tokenExpiresAt || now
+  });
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ ticket, expiresAt: new Date(now + 30_000).toISOString() });
+});
+
+app.get("/api/events", async (req, res) => {
+  const ticket = text(req.query.ticket);
+  const record = eventTickets.get(ticket);
+  eventTickets.delete(ticket);
+  if (!record || record.expiresAt <= Date.now()) {
+    res.status(401).json({ error: "实时同步授权已失效，请重新连接" });
+    return;
+  }
+  const employeeStreamCount = [...eventStreams].filter((stream) => stream.employeeId === record.employeeId).length;
+  if (eventStreams.size >= 256 || employeeStreamCount >= 10) {
+    res.status(429).json({ error: "实时同步连接数量已达上限" });
+    return;
+  }
+  try {
+    const employee = await pool.query<{ active: boolean; auth_version: number }>(
+      `SELECT active, auth_version FROM employees WHERE id = $1`,
+      [record.employeeId]
+    );
+    if (!employee.rows[0]?.active || employee.rows[0].auth_version !== record.authVersion) {
+      res.status(401).json({ error: "账号已停用，请重新登录" });
+      return;
+    }
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-store, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+    res.write(": connected\n\n");
+    const stream: EventStream = {
+      response: res,
+      heartbeat: setInterval(() => { void validateEventStream(stream); }, 25_000),
+      employeeId: record.employeeId,
+      authVersion: record.authVersion,
+      tokenExpiresAt: record.tokenExpiresAt,
+      validating: false
+    };
+    stream.heartbeat.unref();
+    eventStreams.add(stream);
+    res.on("close", () => {
+      closeEventStream(stream);
+    });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
 app.get("/api/tables", requireAuth, async (_req, res) => {
   try {
     const result = await pool.query(
@@ -684,6 +837,7 @@ app.post("/api/tables", requireAuth, requireRole("OWNER"), async (req: Authentic
       await logOperation(client, user.id, "CREATE_TABLE", "TABLE", result.rows[0].id, { number, name, seats });
       return result.rows[0].id;
     });
+    broadcastUpdate({ type: "table.updated", tableId });
     res.status(201).json({ tableId });
   } catch (error) {
     publicError(res, error);
@@ -714,15 +868,21 @@ app.post("/api/tables/:tableId/open", requireAuth, async (req: AuthenticatedRequ
         customerId = await findOrCreateCustomer(client, phone, customerName);
       }
       const order = await client.query<{ id: string }>(
-        `INSERT INTO orders (table_id, customer_id, guest_label, people_count, created_by)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-        [tableId, customerId, customerId ? null : (customerName || "散客"), people, user.id]
+        `INSERT INTO orders
+         (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+        [tableId, table.number, table.name, customerId, customerId ? null : (customerName || "散客"), people, user.id]
       );
       await client.query(`UPDATE restaurant_tables SET status = 'OCCUPIED', updated_at = now() WHERE id = $1`, [tableId]);
       await logOperation(client, user.id, "OPEN_TABLE", "ORDER", order.rows[0].id, { tableId, tableNumber: table.number, tableName: table.name });
       const result = await orderDetails(client, order.rows[0].id, user.role === "OWNER");
       await saveIdempotent(client, `open:${tableId}`, requestKey, user.id, result, requestPayload);
       return result;
+    });
+    broadcastUpdate({
+      type: "order.created",
+      orderId: String((response as Record<string, unknown>).id),
+      tableId
     });
     res.status(201).json({ order: response });
   } catch (error) {
@@ -749,6 +909,7 @@ app.delete("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req
       await client.query(`DELETE FROM restaurant_tables WHERE id = $1`, [tableId]);
       await logOperation(client, user.id, "DELETE_TABLE", "TABLE", tableId, { number: table.rows[0].number, name: table.rows[0].name });
     });
+    broadcastUpdate({ type: "table.updated", tableId });
     res.json({ ok: true });
   } catch (error) {
     publicError(res, error);
@@ -790,8 +951,8 @@ app.get("/api/orders/search", requireAuth, async (req, res) => {
         o.id::text ILIKE ${pattern}
         OR COALESCE(c.name, o.guest_label, '') ILIKE ${pattern}
         OR COALESCE(c.phone, '') ILIKE ${pattern}
-        OR COALESCE(t.name, '') ILIKE ${pattern}
-        OR COALESCE(t.number::text, '') ILIKE ${pattern}
+        OR COALESCE(o.table_name_snapshot, t.name, '') ILIKE ${pattern}
+        OR COALESCE(o.table_number_snapshot::text, t.number::text, '') ILIKE ${pattern}
       )`);
     }
     if (minFenText) {
@@ -809,7 +970,9 @@ app.get("/api/orders/search", requireAuth, async (req, res) => {
       ) <= ${add(maxFen)}`);
     }
     const result = await pool.query(
-      `SELECT o.id, o.table_id, t.number AS table_number, t.name AS table_name,
+      `SELECT o.id, o.table_id,
+              COALESCE(o.table_number_snapshot, t.number) AS table_number,
+              COALESCE(o.table_name_snapshot, t.name) AS table_name,
               o.customer_id, COALESCE(c.name, o.guest_label, '散客') AS customer_name,
               c.phone AS customer_phone, o.people_count, o.status, o.business_date,
               o.opened_at, o.settled_at, o.ended_at, o.end_reason,
@@ -900,6 +1063,7 @@ app.patch("/api/orders/:orderId/note", requireAuth, async (req: AuthenticatedReq
       await logOperation(client, user.id, "UPDATE_ORDER_NOTE", "ORDER", orderId, { note });
       return orderDetails(client, orderId, user.role === "OWNER");
     });
+    broadcastUpdate({ type: "order.updated", orderId, tableId: (response.tableId as string | null) ?? null });
     res.json({ order: response });
   } catch (error) {
     publicError(res, error);
@@ -930,6 +1094,11 @@ app.post("/api/orders/:orderId/end", requireAuth, async (req: AuthenticatedReque
       const details = await orderDetails(client, orderId, user.role === "OWNER");
       await saveIdempotent(client, `end:${orderId}`, requestKey, user.id, details, requestPayload);
       return details;
+    });
+    broadcastUpdate({
+      type: "order.ended",
+      orderId,
+      tableId: ((response as Record<string, unknown>).tableId as string | null) ?? null
     });
     res.json({ order: response });
   } catch (error) {
@@ -1000,6 +1169,11 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
       await saveIdempotent(client, `items:${orderId}`, requestKey, user.id, details, requestPayload);
       return details;
     });
+    broadcastUpdate({
+      type: "order.updated",
+      orderId,
+      tableId: ((response as Record<string, unknown>).tableId as string | null) ?? null
+    });
     res.status(201).json({ order: response });
   } catch (error) {
     publicError(res, error);
@@ -1032,6 +1206,11 @@ app.post("/api/orders/:orderId/items/:itemId/gift", requireAuth, async (req: Aut
       const details = await orderDetails(client, orderId, user.role === "OWNER");
       await saveIdempotent(client, `gift:${orderId}:${itemId}`, requestKey, user.id, details, requestPayload);
       return details;
+    });
+    broadcastUpdate({
+      type: "order.updated",
+      orderId,
+      tableId: ((response as Record<string, unknown>).tableId as string | null) ?? null
     });
     res.json({ order: response });
   } catch (error) {
@@ -1096,6 +1275,11 @@ app.post("/api/orders/:orderId/items/:itemId/return", requireAuth, async (req: A
       });
       await saveIdempotent(client, `return:${orderId}:${itemId}`, requestKey, user.id, details, requestPayload);
       return details;
+    });
+    broadcastUpdate({
+      type: "order.updated",
+      orderId,
+      tableId: ((response as Record<string, unknown>).tableId as string | null) ?? null
     });
     res.json({ order: response });
   } catch (error) {
@@ -1235,6 +1419,11 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       await saveIdempotent(client, `checkout:${orderId}`, requestKey, user.id, result, requestPayload);
       return result;
     });
+    broadcastUpdate({
+      type: "order.settled",
+      orderId,
+      tableId: ((((response as Record<string, unknown>).order as Record<string, unknown>).tableId as string | null) ?? null)
+    });
     res.json(response);
   } catch (error) {
     publicError(res, error);
@@ -1298,20 +1487,15 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
         [user.id, settlement.id]
       );
       await client.query(`UPDATE orders SET status = 'REVERSED', updated_at = now() WHERE id = $1`, [orderId]);
-      if (original.table_id) {
-        const table = await client.query<{ status: string }>(
-          `SELECT status FROM restaurant_tables WHERE id = $1 FOR UPDATE`,
-          [original.table_id]
-        );
-        if (table.rows[0]?.status !== "AVAILABLE") fail("原桌台已经开了新账单，请先处理当前账单");
-      }
       const newOrder = await client.query<{ id: string }>(
         `INSERT INTO orders
-         (table_id, customer_id, guest_label, people_count, status, parent_order_id, created_by, business_date, order_note, order_version)
-         SELECT source.table_id, source.customer_id, source.guest_label, source.people_count, 'OPEN', $1, $2,
+         (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, status,
+          parent_order_id, created_by, business_date, order_note, order_version)
+         SELECT NULL, COALESCE(source.table_number_snapshot, t.number), COALESCE(source.table_name_snapshot, t.name),
+                source.customer_id, source.guest_label, source.people_count, 'OPEN', $1, $2,
                 source.business_date, source.order_note,
                 COALESCE((SELECT MAX(batch_no) FROM order_batches WHERE order_id = source.id), 0)
-         FROM orders source WHERE source.id = $3
+         FROM orders source LEFT JOIN restaurant_tables t ON t.id = source.table_id WHERE source.id = $3
          RETURNING id`,
         [orderId, user.id, orderId]
       );
@@ -1342,13 +1526,16 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
             item.quantity, item.gifted_quantity, item.returned_quantity, item.returned_made_quantity, item.note, JSON.stringify(item.option_snapshot || [])]
         );
       }
-      if (original.table_id) {
-        await client.query(`UPDATE restaurant_tables SET status = 'OCCUPIED', updated_at = now() WHERE id = $1`, [original.table_id]);
-      }
       await logOperation(client, user.id, "REOPEN_ORDER", "ORDER", orderId, { newOrderId, settlementId: settlement.id });
       const result = { originalOrderId: orderId, order: await orderDetails(client, newOrderId, true), pointsBalance: balanceAfter };
       await saveIdempotent(client, `reopen:${orderId}`, requestKey, user.id, result, requestPayload);
       return result;
+    });
+    broadcastUpdate({
+      type: "order.reopened",
+      orderId,
+      newOrderId: String(((response as Record<string, unknown>).order as Record<string, unknown>).id),
+      tableId: null
     });
     res.json(response);
   } catch (error) {
@@ -1377,14 +1564,50 @@ app.post("/api/categories", requireAuth, requireRole("OWNER"), async (req: Authe
     const name = text(req.body?.name);
     if (!name) fail("分类名称不能为空");
     const category = await withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-category-order'))`);
+      const nextSortOrder = req.body?.sortOrder === undefined
+        ? Number((await client.query<{ next_order: number }>(`SELECT COALESCE(MAX(sort_order), 0) + 10 AS next_order FROM categories`)).rows[0]?.next_order || 10)
+        : requireNonNegativeInteger(req.body.sortOrder, "分类顺序必须是非负整数");
       const result = await client.query<{ id: string; name: string }>(
         `INSERT INTO categories (name, sort_order) VALUES ($1, $2) RETURNING id, name`,
-        [name, req.body?.sortOrder === undefined ? 0 : requireNonNegativeInteger(req.body.sortOrder, "分类顺序必须是非负整数")]
+        [name, nextSortOrder]
       );
       await logOperation(client, user.id, "CREATE_CATEGORY", "CATEGORY", result.rows[0].id, { name });
       return result.rows[0];
     });
+    broadcastUpdate({ type: "menu.updated" });
     res.status(201).json({ category });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.put("/api/categories/order", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const parsed = z.object({ ids: z.array(z.string().uuid()).max(500) }).safeParse(req.body);
+    if (!parsed.success || new Set(parsed.data?.ids || []).size !== parsed.data?.ids.length) {
+      fail("分类顺序内容不正确，请刷新后重试");
+    }
+    const categories = await withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-category-order'))`);
+      const active = await client.query<{ id: string }>(
+        `SELECT id FROM categories WHERE active = true ORDER BY sort_order, name FOR UPDATE`
+      );
+      const ids = parsed.data.ids;
+      if (ids.length !== active.rows.length || active.rows.some((row) => !ids.includes(row.id))) {
+        fail("分类列表已变化，请刷新后重新排序", 409);
+      }
+      for (const [index, id] of ids.entries()) {
+        await client.query(`UPDATE categories SET sort_order = $1, updated_at = now() WHERE id = $2 AND active = true`, [(index + 1) * 10, id]);
+      }
+      await logOperation(client, user.id, "REORDER_CATEGORIES", "CATEGORY", null, { ids });
+      return (await client.query(
+        `SELECT id, name, sort_order, active FROM categories WHERE active = true ORDER BY sort_order, name`
+      )).rows;
+    });
+    broadcastUpdate({ type: "menu.updated" });
+    res.json({ categories });
   } catch (error) {
     publicError(res, error);
   }
@@ -1415,6 +1638,7 @@ app.patch("/api/categories/:categoryId", requireAuth, requireRole("OWNER"), asyn
     if (!updates.length) fail("没有要修改的内容");
     values.push(categoryId);
     const category = await withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-category-order'))`);
       const result = await client.query<{ id: string; name: string; active: boolean }>(
         `UPDATE categories SET ${updates.join(", ")}, updated_at = now()
          WHERE id = $${values.length} RETURNING id, name, active`,
@@ -1424,6 +1648,7 @@ app.patch("/api/categories/:categoryId", requireAuth, requireRole("OWNER"), asyn
       await logOperation(client, user.id, req.body?.active === false ? "ARCHIVE_CATEGORY" : "UPDATE_CATEGORY", "CATEGORY", categoryId, req.body);
       return result.rows[0];
     });
+    broadcastUpdate({ type: "menu.updated" });
     res.json({ category });
   } catch (error) {
     publicError(res, error);
@@ -1435,6 +1660,7 @@ app.delete("/api/categories/:categoryId", requireAuth, requireRole("OWNER"), asy
     const user = currentUser(req);
     const categoryId = routeParam(req, "categoryId");
     await withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-category-order'))`);
       const result = await client.query<{ id: string }>(
         `UPDATE categories SET active = false, updated_at = now() WHERE id = $1 AND active = true RETURNING id`,
         [categoryId]
@@ -1442,6 +1668,7 @@ app.delete("/api/categories/:categoryId", requireAuth, requireRole("OWNER"), asy
       if (!result.rows[0]) fail("分类不存在", 404);
       await logOperation(client, user.id, "ARCHIVE_CATEGORY", "CATEGORY", categoryId);
     });
+    broadcastUpdate({ type: "menu.updated" });
     res.json({ ok: true });
   } catch (error) {
     publicError(res, error);
@@ -1538,6 +1765,7 @@ app.post("/api/dishes", requireAuth, requireRole("OWNER"), async (req: Authentic
       await logOperation(client, user.id, "CREATE_DISH", "DISH", id, { name });
       return id;
     });
+    broadcastUpdate({ type: "menu.updated" });
     res.status(201).json({ dishId });
   } catch (error) {
     publicError(res, error);
@@ -1592,6 +1820,7 @@ app.patch("/api/dishes/:dishId", requireAuth, requireRole("OWNER"), async (req: 
       if (hasOptionGroups) await replaceDishOptionGroups(client, dishId, req.body.optionGroups);
       await logOperation(client, user.id, "UPDATE_DISH", "DISH", dishId, req.body);
     });
+    broadcastUpdate({ type: "menu.updated" });
     res.json({ ok: true });
   } catch (error) {
     publicError(res, error);
@@ -1607,6 +1836,7 @@ app.delete("/api/dishes/:dishId", requireAuth, requireRole("OWNER"), async (req:
       if (!result.rows[0]) fail("菜品不存在", 404);
       await logOperation(client, user.id, "ARCHIVE_DISH", "DISH", dishId);
     });
+    broadcastUpdate({ type: "menu.updated" });
     res.json({ ok: true });
   } catch (error) {
     publicError(res, error);
@@ -1624,6 +1854,7 @@ app.put("/api/dishes/:dishId/options", requireAuth, requireRole("OWNER"), async 
       await client.query(`UPDATE dishes SET updated_at = now() WHERE id = $1`, [dishId]);
       await logOperation(client, user.id, "UPDATE_DISH_OPTIONS", "DISH", dishId, { groups: req.body?.groups ?? req.body?.optionGroups ?? [] });
     });
+    broadcastUpdate({ type: "menu.updated" });
     res.json({ ok: true, groups: await dishOptionGroups(pool, dishId) });
   } catch (error) {
     publicError(res, error);
@@ -1669,6 +1900,7 @@ app.patch("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req:
       if (!result.rows[0]) fail("桌台不存在", 404);
       await logOperation(client, user.id, "UPDATE_TABLE", "TABLE", tableId, req.body);
     });
+    broadcastUpdate({ type: "table.updated", tableId });
     res.json({ ok: true });
   } catch (error) {
     publicError(res, error);
@@ -1736,7 +1968,8 @@ function validateDateRange(from: string, to: string): void {
 async function statsData(client: DbClient, from: string, to: string) {
   const summary = await client.query(
     `WITH active AS (
-       SELECT s.*, o.business_date, o.people_count, o.customer_id, o.table_id
+       SELECT s.*, o.business_date, o.people_count, o.customer_id, o.table_id,
+              o.table_number_snapshot, o.table_name_snapshot
        FROM settlements s JOIN orders o ON o.id = s.order_id
        WHERE s.status = 'ACTIVE' AND o.business_date BETWEEN $1::date AND $2::date
      ), costs AS (
@@ -1752,7 +1985,8 @@ async function statsData(client: DbClient, from: string, to: string) {
             COALESCE(SUM(a.gift_fen + a.manual_discount_fen + a.points_discount_fen), 0) AS discount_fen,
             COALESCE(SUM(c.cost_fen), 0) AS cost_fen,
             COALESCE(SUM(c.loss_fen), 0) AS loss_fen,
-            COUNT(DISTINCT a.table_id)::int AS used_table_count,
+            COUNT(*) FILTER (WHERE a.table_number_snapshot IS NOT NULL)::int AS table_order_count,
+            COUNT(DISTINCT a.table_number_snapshot)::int AS used_table_count,
             COUNT(*) FILTER (WHERE a.customer_id IS NULL)::int AS guest_orders
      FROM active a LEFT JOIN costs c ON c.order_id = a.order_id`,
     [from, to]
@@ -1795,7 +2029,9 @@ async function statsData(client: DbClient, from: string, to: string) {
       revenueFen,
       orderCount: Number(row.order_count || 0),
       peopleCount,
-      averageOrderFen: Number(row.order_count || 0) ? Math.round(revenueFen / Number(row.order_count)) : 0,
+      averageOrderFen: averageFen(revenueFen, Number(row.order_count || 0)),
+      tableOrderCount: Number(row.table_order_count || 0),
+      averageTableFen: averageFen(revenueFen, Number(row.table_order_count || 0)),
       averagePersonFen: peopleCount ? Math.round(revenueFen / peopleCount) : 0,
       grossProfitFen: revenueFen - costFen,
       grossMarginPercent: revenueFen ? Math.round(((revenueFen - costFen) / revenueFen) * 10000) / 100 : 0,
@@ -1804,7 +2040,8 @@ async function statsData(client: DbClient, from: string, to: string) {
       usedTableCount: Number(row.used_table_count || 0),
       newCustomers: Number(customers.rows[0]?.new_customers || 0),
       returningCustomers: Number(customers.rows[0]?.returning_customers || 0),
-      guestOrders: Number(row.guest_orders || 0)
+      guestOrders: Number(row.guest_orders || 0),
+      guestOrderPercent: ratioPercent(Number(row.guest_orders || 0), Number(row.order_count || 0))
     },
     sales: sales.rows
   };
@@ -1829,11 +2066,36 @@ app.get("/api/stats/export.csv", requireAuth, requireRole("OWNER"), async (req, 
     const to = text(req.query.to) || today;
     validateDateRange(from, to);
     const data = await withReadOnlySnapshot((client) => statsData(client, from, to));
-    const rows = [
-      ["菜品", "售出数量", "赠送数量", "退菜数量", "销售金额（分）"],
-      ...data.sales.map((row) => [row.dish_name, row.sold_quantity, row.gifted_quantity, row.returned_quantity, row.amount_fen])
+    const summary = data.summary;
+    const rows: unknown[][] = [
+      ["营业报表"],
+      ["开始日期", from],
+      ["结束日期", to],
+      [],
+      ["核心指标"],
+      ["指标", "数值", "单位"],
+      ["营业额", fenAsYuan(summary.revenueFen), "元"],
+      ["订单数", summary.orderCount, "单"],
+      ["有桌台订单数", summary.tableOrderCount, "单"],
+      ["使用桌台数", summary.usedTableCount, "张"],
+      ["每桌平均消费", fenAsYuan(summary.averageTableFen), "元/桌台订单"],
+      ["每单平均消费", fenAsYuan(summary.averageOrderFen), "元/单"],
+      ["用餐人数", summary.peopleCount, "人"],
+      ["人均消费", fenAsYuan(summary.averagePersonFen), "元/人"],
+      ["新客", summary.newCustomers, "人"],
+      ["老客", summary.returningCustomers, "人"],
+      ["散客订单", summary.guestOrders, "单"],
+      ["散客订单占比", summary.guestOrderPercent, "%"],
+      ["毛利润", fenAsYuan(summary.grossProfitFen), "元"],
+      ["毛利率", summary.grossMarginPercent, "%"],
+      ["优惠金额", fenAsYuan(summary.discountFen), "元"],
+      ["退菜损耗", fenAsYuan(summary.lossFen), "元"],
+      [],
+      ["菜品销量"],
+      ["菜品", "销售数量", "赠送数量", "退菜数量", "销售金额（元）"],
+      ...data.sales.map((row) => [row.dish_name, row.sold_quantity, row.gifted_quantity, row.returned_quantity, fenAsYuan(Number(row.amount_fen))])
     ];
-    const csv = rows.map((row) => row.map((value) => `"${String(value ?? "").replaceAll('"', '""')}"`).join(",")).join("\n");
+    const csv = csvDocument(rows);
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="business-stats.csv"; filename*=UTF-8''${encodeURIComponent("营业统计.csv")}`);
     res.send(`\uFEFF${csv}`);
@@ -1873,6 +2135,7 @@ app.put("/api/settings", requireAuth, requireRole("OWNER"), async (req: Authenti
       }
       await logOperation(client, user.id, "UPDATE_SETTINGS", "SETTING", null, parsed.data);
     });
+    broadcastUpdate({ type: "printer.updated" });
     res.json({ settings: await getSettings(pool) });
   } catch (error) {
     publicError(res, error);
@@ -2003,7 +2266,7 @@ app.get("/api/print-jobs", requireAuth, async (req, res) => {
     const result = await pool.query(
       `SELECT pj.id, pj.order_id, pj.batch_id, pj.kind, pj.copy_no, pj.payload, pj.status, pj.device_id, pj.attempts,
               pj.last_error, pj.manual_requested_at, pj.claimed_at, pj.sent_at, pj.created_at
-       FROM print_jobs pj WHERE ${conditions.join(" AND ")}
+       FROM print_jobs pj ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
        ORDER BY pj.created_at DESC, pj.id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params
     );
@@ -2032,7 +2295,7 @@ app.post("/api/print-devices/register", requireAuth, requireRole("OWNER"), async
         `INSERT INTO printer_devices (id, name, token_hash, active, created_by)
          VALUES ($1, $2, $3, true, $4)
          ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, token_hash = EXCLUDED.token_hash,
-           active = true, created_by = EXCLUDED.created_by, updated_at = now()`,
+           active = true, last_seen_at = NULL, created_by = EXCLUDED.created_by, updated_at = now()`,
         [deviceId, name, printerTokenHash(printerToken), user.id]
       );
       for (const [key, value] of [["printer_device_id", deviceId], ["printer_device_name", name]] as const) {
@@ -2045,6 +2308,7 @@ app.post("/api/print-devices/register", requireAuth, requireRole("OWNER"), async
       }
       await logOperation(client, user.id, "REGISTER_PRINTER_DEVICE", "PRINTER_DEVICE", null, { deviceId, name });
     });
+    broadcastUpdate({ type: "printer.updated" });
     res.json({ deviceId, name, printerToken });
   } catch (error) {
     publicError(res, error);
@@ -2058,6 +2322,32 @@ app.get("/api/print-devices", requireAuth, requireRole("OWNER"), async (_req, re
        FROM printer_devices ORDER BY active DESC, updated_at DESC, id`
     );
     res.json({ devices: result.rows });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.post("/api/print-devices/:deviceId/rotate-token", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const deviceId = routeParam(req, "deviceId");
+    const printerToken = crypto.randomBytes(32).toString("hex");
+    const device = await withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-printer-selection'))`);
+      const found = await client.query<{ id: string; name: string; active: boolean }>(
+        `SELECT id, name, active FROM printer_devices WHERE id = $1 FOR UPDATE`,
+        [deviceId]
+      );
+      if (!found.rows[0]) fail("打印设备不存在", 404);
+      await client.query(
+        `UPDATE printer_devices SET token_hash = $1, last_seen_at = NULL, updated_at = now() WHERE id = $2`,
+        [printerTokenHash(printerToken), deviceId]
+      );
+      await logOperation(client, user.id, "ROTATE_PRINTER_TOKEN", "PRINTER_DEVICE", null, { deviceId });
+      return found.rows[0];
+    });
+    broadcastUpdate({ type: "printer.updated" });
+    res.json({ deviceId, name: device.name, active: device.active, printerToken });
   } catch (error) {
     publicError(res, error);
   }
@@ -2101,6 +2391,7 @@ app.patch("/api/print-devices/:deviceId", requireAuth, requireRole("OWNER"), asy
       }
       await logOperation(client, user.id, req.body.active ? "ENABLE_PRINTER_DEVICE" : "DISABLE_PRINTER_DEVICE", "PRINTER_DEVICE", null, { deviceId });
     });
+    broadcastUpdate({ type: "printer.updated" });
     res.json({ ok: true });
   } catch (error) {
     publicError(res, error);
@@ -2120,11 +2411,7 @@ app.post("/api/print-jobs/claim", requirePrinterDevice, async (req, res) => {
       if (!selected.rows[0]?.device_id || selected.rows[0].device_id !== deviceId) {
         fail("此设备不是当前指定的打印主机", 403);
       }
-      await client.query(
-        `UPDATE print_jobs SET status = 'NEEDS_CHECK',
-           last_error = COALESCE(NULLIF(last_error, ''), '打印设备领取超时，打印结果未知')
-         WHERE status = 'CLAIMED' AND (claimed_at IS NULL OR claimed_at < now() - interval '5 minutes')`
-      );
+      await expireStalePrintClaims(client);
       const job = await client.query(
         `SELECT id FROM print_jobs
          WHERE status = 'PENDING'
@@ -2284,6 +2571,11 @@ async function start(): Promise<void> {
     void pruneExpiredIdempotencyKeys().catch((error) => console.error("幂等记录清理失败", error));
   }, 24 * 60 * 60 * 1000);
   idempotencyCleanup.unref();
+  const printClaimCleanup = setInterval(() => {
+    void expireStalePrintClaims().catch((error) => console.error("打印任务超时核对失败", error));
+  }, process.env.NODE_ENV === "test" ? 250 : 60 * 1000);
+  printClaimCleanup.unref();
+  void expireStalePrintClaims().catch((error) => console.error("打印任务超时核对失败", error));
   app.listen(port, () => {
     console.log(`餐厅点单系统已启动：http://0.0.0.0:${port}`);
   });

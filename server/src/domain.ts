@@ -74,6 +74,29 @@ export function dishSales(quantity: number, returned: number, gifted: number, pr
   return { soldQuantity, amountFen: soldQuantity * Math.max(0, Math.trunc(priceFen)) };
 }
 
+export function averageFen(revenueFen: number, orderCount: number): number {
+  return orderCount > 0 ? Math.round(revenueFen / orderCount) : 0;
+}
+
+export function ratioPercent(part: number, total: number): number {
+  return total > 0 ? Math.round((part / total) * 10_000) / 100 : 0;
+}
+
+export function fenAsYuan(value: number | string | null | undefined): string {
+  const fen = Number(value || 0);
+  return (Number.isFinite(fen) ? fen / 100 : 0).toFixed(2);
+}
+
+export function csvCell(value: unknown): string {
+  let text = String(value ?? "");
+  if (typeof value === "string" && /^[\t\r\n ]*[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+export function csvDocument(rows: unknown[][]): string {
+  return rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
+}
+
 export function publicErrorResponse(error: unknown): { status: number; message: string } {
   const errorRecord = typeof error === "object" && error !== null
     ? error as { status?: unknown; code?: unknown }

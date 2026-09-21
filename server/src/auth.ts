@@ -26,6 +26,7 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
       tokenVersion?: number;
     };
     if (typeof claims.id !== "string") throw new Error("invalid token subject");
+    if (!Number.isFinite(claims.exp)) throw new Error("token expiry is required");
     const tokenVersion = Number.isInteger(claims.tokenVersion) ? claims.tokenVersion! : 0;
     void pool.query<{
       id: string;
@@ -50,6 +51,7 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
         role: employee.role,
         authVersion: employee.auth_version
       };
+      req.tokenExpiresAt = claims.exp! * 1000;
       next();
     }).catch(() => {
       res.status(503).json({ error: "登录状态暂时无法验证，请稍后重试" });

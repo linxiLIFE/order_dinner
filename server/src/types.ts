@@ -12,4 +12,5 @@ export type AuthUser = {
 
 export type AuthenticatedRequest = Request & {
   user?: AuthUser;
+  tokenExpiresAt?: number;
 };

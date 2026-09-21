@@ -39,8 +39,20 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
+function currentEmployeeId(): string {
+  try {
+    const payload = authToken.split(".")[1];
+    if (!payload) return "anonymous";
+    const base64 = payload.replaceAll("-", "+").replaceAll("_", "/");
+    const decoded = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "="))) as { id?: unknown };
+    return typeof decoded.id === "string" && decoded.id ? decoded.id : "anonymous";
+  } catch {
+    return "anonymous";
+  }
+}
+
 function requestStorageKey(scope: string): string {
-  return `order-dinner-pending-request:${encodeURIComponent(scope)}`;
+  return `order-dinner-pending-request:${encodeURIComponent(currentEmployeeId())}:${encodeURIComponent(scope)}`;
 }
 
 export function getPendingIdempotentRequest(scope: string): PendingIdempotentRequest | null {
@@ -83,9 +95,14 @@ export async function idempotentApi<T>(path: string, scope: string, payload: Rec
     clearIdempotentRequest(scope, request.idempotencyKey);
     return result;
   } catch (error) {
-    const preserveConflict = error instanceof ApiError && error.status === 409 &&
-      (error.message.includes("请求编号已被其他账号使用") || error.message.includes("上次请求尚未确认且内容已变化"));
-    if (error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 401 && error.status !== 429 && !preserveConflict) {
+    const crossAccountConflict = error instanceof ApiError && error.status === 409
+      && error.message.includes("请求编号已被其他账号使用");
+    if (crossAccountConflict) {
+      clearIdempotentRequest(scope, request.idempotencyKey);
+      window.dispatchEvent(new CustomEvent("点单台幂等请求冲突", { detail: { scope } }));
+      throw new ApiError("该请求属于其他员工，请确认当前订单状态", 409);
+    } else if (error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 401 && error.status !== 429
+      && !error.message.includes("上次请求尚未确认且内容已变化")) {
       clearIdempotentRequest(scope, request.idempotencyKey);
     }
     throw error;

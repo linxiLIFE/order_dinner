@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   dishSales,
+  averageFen,
+  csvDocument,
+  fenAsYuan,
   idempotencyLockKey,
   normalizeCustomerPhone,
   publicErrorResponse,
+  ratioPercent,
   redactFinancialDetails,
   requireNonNegativeInteger,
   requirePositiveInteger
@@ -59,6 +63,23 @@ test("金额和顺序字段只接受范围内的非负整数", () => {
 test("销量金额按退菜和赠送后的实际付费数量计算", () => {
   assert.deepEqual(dishSales(5, 1, 2, 2500), { soldQuantity: 2, amountFen: 5000 });
   assert.deepEqual(dishSales(3, 4, 2, 100), { soldQuantity: 0, amountFen: 0 });
+});
+
+test("报表平均值、比例和元格式处理边界值", () => {
+  assert.equal(averageFen(12_800, 4), 3_200);
+  assert.equal(averageFen(12_800, 0), 0);
+  assert.equal(ratioPercent(7, 20), 35);
+  assert.equal(ratioPercent(1, 0), 0);
+  assert.equal(fenAsYuan(128_800), "1288.00");
+  assert.equal(fenAsYuan(undefined), "0.00");
+});
+
+test("CSV 使用 CRLF、转义双引号并拦截公式注入文本", () => {
+  const csv = csvDocument([["菜品", "备注"], ["=1+1", '大份,"加辣"']]);
+  assert.ok(csv.startsWith('"菜品","备注"'));
+  assert.equal(csv.split("\r\n").length, 2);
+  assert.ok(csv.includes("'=1+1"));
+  assert.ok(csv.includes('大份,""加辣"'));
 });
 
 test("500 错误不向客户端泄漏内部信息，冲突错误可读且有明确状态", () => {

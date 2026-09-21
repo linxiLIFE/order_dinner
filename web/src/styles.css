@@ -57,6 +57,9 @@ main { max-width: 1600px; margin: 0 auto; }
 .table-card:hover { transform: translateY(-2px); box-shadow: 0 7px 20px rgba(30,50,70,.08); }
 .table-card.available { border-color: #cfe7da; }
 .table-card.occupied { border-color: #f0d49c; background: #fffdf7; }
+.table-card.disabled { border-color: #d8dde1; background: #f1f3f5; color: #737b84; }
+.table-card.disabled:hover { transform: none; box-shadow: none; }
+.table-card.disabled .table-state { color: #737b84; }
 .table-name { color: #202c36; font-weight: 700; font-size: 24px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .table-number { color: #69747d; font-weight: 500; font-size: 15px; line-height: 1; margin-top: 8px; }
 .table-number small { font-size: 15px; margin-left: 5px; font-weight: 400; }
@@ -137,7 +140,7 @@ td { color: #303941; }
 .toggle-row { flex-direction: row; align-items: center; margin-bottom: 18px; }
 .toggle-row input { width: 18px; min-height: 18px; }
 .table-settings { display: grid; grid-template-columns: 1fr; gap: 12px; }
-.table-setting { display: grid; grid-template-columns: minmax(150px, 2fr) 90px 90px auto auto auto; align-items: end; gap: 8px; padding: 12px; border: 1px solid #edf0f2; border-radius: 7px; }
+.table-setting { display: grid; grid-template-columns: minmax(150px, 2fr) 90px 90px auto auto auto auto; align-items: end; gap: 8px; padding: 12px; border: 1px solid #edf0f2; border-radius: 7px; }
 .table-setting label { min-width: 0; }
 .table-setting input { min-height: 36px; padding: 5px 7px; }
 .table-setting .secondary { min-height: 36px; padding: 0 9px; }
@@ -149,6 +152,7 @@ td { color: #303941; }
 .employee-form { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 12px; align-items: end; margin-bottom: 18px; }
 .employee-list { display: flex; flex-direction: column; gap: 8px; }
 .employee-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 13px; padding: 11px 12px; border: 1px solid #edf0f2; border-radius: 7px; }
+.employee-row.printer-device-row { grid-template-columns: minmax(0, 1fr) auto auto auto; }
 .employee-row div { display: flex; flex-direction: column; gap: 3px; }
 .employee-row div span { color: var(--muted); font-size: 13px; }
 .filter-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 13px; }
@@ -185,8 +189,10 @@ td { color: #303941; }
 .option-add-row { display: flex; gap: 8px; margin-top: 10px; max-width: 470px; }
 .option-add-row input { min-height: 36px; }
 .category-manager-list { display: flex; flex-direction: column; gap: 8px; }
-.category-manager-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 8px; }
+.category-manager-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: center; gap: 8px; }
 .category-manager-row input { min-height: 36px; }
+.category-order-controls { display: flex; gap: 5px; }
+.category-order-controls button { min-height: 36px; min-width: 38px; padding: 0 8px; }
 .category-add-row { display: flex; gap: 8px; padding-top: 17px; margin-top: 17px; border-top: 1px solid #edf0f2; }
 .print-tabs { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 15px; }
 .table-actions { white-space: nowrap; }
@@ -293,6 +299,8 @@ td { color: #303941; }
   .table-setting { grid-template-columns: 1fr 1fr; }
   .table-setting .occupied-dot, .table-setting .available-dot { padding-bottom: 8px; }
   .employee-form, .filter-grid { grid-template-columns: 1fr; }
+  .employee-row.printer-device-row { grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 7px; }
+  .employee-row.printer-device-row button { padding-left: 7px; padding-right: 7px; font-size: 12px; }
   .printer-host-controls { grid-template-columns: 1fr; }
   .filter-wide { grid-column: auto; }
   .detail-summary { grid-template-columns: repeat(2, 1fr); }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Capacitor, registerPlugin } from "@capacitor/core";
 import {
   api,
@@ -97,6 +97,7 @@ type Order = {
   }>;
 };
 type Settings = Record<string, unknown>;
+type StoreEventDetail = { type?: string; orderId?: string; newOrderId?: string; tableId?: string | null; scope?: string };
 type OrderSearchRow = {
   id: string;
   table_id: string | null;
@@ -341,6 +342,28 @@ function TablesPage({ tables, refresh, openOrder, setMessage }: {
   const [openingTable, setOpeningTable] = useState<Table | null>(null);
   const [pendingOpenRequest, setPendingOpenRequest] = useState<PendingIdempotentRequest | null>(null);
 
+  useEffect(() => {
+    for (const table of tables) {
+      if (table.status === "AVAILABLE" && !table.order) continue;
+      const scope = `open:${table.id}`;
+      const pending = getPendingIdempotentRequest(scope);
+      if (pending) clearIdempotentRequest(scope, pending.idempotencyKey);
+    }
+  }, [tables]);
+
+  useEffect(() => {
+    if (!openingTable || busy) return;
+    const latest = tables.find((table) => table.id === openingTable.id);
+    if (!latest || latest.status !== "AVAILABLE" || latest.order) {
+      const scope = `open:${openingTable.id}`;
+      const pending = getPendingIdempotentRequest(scope);
+      if (pending) clearIdempotentRequest(scope, pending.idempotencyKey);
+      setOpeningTable(null);
+      setPendingOpenRequest(null);
+      setMessage("桌台状态已在其他设备发生变化，已关闭开台窗口");
+    }
+  }, [busy, openingTable, setMessage, tables]);
+
   function selectTable(table: Table) {
     setPendingOpenRequest(getPendingIdempotentRequest(`open:${table.id}`));
     setOpeningTable(table);
@@ -373,7 +396,7 @@ function TablesPage({ tables, refresh, openOrder, setMessage }: {
       <div className="table-grid">
         {tables.map((table) => {
           const occupied = Boolean(table.order);
-          return <button key={table.id} className={`table-card ${occupied ? "occupied" : "available"}`} onClick={() => occupied ? openOrder(table.order!.id) : selectTable(table)} disabled={busy || table.status === "DISABLED"}>
+          return <button key={table.id} className={`table-card ${table.status === "DISABLED" ? "disabled" : occupied ? "occupied" : "available"}`} onClick={() => occupied ? openOrder(table.order!.id) : selectTable(table)} disabled={busy || table.status === "DISABLED"}>
             <div className="table-name">{table.name}</div>
             <div className="table-number">{table.number}<small>号桌</small></div>
             <div className="table-state">{table.status === "DISABLED" ? "停用" : occupied ? "用餐中" : "空桌"}</div>
@@ -435,46 +458,71 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
   const [pendingItemAction, setPendingItemAction] = useState<{ scope: string; request: PendingIdempotentRequest } | null>(null);
   const [confirmAction, setConfirmAction] = useState<"reopen" | "end" | null>(null);
   const [busy, setBusy] = useState(false);
+  const orderStatusRef = useRef<string | null>(null);
 
-  async function load() {
-    setOrder(null);
-    setDraftReady(false);
-    setPendingSubmission(null);
-    setCart({});
+  const setCurrentOrder = useCallback((next: Order | null) => {
+    orderStatusRef.current = next?.status ?? null;
+    setOrder(next);
+  }, []);
+
+  const load = useCallback(async (initializeDraft = false) => {
+    if (initializeDraft) {
+      setCurrentOrder(null);
+      setDraftReady(false);
+      setPendingSubmission(null);
+      setCart({});
+    }
     try {
       const [orderResult, categoryResult, dishResult] = await Promise.all([
         api<{ order: Order }>(`/api/orders/${orderId}`),
         api<{ categories: Category[] }>("/api/categories"),
         api<{ dishes: Dish[] }>("/api/dishes")
       ]);
-      setOrder(orderResult.order);
+      const previousStatus = orderStatusRef.current;
+      setCurrentOrder(orderResult.order);
       setCategories(categoryResult.categories);
       setDishes(dishResult.dishes);
-      const pending = getPendingIdempotentRequest(`items:${orderId}`);
-      let savedLines: unknown = [];
-      const rawDraft = localStorage.getItem(`order-draft-${orderId}`);
-      if (rawDraft) {
-        try {
-          const saved = JSON.parse(rawDraft) as { lines?: unknown; items?: unknown } | unknown[];
-          savedLines = Array.isArray(saved) ? saved : saved.lines ?? saved.items ?? [];
-        } catch {
-          savedLines = [];
+      if (initializeDraft) {
+        const pending = getPendingIdempotentRequest(`items:${orderId}`);
+        let savedLines: unknown = [];
+        const rawDraft = localStorage.getItem(`order-draft:${encodeURIComponent(user.id)}:${encodeURIComponent(orderId)}`);
+        if (rawDraft) {
+          try {
+            const saved = JSON.parse(rawDraft) as { lines?: unknown; items?: unknown } | unknown[];
+            savedLines = Array.isArray(saved) ? saved : saved.lines ?? saved.items ?? [];
+          } catch {
+            savedLines = [];
+          }
         }
+        if (pending && Array.isArray(pending.payload.items)) savedLines = pending.payload.items;
+        setCart(restoreCartLines(savedLines, dishResult.dishes));
+        setPendingSubmission(pending);
+        setDraftReady(true);
+      } else if (previousStatus === "OPEN" && orderResult.order.status !== "OPEN") {
+        setMessage("订单已在其他设备结束；本机未提交菜品仍保留，请先核对订单状态");
       }
-      if (pending && Array.isArray(pending.payload.items)) savedLines = pending.payload.items;
-      setCart(restoreCartLines(savedLines, dishResult.dishes));
-      setPendingSubmission(pending);
-      setDraftReady(true);
     } catch (error) {
       setMessage(errorText(error));
     }
-  }
+  }, [orderId, setCurrentOrder, setMessage, user.id]);
 
-  useEffect(() => { void load(); }, [orderId]);
+  useEffect(() => { void load(true); }, [load]);
+  useEffect(() => {
+    const handleUpdate = (event: Event) => {
+      const detail = (event as CustomEvent<StoreEventDetail>).detail;
+      if (detail?.type === "menu.updated" || detail?.orderId === orderId) void load(false);
+    };
+    window.addEventListener("点单台数据更新", handleUpdate);
+    const timer = window.setInterval(() => { void load(false); }, 30_000);
+    return () => {
+      window.removeEventListener("点单台数据更新", handleUpdate);
+      window.clearInterval(timer);
+    };
+  }, [load, orderId]);
 
   useEffect(() => {
     if (!draftReady) return;
-    const storageKey = `order-draft-${orderId}`;
+    const storageKey = `order-draft:${encodeURIComponent(user.id)}:${encodeURIComponent(orderId)}`;
     const lines = saveCartLines(cart);
     const pending = pendingSubmission || getPendingIdempotentRequest(`items:${orderId}`);
     if (!lines.length && !pending) {
@@ -490,7 +538,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
     } catch {
       setMessage("本机草稿保存失败，请检查设备存储空间");
     }
-  }, [cart, draftReady, orderId, pendingSubmission, setMessage]);
+  }, [cart, draftReady, orderId, pendingSubmission, setMessage, user.id]);
 
   const visibleDishes = useMemo(() => dishes.filter((dish) => {
     const categoryMatch = !categoryId || dish.category_id === categoryId;
@@ -577,7 +625,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
         method: "PATCH",
         body: JSON.stringify({ note })
       });
-      setOrder(result.order);
+      setCurrentOrder(result.order);
       setOrderNoteOpen(false);
       setMessage("本单备注已保存");
     } catch (error) {
@@ -595,16 +643,16 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
       const request = prepareIdempotentRequest(`items:${orderId}`, { items });
       const exactItems = Array.isArray(request.payload.items) ? request.payload.items : items;
       setPendingSubmission(request);
-      localStorage.setItem(`order-draft-${orderId}`, JSON.stringify({
+      localStorage.setItem(`order-draft:${encodeURIComponent(user.id)}:${encodeURIComponent(orderId)}`, JSON.stringify({
         version: 2,
         lines: saveCartLines(cart),
         pending: { idempotencyKey: request.idempotencyKey, items: exactItems }
       }));
       const result = await idempotentApi<{ order: Order }>(`/api/orders/${orderId}/items`, `items:${orderId}`, { items: exactItems });
-      setOrder(result.order);
+      setCurrentOrder(result.order);
       setCart({});
       setPendingSubmission(null);
-      localStorage.removeItem(`order-draft-${orderId}`);
+      localStorage.removeItem(`order-draft:${encodeURIComponent(user.id)}:${encodeURIComponent(orderId)}`);
       setMessage("已提交，已生成两份备菜单打印任务");
       await refreshTables();
     } catch (error) {
@@ -626,7 +674,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
       const result = await idempotentApi<{ order: Order }>(`/api/orders/${orderId}/items/${item.id}/${action}`, scope, values);
       setActionTarget(null);
       setPendingItemAction(null);
-      setOrder(result.order);
+      setCurrentOrder(result.order);
       setMessage(action === "gift" ? "已记录赠送" : "已记录退菜，并生成两份退菜单打印任务");
       await refreshTables();
     } catch (error) {
@@ -643,7 +691,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
     try {
       const result = await idempotentApi<{ order: Order }>(`/api/orders/${orderId}/reopen`, `reopen:${orderId}`, {});
       setConfirmAction(null);
-      setOrder(result.order);
+      setCurrentOrder(result.order);
       setMessage("已撤销结账并生成新账单，未重复打印厨房菜单");
       await refreshTables();
     } catch (error) {
@@ -658,7 +706,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
     try {
       const result = await idempotentApi<{ order: Order }>(`/api/orders/${orderId}/end`, `end:${orderId}`, { reason: "顾客未结账直接离开" });
       setConfirmAction(null);
-      setOrder(result.order);
+      setCurrentOrder(result.order);
       setMessage("本单已直接结束，未生成收款记录");
       await refreshTables();
     } catch (error) {
@@ -696,7 +744,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
       </aside>
     </div>
     {previewOpen && <OrderPreviewDialog order={order} cartLines={Object.values(cart)} totalFen={previewTotalFen} totalLabel={previewTotalLabel} onClose={() => setPreviewOpen(false)} />}
-    {checkoutOpen && <CheckoutPanel order={order} role={user.role} onClose={() => setCheckoutOpen(false)} onDone={async (nextOrder, message) => { setOrder(nextOrder); setCheckoutOpen(false); setMessage(message); await refreshTables(); }} />}
+    {checkoutOpen && <CheckoutPanel order={order} role={user.role} onClose={() => setCheckoutOpen(false)} onDone={async (nextOrder, message) => { setCurrentOrder(nextOrder); setCheckoutOpen(false); setMessage(message); await refreshTables(); }} />}
     {optionTarget && <DishOptionsDialog dish={optionTarget} onClose={() => setOptionTarget(null)} onSubmit={(selections, note) => { addConfiguredDish(optionTarget, selections, note); setOptionTarget(null); }} />}
     {noteTarget && <NoteDialog note={noteTarget.note} title="填写自定义备注" onClose={() => setNoteTarget(null)} onSubmit={saveNote} />}
     {orderNoteOpen && <NoteDialog note={order.orderNote} title="本单备注" onClose={() => setOrderNoteOpen(false)} onSubmit={(note) => void saveOrderNote(note)} />}
@@ -986,6 +1034,13 @@ function DishesPage({ categories, user, setMessage, reloadCategories }: { catego
   }, [categoryFilter, dishes]);
   async function load() { try { const result = await api<{ dishes: Dish[] }>(`/api/dishes?q=${encodeURIComponent(query)}`); setDishes(result.dishes); } catch (error) { setMessage(errorText(error)); } }
   useEffect(() => { void load(); }, [query]);
+  useEffect(() => {
+    const handleUpdate = (event: Event) => {
+      if ((event as CustomEvent<StoreEventDetail>).detail?.type === "menu.updated") void load();
+    };
+    window.addEventListener("点单台数据更新", handleUpdate);
+    return () => window.removeEventListener("点单台数据更新", handleUpdate);
+  }, [query]);
   useEffect(() => { if (!form.categoryId && categories[0]) setForm((current) => ({ ...current, categoryId: categories[0].id })); }, [categories]);
   function dishPayload(values: DishFormState) { return { name: values.name, pinyin: values.pinyin, categoryId: values.categoryId || null, priceFen: centsFromYuan(values.price), costFen: centsFromYuan(values.cost), unit: values.unit, optionGroups: values.optionGroups.map((group) => ({ name: group.name, required: group.required, allowMultiple: group.allowMultiple, options: group.options.map((label) => ({ label })) })) }; }
   async function addDish(event: FormEvent) { event.preventDefault(); if (!form.name.trim()) return setMessage("菜品名称不能为空"); if (form.optionGroups.some((group) => !group.name.trim() || !group.options.length)) return setMessage("请补全备注问题和选项"); try { await api("/api/dishes", { method: "POST", body: JSON.stringify(dishPayload(form)) }); setForm(newDishForm(categories[0]?.id || "")); await load(); setMessage("菜品已保存"); } catch (error) { setMessage(errorText(error)); } }
@@ -1047,6 +1102,7 @@ function CategoryManagerDialog({ categories, onClose, onChanged, setMessage }: {
   const [rows, setRows] = useState<Category[]>(categories);
   const [names, setNames] = useState<Record<string, string>>(() => Object.fromEntries(categories.map((category) => [category.id, category.name])));
   const [deleteId, setDeleteId] = useState("");
+  const [orderBusy, setOrderBusy] = useState(false);
   async function loadAll() {
     try {
       const result = await api<{ categories: Category[] }>("/api/categories?includeInactive=true");
@@ -1055,11 +1111,35 @@ function CategoryManagerDialog({ categories, onClose, onChanged, setMessage }: {
     } catch (error) { setMessage(errorText(error)); }
   }
   useEffect(() => { void loadAll(); }, []);
+  useEffect(() => {
+    const handleUpdate = (event: Event) => {
+      if ((event as CustomEvent<StoreEventDetail>).detail?.type === "menu.updated") void loadAll();
+    };
+    window.addEventListener("点单台数据更新", handleUpdate);
+    return () => window.removeEventListener("点单台数据更新", handleUpdate);
+  }, []);
   async function add() { if (!name.trim()) return setMessage("分类名称不能为空"); try { await api("/api/categories", { method: "POST", body: JSON.stringify({ name: name.trim() }) }); setName(""); await Promise.all([onChanged(), loadAll()]); setMessage("分类已新增"); } catch (error) { setMessage(errorText(error)); } }
   async function update(id: string) { try { await api(`/api/categories/${id}`, { method: "PATCH", body: JSON.stringify({ name: names[id] }) }); await Promise.all([onChanged(), loadAll()]); setMessage("分类已修改"); } catch (error) { setMessage(errorText(error)); } }
   async function setActive(category: Category, active: boolean) { try { await api(`/api/categories/${category.id}`, { method: "PATCH", body: JSON.stringify({ active }) }); await Promise.all([onChanged(), loadAll()]); setMessage(active ? "分类已恢复" : "分类已停用"); } catch (error) { setMessage(errorText(error)); } }
   async function archive() { const category = rows.find((row) => row.id === deleteId); if (!category) return; await setActive(category, false); setDeleteId(""); }
-  return <Dialog title="分类管理" description="停用分类不会删除历史订单里的分类快照；停用分类可在此恢复。" onClose={onClose} className="large-modal"><div className="category-manager-list">{rows.map((category) => <div className="category-manager-row" key={category.id}><input value={names[category.id] || ""} onChange={(event) => setNames((current) => ({ ...current, [category.id]: event.target.value }))} disabled={category.active === false} /><button className="secondary" onClick={() => void update(category.id)} disabled={category.active === false}>保存</button>{category.active === false ? <button className="text-button" onClick={() => void setActive(category, true)}>恢复</button> : <button className="text-button danger-text" onClick={() => setDeleteId(category.id)}>停用</button>}</div>)}</div><div className="category-add-row"><input placeholder="新增分类名称" value={name} onChange={(event) => setName(event.target.value)} /><button className="primary" onClick={() => void add()}>新增分类</button></div><div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button></div>{deleteId && <ConfirmDialog title="停用分类" message="停用后不能再给新菜品选择，但历史订单仍会保留。" confirmText="确认停用" danger onClose={() => setDeleteId("")} onConfirm={() => void archive()} />}</Dialog>;
+  async function moveCategory(index: number, direction: -1 | 1) {
+    const ids = rows.filter((row) => row.active !== false).map((row) => row.id);
+    const target = index + direction;
+    if (target < 0 || target >= ids.length || orderBusy) return;
+    [ids[index], ids[target]] = [ids[target], ids[index]];
+    setOrderBusy(true);
+    try {
+      await api("/api/categories/order", { method: "PUT", body: JSON.stringify({ ids }) });
+      await Promise.all([onChanged(), loadAll()]);
+      setMessage("分类顺序已保存");
+    } catch (error) {
+      setMessage(errorText(error));
+    } finally {
+      setOrderBusy(false);
+    }
+  }
+  let activeIndex = 0;
+  return <Dialog title="分类管理" description="使用上下按钮调整分类顺序；停用分类可在此恢复。" onClose={onClose} className="large-modal"><div className="category-manager-list">{rows.map((category) => { const isActive = category.active !== false; const index = isActive ? activeIndex++ : -1; return <div className="category-manager-row" key={category.id}><input value={names[category.id] || ""} onChange={(event) => setNames((current) => ({ ...current, [category.id]: event.target.value }))} disabled={!isActive} /><div className="category-order-controls">{isActive && <><button type="button" className="secondary" aria-label={`${category.name}上移`} title="上移" disabled={orderBusy || index === 0} onClick={() => void moveCategory(index, -1)}>↑</button><button type="button" className="secondary" aria-label={`${category.name}下移`} title="下移" disabled={orderBusy || index === rows.filter((row) => row.active !== false).length - 1} onClick={() => void moveCategory(index, 1)}>↓</button></>}</div><button type="button" className="secondary" onClick={() => void update(category.id)} disabled={!isActive}>保存</button>{!isActive ? <button type="button" className="text-button" onClick={() => void setActive(category, true)}>恢复</button> : <button type="button" className="text-button danger-text" onClick={() => setDeleteId(category.id)}>停用</button>}</div>; })}</div><div className="category-add-row"><input placeholder="新增分类名称" value={name} onChange={(event) => setName(event.target.value)} /><button type="button" className="primary" onClick={() => void add()}>新增分类</button></div><div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button></div>{deleteId && <ConfirmDialog title="停用分类" message="停用后不能再给新菜品选择，但历史订单仍会保留。" confirmText="确认停用" danger onClose={() => setDeleteId("")} onConfirm={() => void archive()} />}</Dialog>;
 }
 
 function printKindText(kind: string): string {
@@ -1127,7 +1207,27 @@ function StatsPage({ setMessage }: { setMessage: (message: string) => void }) {
   async function load() { try { setData(await api(`/api/stats?from=${from}&to=${to}`)); } catch (error) { setMessage(errorText(error)); } }
   useEffect(() => { void load(); }, []);
   const s = data?.summary;
-  return <section className="page-section"><div className="section-heading"><div><h2>营业统计</h2><p className="muted">按北京时间营业日统计有效结账数据，营业额已扣积分抵扣和人工减免</p></div><button className="secondary" onClick={() => void downloadFile(`/api/stats/export.csv?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, "营业统计.csv").catch((error) => setMessage(errorText(error)))}>导出表格</button></div><div className="filter-bar"><label>开始日期<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>结束日期<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label><button className="primary" onClick={load}>查询</button></div>{s && <><div className="metric-grid"><Metric label="营业额" value={money(s.revenueFen)} /><Metric label="订单数" value={`${s.orderCount} 单`} /><Metric label="用餐人数" value={`${s.peopleCount} 人`} /><Metric label="人均消费" value={money(s.averagePersonFen)} /><Metric label="毛利润" value={money(s.grossProfitFen)} /><Metric label="毛利率" value={`${s.grossMarginPercent}%`} /><Metric label="优惠金额" value={money(s.discountFen)} /><Metric label="退菜损耗" value={money(s.lossFen)} /></div><div className="content-card"><h3>菜品销量</h3><table><thead><tr><th>菜品</th><th>售出</th><th>赠送</th><th>退菜</th><th>销售金额</th></tr></thead><tbody>{data.sales.map((row) => <tr key={String(row.dish_name)}><td>{String(row.dish_name)}</td><td>{String(row.sold_quantity)}</td><td>{String(row.gifted_quantity)}</td><td>{String(row.returned_quantity)}</td><td>{money(Number(row.amount_fen))}</td></tr>)}</tbody></table></div></>}</section>;
+  return <section className="page-section">
+    <div className="section-heading"><div><h2>营业统计</h2><p className="muted">按北京时间营业日统计有效结账数据；营业额扣除赠送、退菜、人工减免和积分抵扣</p></div><button className="secondary" onClick={() => void downloadFile(`/api/stats/export.csv?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, "营业统计.csv").catch((error) => setMessage(errorText(error)))}>导出完整报表</button></div>
+    <div className="filter-bar"><label>开始日期<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>结束日期<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label><button className="primary" onClick={() => void load()}>查询</button></div>
+    {s && <><div className="metric-grid">
+      <Metric label="营业额" value={money(s.revenueFen)} />
+      <Metric label="订单数" value={`${s.orderCount} 单`} />
+      <Metric label="每桌平均" value={money(s.averageTableFen)} />
+      <Metric label="有桌台订单" value={`${s.tableOrderCount} 单`} />
+      <Metric label="用餐人数" value={`${s.peopleCount} 人`} />
+      <Metric label="人均消费" value={money(s.averagePersonFen)} />
+      <Metric label="新客" value={`${s.newCustomers} 人`} />
+      <Metric label="老客" value={`${s.returningCustomers} 人`} />
+      <Metric label="散客订单" value={`${s.guestOrders} 单`} />
+      <Metric label="散客订单占比" value={`${s.guestOrderPercent}%`} />
+      <Metric label="毛利润" value={money(s.grossProfitFen)} />
+      <Metric label="毛利率" value={`${s.grossMarginPercent}%`} />
+      <Metric label="优惠金额" value={money(s.discountFen)} />
+      <Metric label="退菜损耗" value={money(s.lossFen)} />
+      <Metric label="使用桌台" value={`${s.usedTableCount} 张`} />
+    </div><div className="content-card"><h3>菜品销量</h3><table><thead><tr><th>菜品</th><th>售出</th><th>赠送</th><th>退菜</th><th>销售金额</th></tr></thead><tbody>{data.sales.map((row) => <tr key={String(row.dish_name)}><td>{String(row.dish_name)}</td><td>{String(row.sold_quantity)}</td><td>{String(row.gifted_quantity)}</td><td>{String(row.returned_quantity)}</td><td>{money(Number(row.amount_fen))}</td></tr>)}</tbody></table></div></>}
+  </section>;
 }
 
 function Metric({ label, value }: { label: string; value: string }) { return <div className="metric-card"><span>{label}</span><strong>{value}</strong></div>; }
@@ -1219,13 +1319,78 @@ function SettingsPage({ setMessage }: { setMessage: (message: string) => void })
   const [printerDevices, setPrinterDevices] = useState<PrinterDevice[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Table | null>(null);
+  const [rotatedPrinterToken, setRotatedPrinterToken] = useState<{ id: string; name: string; token: string } | null>(null);
   const [employeeForm, setEmployeeForm] = useState({ username: "", name: "", password: "" });
   async function load() { try { const [settingResult, tableResult, employeeResult, printerResult] = await Promise.all([api<{ settings: Settings }>("/api/settings"), api<{ tables: Table[] }>("/api/tables"), api<{ employees: Employee[] }>("/api/employees"), api<{ devices: PrinterDevice[] }>("/api/print-devices")]); setSettings(settingResult.settings); setTables(tableResult.tables); setEmployees(employeeResult.employees); setPrinterDevices(printerResult.devices); setLoaded(true); } catch (error) { setMessage(errorText(error)); } }
+  async function loadPrinters() { try { const result = await api<{ devices: PrinterDevice[] }>("/api/print-devices"); setPrinterDevices(result.devices); } catch { /* Keep the last known state during temporary connection loss. */ } }
   useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    const timer = window.setInterval(() => { void loadPrinters(); }, 10_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    const handleUpdate = (event: Event) => {
+      const type = (event as CustomEvent<StoreEventDetail>).detail?.type;
+      if (type === "printer.updated") {
+        void loadPrinters();
+        void api<{ settings: Settings }>("/api/settings").then(({ settings: next }) => {
+          setSettings((current) => ({
+            ...current,
+            printer_device_id: next.printer_device_id,
+            printer_device_name: next.printer_device_name
+          }));
+        }).catch(() => undefined);
+      }
+      if (["table.updated", "order.created", "order.updated", "order.settled", "order.ended", "order.reopened"].includes(type || "")) {
+        void api<{ tables: Table[] }>("/api/tables").then((result) => setTables(result.tables)).catch(() => undefined);
+      }
+    };
+    window.addEventListener("点单台数据更新", handleUpdate);
+    return () => window.removeEventListener("点单台数据更新", handleUpdate);
+  }, []);
   function value(key: string, fallback = "") { return String(settings[key] ?? fallback); }
   async function saveSettings() { try { await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) }); setMessage("设置已保存"); } catch (error) { setMessage(errorText(error)); } }
   async function togglePrinter(device: PrinterDevice) { try { await api(`/api/print-devices/${encodeURIComponent(device.id)}`, { method: "PATCH", body: JSON.stringify({ active: !device.active }) }); await load(); setMessage(device.active ? "打印设备已停用" : "打印设备已启用并设为当前主机"); } catch (error) { setMessage(errorText(error)); } }
+  async function rotatePrinter(device: PrinterDevice) {
+    try {
+      const result = await api<{ deviceId: string; name: string; active: boolean; printerToken: string }>(
+        `/api/print-devices/${encodeURIComponent(device.id)}/rotate-token`,
+        { method: "POST", body: "{}" }
+      );
+      if (result.active && Capacitor.getPlatform() === "android") {
+        try {
+          await PrinterHost.configure({
+            deviceId: result.deviceId,
+            deviceName: result.name,
+            printerToken: result.printerToken,
+            serverUrl: window.location.origin
+          });
+          setMessage("打印设备已重新授权并配置到本机");
+        } catch (error) {
+          setRotatedPrinterToken({ id: result.deviceId, name: result.name, token: result.printerToken });
+          setMessage(`授权码已更新，但本机配置失败：${errorText(error)}`);
+        }
+      } else {
+        setRotatedPrinterToken({ id: result.deviceId, name: result.name, token: result.printerToken });
+        setMessage("授权码已更新；旧授权已立即失效");
+      }
+      await load();
+    } catch (error) {
+      setMessage(errorText(error));
+    }
+  }
+  async function copyRotatedPrinterToken() {
+    if (!rotatedPrinterToken) return;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("当前设备不支持自动复制");
+      await navigator.clipboard.writeText(rotatedPrinterToken.token);
+      setMessage("授权码已复制");
+    } catch {
+      setMessage("复制失败，请选中授权码手动复制");
+    }
+  }
   async function saveTable(table: Table, values: { name: string; number: number; seats: number }) { try { await api(`/api/tables/${table.id}`, { method: "PATCH", body: JSON.stringify(values) }); await load(); setMessage(`${values.name}已保存`); } catch (error) { setMessage(errorText(error)); } }
+  async function setTableActive(table: Table, active: boolean) { try { await api(`/api/tables/${table.id}`, { method: "PATCH", body: JSON.stringify({ status: active ? "AVAILABLE" : "DISABLED" }) }); await load(); setMessage(active ? `${table.name}已恢复` : `${table.name}已停用`); } catch (error) { setMessage(errorText(error)); } }
   async function addTable(values: { name: string; number: number; seats: number }) { try { await api("/api/tables", { method: "POST", body: JSON.stringify(values) }); await load(); setMessage(`${values.name}已新增`); } catch (error) { setMessage(errorText(error)); } }
   async function deleteTable() { if (!deleteTarget) return; try { await api(`/api/tables/${deleteTarget.id}`, { method: "DELETE" }); setDeleteTarget(null); await load(); setMessage(`${deleteTarget.name}已删除`); } catch (error) { setMessage(errorText(error)); } }
   async function addEmployee(event: FormEvent) { event.preventDefault(); try { await api("/api/employees", { method: "POST", body: JSON.stringify(employeeForm) }); setEmployeeForm({ username: "", name: "", password: "" }); await load(); setMessage("员工账号已开通"); } catch (error) { setMessage(errorText(error)); } }
@@ -1234,20 +1399,20 @@ function SettingsPage({ setMessage }: { setMessage: (message: string) => void })
   return <section className="page-section"><div className="section-heading"><div><h2>设置</h2><p className="muted">店铺、积分规则、打印设备、桌台和员工账号</p></div></div><div className="settings-layout">
     <AndroidPrinterPanel setMessage={setMessage} />
     <div className="content-card"><h3>店铺与小票</h3><div className="form-grid"><label>店名<input value={value("store_name")} onChange={(event) => setSettings({ ...settings, store_name: event.target.value })} /></label><label>小票尾注<input value={value("receipt_footer")} onChange={(event) => setSettings({ ...settings, receipt_footer: event.target.value })} /></label><label>当前打印设备<input value={value("printer_device_name", "未配置打印设备")} readOnly /></label><label>设备编号<input value={value("printer_device_id", "未配置")} readOnly /></label></div></div>
-    <div className="content-card"><h3>打印设备列表</h3>{printerDevices.length ? <div className="employee-list">{printerDevices.map((device) => <div className="employee-row" key={device.id}><div><strong>{device.name}</strong><span>{device.id} · 最近连接 {device.last_seen_at ? formatTime(device.last_seen_at) : "从未"}</span></div><span className={device.active ? "status-pill green" : "status-pill gray"}>{device.active ? "当前启用" : "已停用"}</span><button type="button" className="secondary" onClick={() => void togglePrinter(device)}>{device.active ? "停用" : "启用并设为当前"}</button></div>)}</div> : <div className="empty">尚未注册打印设备</div>}</div>
+    <div className="content-card"><h3>打印设备列表</h3><p className="muted">最近 30 秒内上报心跳视为在线；“重新授权”会让旧授权立即失效。</p>{printerDevices.length ? <div className="employee-list">{printerDevices.map((device) => { const lastSeen = device.last_seen_at ? new Date(device.last_seen_at).getTime() : 0; const online = Number.isFinite(lastSeen) && Date.now() - lastSeen < 30_000; return <div className="employee-row printer-device-row" key={device.id}><div><strong>{device.name}</strong><span>{device.id} · {device.active ? "当前打印主机" : "备用设备"} · 最近连接 {device.last_seen_at ? formatTime(device.last_seen_at) : "从未"}</span></div><span className={online ? "status-pill green" : "status-pill gray"}>{online ? "在线" : "离线"}</span><button type="button" className="secondary" onClick={() => void togglePrinter(device)}>{device.active ? "停用" : "启用并设为当前"}</button><button type="button" className="text-button" onClick={() => void rotatePrinter(device)}>重新授权</button></div>; })}</div> : <div className="empty">尚未注册打印设备</div>}</div>
     <div className="content-card"><h3>积分规则</h3><label className="toggle-row"><input type="checkbox" checked={Boolean(settings.points_enabled)} onChange={(event) => setSettings({ ...settings, points_enabled: event.target.checked })} />启用积分</label><div className="form-grid three"><label>每多少分获得 1 分<small>按实收金额计算，填写分</small><input type="number" min="1" value={value("points_earn_fen", "100")} onChange={(event) => setSettings({ ...settings, points_earn_fen: Number(event.target.value) })} /></label><label>多少积分抵 1 元<input type="number" min="1" value={value("points_redeem_points", "10")} onChange={(event) => setSettings({ ...settings, points_redeem_points: Number(event.target.value) })} /></label><label>每个抵扣单位金额（分）<input type="number" min="1" value={value("points_redeem_fen", "100")} onChange={(event) => setSettings({ ...settings, points_redeem_fen: Number(event.target.value) })} /></label></div></div>
-    <div className="content-card"><h3>桌台管理</h3><p className="muted">桌台有历史订单时不能物理删除，可改名或停用以保留历史记录。</p><div className="table-settings">{tables.map((table) => <TableSetting key={table.id} table={table} onSave={saveTable} onDelete={() => setDeleteTarget(table)} />)}</div><AddTableForm onAdd={addTable} /></div>
+    <div className="content-card"><h3>桌台管理</h3><p className="muted">桌台有历史订单时不能物理删除；空闲桌台可停用或恢复。</p><div className="table-settings">{tables.map((table) => <TableSetting key={table.id} table={table} onSave={saveTable} onSetActive={setTableActive} onDelete={() => setDeleteTarget(table)} />)}</div><AddTableForm onAdd={addTable} /></div>
     <div className="content-card"><h3>员工账号</h3><p className="muted">开通后员工使用自己的账号登录；停用不会删除历史操作记录。</p><form className="employee-form" noValidate onSubmit={addEmployee}><label>登录账号<input value={employeeForm.username} onChange={(event) => setEmployeeForm({ ...employeeForm, username: event.target.value })} /></label><label>员工姓名<input value={employeeForm.name} onChange={(event) => setEmployeeForm({ ...employeeForm, name: event.target.value })} /></label><label>初始密码<small>至少 8 位</small><input type="password" value={employeeForm.password} onChange={(event) => setEmployeeForm({ ...employeeForm, password: event.target.value })} /></label><button className="primary">开通账号</button></form><div className="employee-list">{employees.map((employee) => <div className="employee-row" key={employee.id}><div><strong>{employee.name}</strong><span>{employee.username} · {employee.role === "OWNER" ? "老板" : "收银员"}</span></div><span className={employee.active ? "status-pill green" : "status-pill gray"}>{employee.active ? "启用" : "停用"}</span>{employee.role !== "OWNER" && <button type="button" className="secondary" onClick={() => void toggleEmployee(employee)}>{employee.active ? "停用" : "启用"}</button>}</div>)}</div></div>
     <button className="primary" type="button" onClick={() => void saveSettings()}>保存店铺与积分设置</button>
-  </div>{deleteTarget && <ConfirmDialog title="删除桌台" message={`确定删除“${deleteTarget.name}”？只有从未产生订单且当前空闲的桌台可以删除。`} confirmText="确认删除" danger onClose={() => setDeleteTarget(null)} onConfirm={() => void deleteTable()} />}</section>;
+  </div>{deleteTarget && <ConfirmDialog title="删除桌台" message={`确定删除“${deleteTarget.name}”？只有从未产生订单且当前空闲的桌台可以删除。`} confirmText="确认删除" danger onClose={() => setDeleteTarget(null)} onConfirm={() => void deleteTable()} />}{rotatedPrinterToken && <Dialog title="打印设备新授权码" description="旧授权已立即失效。新授权码仅在此显示，请重新配置打印平板。" onClose={() => setRotatedPrinterToken(null)}><p>{rotatedPrinterToken.name} · {rotatedPrinterToken.id}</p><label>新授权码<input readOnly value={rotatedPrinterToken.token} onFocus={(event) => event.target.select()} /></label><div className="modal-actions"><button type="button" className="secondary" onClick={() => void copyRotatedPrinterToken()}>复制授权码</button><button type="button" className="primary" onClick={() => setRotatedPrinterToken(null)}>关闭</button></div></Dialog>}</section>;
 }
 
-function TableSetting({ table, onSave, onDelete }: { table: Table; onSave: (table: Table, values: { name: string; number: number; seats: number }) => Promise<void>; onDelete: () => void }) {
+function TableSetting({ table, onSave, onSetActive, onDelete }: { table: Table; onSave: (table: Table, values: { name: string; number: number; seats: number }) => Promise<void>; onSetActive: (table: Table, active: boolean) => Promise<void>; onDelete: () => void }) {
   const [name, setName] = useState(table.name);
   const [number, setNumber] = useState(table.number);
   const [seats, setSeats] = useState(table.seats);
   useEffect(() => { setName(table.name); setNumber(table.number); setSeats(table.seats); }, [table.name, table.number, table.seats]);
-  return <div className="table-setting"><label>桌台名称<input value={name} onChange={(event) => setName(event.target.value)} /></label><label>桌号<input type="number" min="1" value={number} onChange={(event) => setNumber(Number(event.target.value))} /></label><label>座位<input type="number" min="1" value={seats} onChange={(event) => setSeats(Number(event.target.value))} /></label><span className={table.order ? "occupied-dot" : "available-dot"}>{table.order ? "使用中" : table.status === "DISABLED" ? "停用" : "空闲"}</span><button className="secondary" type="button" disabled={Boolean(table.order)} onClick={() => void onSave(table, { name: name.trim(), number, seats })}>保存</button><button className="text-button danger-text" type="button" disabled={Boolean(table.order)} onClick={onDelete}>删除</button></div>;
+  return <div className="table-setting"><label>桌台名称<input value={name} onChange={(event) => setName(event.target.value)} /></label><label>桌号<input type="number" min="1" value={number} onChange={(event) => setNumber(Number(event.target.value))} /></label><label>座位<input type="number" min="1" value={seats} onChange={(event) => setSeats(Number(event.target.value))} /></label><span className={table.order ? "occupied-dot" : "available-dot"}>{table.order ? "使用中" : table.status === "DISABLED" ? "停用" : "空闲"}</span><button className="secondary" type="button" disabled={Boolean(table.order)} onClick={() => void onSave(table, { name: name.trim(), number, seats })}>保存</button><button className={table.status === "DISABLED" ? "text-button" : "text-button danger-text"} type="button" disabled={Boolean(table.order)} onClick={() => void onSetActive(table, table.status === "DISABLED")}>{table.status === "DISABLED" ? "恢复" : "停用"}</button><button className="text-button danger-text" type="button" disabled={Boolean(table.order)} onClick={onDelete}>删除</button></div>;
 }
 
 function AddTableForm({ onAdd }: { onAdd: (values: { name: string; number: number; seats: number }) => Promise<void> }) {
@@ -1280,6 +1445,82 @@ export default function App() {
     return () => window.removeEventListener("点单台登录失效", handler);
   }, []);
   useEffect(() => { if (user) void loadHome(); }, [user]);
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    let source: EventSource | null = null;
+    let retryTimer: number | undefined;
+    let retryDelay = 1_000;
+    const refreshTableSnapshot = () => {
+      void api<{ tables: Table[] }>("/api/tables").then((result) => setTables(result.tables)).catch((error) => {
+        setMessage(errorText(error));
+      });
+    };
+    const scheduleRetry = () => {
+      if (cancelled || retryTimer !== undefined) return;
+      retryTimer = window.setTimeout(() => {
+        retryTimer = undefined;
+        void connect();
+      }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 30_000);
+    };
+    const connect = async () => {
+      try {
+        const result = await api<{ ticket: string }>("/api/auth/event-ticket", {
+          method: "POST",
+          body: "{}"
+        });
+        if (cancelled) return;
+        const nextSource = new EventSource(`/api/events?ticket=${encodeURIComponent(result.ticket)}`);
+        source = nextSource;
+        nextSource.onopen = () => { retryDelay = 1_000; };
+        nextSource.onmessage = (messageEvent) => {
+          let update: StoreEventDetail;
+          try {
+            update = JSON.parse(messageEvent.data) as StoreEventDetail;
+          } catch {
+            return;
+          }
+          if (["table.updated", "order.created", "order.updated", "order.settled", "order.ended", "order.reopened"].includes(update.type || "")) {
+            refreshTableSnapshot();
+          }
+          if (update.type === "menu.updated") {
+            void api<{ categories: Category[] }>("/api/categories").then((value) => setCategories(value.categories)).catch(() => undefined);
+          }
+          window.dispatchEvent(new CustomEvent("点单台数据更新", { detail: update }));
+        };
+        nextSource.onerror = () => {
+          nextSource.close();
+          if (source === nextSource) source = null;
+          scheduleRetry();
+        };
+      } catch {
+        scheduleRetry();
+      }
+    };
+    void connect();
+    const fallbackTimer = window.setInterval(refreshTableSnapshot, 30_000);
+    return () => {
+      cancelled = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      window.clearInterval(fallbackTimer);
+      source?.close();
+    };
+  }, [user?.id]);
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ scope?: string }>).detail;
+      const parts = String(detail?.scope || "").split(":");
+      const orderId = parts[0] === "open" ? undefined : parts[1];
+      void api<{ tables: Table[] }>("/api/tables").then((result) => setTables(result.tables)).catch(() => undefined);
+      window.dispatchEvent(new CustomEvent("点单台数据更新", {
+        detail: { type: "order.updated", orderId }
+      }));
+      setMessage("该请求属于其他员工，请确认当前订单状态");
+    };
+    window.addEventListener("点单台幂等请求冲突", handler);
+    return () => window.removeEventListener("点单台幂等请求冲突", handler);
+  }, []);
   useEffect(() => { if (!message) return; const timer = window.setTimeout(() => setMessage(""), 5000); return () => window.clearTimeout(timer); }, [message]);
 
   if (checking) return <main className="login-shell"><div className="loading">正在检查登录状态…</div></main>;
