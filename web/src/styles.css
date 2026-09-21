@@ -214,7 +214,7 @@ td { color: #303941; }
 .print-align-center { text-align: center; }
 .print-size-large, .print-size-emphasis { font-size: 20px; line-height: 1.18; }
 .print-size-large { font-weight: 700; }
-.print-size-emphasis { font-weight: 800; }
+.print-size-emphasis { display: block; width: 200%; transform: scaleX(.5); transform-origin: left center; font-weight: 800; }
 .printer-host-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .printer-host-heading h3 { margin-bottom: 5px; }
 .printer-host-heading p { margin-bottom: 14px; }

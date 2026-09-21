@@ -616,6 +616,16 @@ function printerDisplayWidth(value: string): number {
   return Array.from(value).reduce((width, character) => width + (character.codePointAt(0)! <= 0x7f ? 1 : 2), 0);
 }
 
+function printerColumns(size: PrinterLine["size"]): number {
+  switch (size) {
+    case "LARGE":
+      return 21;
+    case "EMPHASIS":
+    case "NORMAL":
+      return 42;
+  }
+}
+
 function wrapPrinterText(value: string, maxWidth: number): string[] {
   if (!value) return [];
   const lines: string[] = [];
@@ -671,16 +681,49 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     value: string,
     align: PrinterLine["align"] = "LEFT",
     size: PrinterLine["size"] = "NORMAL",
-    maxWidth = size === "NORMAL" ? 42 : 21
+    maxWidth = printerColumns(size)
   ) => {
     const wrapped = value ? wrapPrinterText(value, maxWidth) : [""];
     for (const text of wrapped) lines.push({ text, align, size });
   };
+  const pushRight = (value: string, size: PrinterLine["size"], maxWidth = printerColumns(size)) => {
+    const leadingSpaces = Math.max(0, maxWidth - printerDisplayWidth(value));
+    push(`${" ".repeat(leadingSpaces)}${value}`, "LEFT", size, maxWidth);
+  };
   const stringValue = (value: unknown, fallback = "") => value === null || value === undefined ? fallback : String(value);
   const tableName = stringValue(payload.tableName) || (Number(payload.tableNumber) > 0 ? `${Number(payload.tableNumber)}号桌` : "无桌台");
   const large = "LARGE" as const;
+  const emphasis = "EMPHASIS" as const;
   const normal = "NORMAL" as const;
   const center = "CENTER" as const;
+  const dishColumns = printerColumns(emphasis);
+  const printNoteAndQuantity = (note: string, quantityLabel: string) => {
+    const quantityWidth = printerDisplayWidth(quantityLabel);
+    const maxNoteWidth = dishColumns - quantityWidth - 1;
+    const noteText = `  ${note}`;
+    if (maxNoteWidth < 1) {
+      for (const noteLine of wrapPrinterText(noteText, dishColumns)) push(noteLine, "LEFT", normal, dishColumns);
+      pushRight(quantityLabel, emphasis, dishColumns);
+      return;
+    }
+
+    const noteLines = wrapPrinterText(noteText, dishColumns);
+    let finalNoteLine = noteLines.pop() || "";
+    if (printerDisplayWidth(finalNoteLine) > maxNoteWidth) {
+      const wrappedFinalLine = wrapPrinterText(finalNoteLine, maxNoteWidth);
+      finalNoteLine = wrappedFinalLine.pop() || "";
+      noteLines.push(...wrappedFinalLine);
+    }
+    for (const noteLine of noteLines) push(noteLine, "LEFT", normal, dishColumns);
+
+    const gap = dishColumns - printerDisplayWidth(finalNoteLine) - quantityWidth;
+    if (gap < 1) {
+      push(finalNoteLine, "LEFT", normal, dishColumns);
+      pushRight(quantityLabel, emphasis, dishColumns);
+      return;
+    }
+    push(`${finalNoteLine}${" ".repeat(gap)}${quantityLabel}`, "LEFT", normal, dishColumns);
+  };
 
   const storeName = receipt ? stringValue(payload.storeName).trim() : "";
   if (storeName) {
@@ -710,26 +753,37 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     const unit = stringValue(item.unit, "份");
     const quantityLabel = `x${quantity}${unit}`;
     const note = receipt ? "" : printerItemNote(item.note);
-    const sameLargeLine = printerDisplayWidth(name) + 1 + printerDisplayWidth(quantityLabel) <= 21;
-    if (sameLargeLine) {
-      const gap = Math.max(1, 21 - printerDisplayWidth(name) - printerDisplayWidth(quantityLabel));
-      push(`${name}${" ".repeat(gap)}${quantityLabel}`, "LEFT", large);
+    const sameDishLine = printerDisplayWidth(name) + 1 + printerDisplayWidth(quantityLabel) <= dishColumns;
+    if (sameDishLine) {
+      const gap = Math.max(1, dishColumns - printerDisplayWidth(name) - printerDisplayWidth(quantityLabel));
+      push(`${name}${" ".repeat(gap)}${quantityLabel}`, "LEFT", emphasis);
+      if (note) {
+        for (const noteLine of wrapPrinterText(`  ${note}`, dishColumns)) push(noteLine, "LEFT", normal, dishColumns);
+      }
     } else {
-      for (const nameLine of wrapPrinterText(name, 21)) push(nameLine, "LEFT", large);
-      const quantityWidth = printerDisplayWidth(quantityLabel);
-      push(`${" ".repeat(Math.max(0, 21 - quantityWidth))}${quantityLabel}`, "LEFT", large, 21);
+      for (const nameLine of wrapPrinterText(name, dishColumns)) push(nameLine, "LEFT", emphasis, dishColumns);
+      if (note) printNoteAndQuantity(note, quantityLabel);
+      else pushRight(quantityLabel, emphasis, dishColumns);
     }
-    if (!receipt && note) {
-      for (const noteLine of wrapPrinterText(`  ${note}`, 42)) push(noteLine);
-      if (itemIndex < items.length - 1) push("");
-    }
+    if (note && itemIndex < items.length - 1) push("");
   }
 
   if (receipt) {
     const totals = payload.totals && typeof payload.totals === "object" ? payload.totals as Record<string, unknown> : {};
     push("------------------------------------------");
+    if (totals.grossFen !== undefined && totals.grossFen !== null) push(`菜品原价：${printerMoney(totals.grossFen)}`);
+    const printDiscount = (label: string, value: unknown) => {
+      const amount = Number(value);
+      if (Number.isFinite(amount) && amount > 0) push(`${label}：-${printerMoney(amount)}`);
+    };
+    printDiscount("赠送", totals.giftFen);
+    printDiscount("退菜", totals.returnFen);
+    printDiscount("人工减免", totals.manualDiscountFen);
+    printDiscount("积分抵扣", totals.pointsDiscountFen);
     push(`应收：${printerMoney(totals.dueFen ?? totals.receivedFen)}`);
-    push(`实收：${printerMoney(totals.receivedFen)}`);
+    push(`实收：${printerMoney(totals.receivedFen)}`, "LEFT", emphasis);
+    const paymentMethod = stringValue(payload.paymentMethod).trim();
+    if (paymentMethod) push(`收款方式：${paymentMethod}`);
     if (Number(payload.redeemedPoints) > 0) push(`本次抵扣积分：${Number(payload.redeemedPoints)} 分`);
     if (Number(payload.earnedPoints) > 0) push(`本次获得积分：${Number(payload.earnedPoints)} 分`);
   }
@@ -744,7 +798,12 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
   return lines;
 }
 
-function preparePrintPayload(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Record<string, unknown>): Record<string, unknown> {
+function preparePrintPayload(
+  kind: "KITCHEN" | "RETURN" | "RECEIPT",
+  payload: Record<string, unknown>,
+  rebuild = false
+): Record<string, unknown> {
+  if (!rebuild && Array.isArray(payload.printLines) && payload.printLines.length > 0) return payload;
   const normalized = payload.reprintOf
     ? { ...payload, title: normalizeReprintTitle(payload.title) }
     : { ...payload };
@@ -2697,7 +2756,7 @@ app.post("/api/print-jobs/:jobId/reprint", requireAuth, async (req: Authenticate
       };
       const jobIds: string[] = [];
       for (let copyNo = 1; copyNo <= copies; copyNo += 1) {
-        const payload = preparePrintPayload(original.kind, { ...basePayload, copyNo });
+        const payload = preparePrintPayload(original.kind, { ...basePayload, copyNo }, true);
         const inserted = await client.query<{ id: string }>(
           `INSERT INTO print_jobs (order_id, batch_id, kind, copy_no, payload, manual_requested_at)
            VALUES ($1, $2, $3, $4, $5::jsonb, now()) RETURNING id`,

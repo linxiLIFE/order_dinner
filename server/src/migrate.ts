@@ -192,7 +192,7 @@ CREATE TABLE IF NOT EXISTS print_jobs (
   order_id uuid REFERENCES orders(id),
   batch_id uuid REFERENCES order_batches(id),
   kind text NOT NULL CHECK (kind IN ('KITCHEN', 'RETURN', 'RECEIPT')),
-  copy_no integer NOT NULL DEFAULT 1 CHECK (copy_no IN (1, 2)),
+  copy_no integer NOT NULL DEFAULT 1 CHECK (copy_no BETWEEN 1 AND 20),
   payload jsonb NOT NULL,
   status text NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CLAIMED', 'SENT', 'FAILED', 'NEEDS_CHECK')),
   device_id text,
@@ -203,6 +203,27 @@ CREATE TABLE IF NOT EXISTS print_jobs (
   sent_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+DO $$
+DECLARE
+  current_copy_check text;
+BEGIN
+  SELECT pg_get_constraintdef(oid)
+    INTO current_copy_check
+    FROM pg_constraint
+   WHERE conrelid = 'print_jobs'::regclass
+     AND conname = 'print_jobs_copy_no_check';
+
+  IF current_copy_check IS NULL
+     OR current_copy_check NOT ILIKE '%copy_no >= 1%'
+     OR current_copy_check NOT ILIKE '%copy_no <= 20%' THEN
+    ALTER TABLE print_jobs DROP CONSTRAINT IF EXISTS print_jobs_copy_no_check;
+    ALTER TABLE print_jobs
+      ADD CONSTRAINT print_jobs_copy_no_check
+      CHECK (copy_no BETWEEN 1 AND 20);
+  END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS print_jobs_queue_idx ON print_jobs (status, created_at);
 
