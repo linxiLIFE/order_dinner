@@ -20,7 +20,7 @@ services:
 
   app:
     build:
-      context: .
+      context: ${ORDER_DINNER_BUILD_CONTEXT:-.}
     image: order-dinner:local
     container_name: order-dinner-app
     restart: unless-stopped

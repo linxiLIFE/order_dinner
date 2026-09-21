@@ -2,14 +2,15 @@ import "dotenv/config";
 import jwt from "jsonwebtoken";
 import type { NextFunction, Response } from "express";
 import type { AuthenticatedRequest, AuthUser, Role } from "./types.js";
+import { pool } from "./db.js";
 
 const jwtSecret = process.env.JWT_SECRET || "";
 if (jwtSecret.length < 32) {
   throw new Error("JWT_SECRET 必须设置且至少 32 个字符");
 }
 
-export function createToken(user: AuthUser): string {
-  return jwt.sign(user, jwtSecret, { expiresIn: "12h" });
+export function createToken(user: AuthUser, authVersion = 0): string {
+  return jwt.sign({ ...user, tokenVersion: authVersion }, jwtSecret, { expiresIn: "12h" });
 }
 
 export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
@@ -20,8 +21,39 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
     return;
   }
   try {
-    req.user = jwt.verify(token, jwtSecret) as unknown as AuthUser;
-    next();
+    const claims = jwt.verify(token, jwtSecret) as jwt.JwtPayload & {
+      id?: string;
+      tokenVersion?: number;
+    };
+    if (typeof claims.id !== "string") throw new Error("invalid token subject");
+    const tokenVersion = Number.isInteger(claims.tokenVersion) ? claims.tokenVersion! : 0;
+    void pool.query<{
+      id: string;
+      username: string;
+      name: string;
+      role: Role;
+      active: boolean;
+      auth_version: number;
+    }>(
+      `SELECT id, username, name, role, active, auth_version FROM employees WHERE id = $1`,
+      [claims.id]
+    ).then((result) => {
+      const employee = result.rows[0];
+      if (!employee || !employee.active || employee.auth_version !== tokenVersion) {
+        res.status(401).json({ error: "账号已停用或登录凭据已更新，请重新登录" });
+        return;
+      }
+      req.user = {
+        id: employee.id,
+        username: employee.username,
+        name: employee.name,
+        role: employee.role,
+        authVersion: employee.auth_version
+      };
+      next();
+    }).catch(() => {
+      res.status(503).json({ error: "登录状态暂时无法验证，请稍后重试" });
+    });
   } catch {
     res.status(401).json({ error: "登录已过期，请重新登录" });
   }

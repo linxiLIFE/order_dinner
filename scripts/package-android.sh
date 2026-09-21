@@ -13,6 +13,10 @@ if ! command -v java >/dev/null 2>&1; then
   echo "未找到 Java，请安装 JDK 17。" >&2
   exit 1
 fi
+if [[ -z "${ANDROID_RELEASE_KEYSTORE:-}" || ! -f "${ANDROID_RELEASE_KEYSTORE:-}" || -z "${ANDROID_RELEASE_KEY_ALIAS:-}" || -z "${ANDROID_RELEASE_STORE_PASSWORD:-}" || -z "${ANDROID_RELEASE_KEY_PASSWORD:-}" ]]; then
+  echo "正式安装包必须配置 ANDROID_RELEASE_KEYSTORE、ANDROID_RELEASE_KEY_ALIAS、ANDROID_RELEASE_STORE_PASSWORD 和 ANDROID_RELEASE_KEY_PASSWORD；不会使用 debug 密钥签名。" >&2
+  exit 1
+fi
 
 npm run build:web
 if [[ ! -d android ]]; then
@@ -39,13 +43,17 @@ fi
 mkdir -p release/android
 unsigned_apk="android/app/build/outputs/apk/release/app-release-unsigned.apk"
 output_apk="release/android/餐厅点单台-release.apk"
-cp "$unsigned_apk" "$output_apk"
-build_tools="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -type f -name apksigner | sort | tail -1)"
-debug_keystore="${ANDROID_DEBUG_KEYSTORE:-${HOME}/.android/debug.keystore}"
-if [[ -x "$build_tools" && -f "$debug_keystore" ]]; then
-  "$build_tools" sign --ks "$debug_keystore" --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android "$output_apk"
-  "$build_tools" verify --verbose "$output_apk" >/dev/null
-  echo "安卓测试签名安装包：$project_root/$output_apk"
-else
-  echo "未找到 Android debug keystore，已生成未签名 APK：$project_root/$output_apk" >&2
+if [[ -e "$output_apk" ]]; then
+  echo "正式安装包已存在：$project_root/$output_apk；为避免覆盖，请先将旧包移入废纸篓。" >&2
+  exit 1
 fi
+build_tools="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -type f -name apksigner | sort | tail -1)"
+if [[ ! -x "$build_tools" ]]; then
+  echo "Android SDK 中未找到 apksigner，无法生成正式安装包。" >&2
+  exit 1
+fi
+signed_apk="release/android/餐厅点单台-release-$$.apk"
+"$build_tools" sign --out "$signed_apk" --ks "$ANDROID_RELEASE_KEYSTORE" --ks-key-alias "$ANDROID_RELEASE_KEY_ALIAS" --ks-pass env:ANDROID_RELEASE_STORE_PASSWORD --key-pass env:ANDROID_RELEASE_KEY_PASSWORD "$unsigned_apk"
+"$build_tools" verify --verbose "$signed_apk" >/dev/null
+mv "$signed_apk" "$output_apk"
+echo "已生成正式签名安卓安装包：$project_root/$output_apk"

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import type { Response } from "express";
 import type { DbClient } from "./db.js";
+import { publicErrorResponse } from "./domain.js";
 
 export function cents(value: unknown, fallback = 0): number {
   const parsed = typeof value === "number" ? value : Number(value);
@@ -28,14 +29,8 @@ export function maskPhone(phone: string | null): string | null {
 }
 
 export function publicError(res: Response, error: unknown): void {
-  const message = error instanceof Error ? error.message : "操作失败";
-  const declaredStatus = typeof error === "object" && error !== null && "status" in error
-    ? Number((error as { status?: unknown }).status)
-    : NaN;
-  const status = Number.isInteger(declaredStatus) && declaredStatus >= 400 && declaredStatus < 600
-    ? declaredStatus
-    : /不存在|已被|不足|必须|不能|不允许|不匹配|过期|重复/.test(message) ? 400 : 500;
-  res.status(status).json({ error: message });
+  const response = publicErrorResponse(error);
+  res.status(response.status).json({ error: response.message });
 }
 
 export function randomKey(): string {

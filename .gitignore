@@ -13,3 +13,5 @@ ios/
 # Local deployment material and credentials
 .deploy/
 doc/LIVE_*.md
+data/
+backups/

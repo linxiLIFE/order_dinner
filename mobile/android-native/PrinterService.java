@@ -318,11 +318,21 @@ public class PrinterService extends Service {
             JSONObject totals = payload.optJSONObject("totals");
             if (totals != null) {
                 separator(output);
+                line(output, "菜品原价：" + money(totals.optInt("grossFen")));
+                if (totals.optInt("giftFen") > 0) line(output, "赠送：-" + money(totals.optInt("giftFen")));
+                if (totals.optInt("returnFen") > 0) line(output, "退菜：-" + money(totals.optInt("returnFen")));
+                if (totals.optInt("manualDiscountFen") > 0) line(output, "人工减免：-" + money(totals.optInt("manualDiscountFen")));
+                if (totals.optInt("pointsDiscountFen") > 0) line(output, "积分抵扣：-" + money(totals.optInt("pointsDiscountFen")));
                 line(output, "应收：" + money(totals.optInt("dueFen", totals.optInt("receivedFen"))));
                 command(output, 0x1D, 0x21, 0x01);
                 line(output, "实收：" + money(totals.optInt("receivedFen")));
                 command(output, 0x1D, 0x21, 0x00);
             }
+            String paymentMethod = payload.optString("paymentMethod", "");
+            if (!paymentMethod.isEmpty()) line(output, "收款方式：" + paymentMethod);
+            if (payload.optInt("redeemedPoints") > 0) line(output, "本次抵扣积分：" + payload.optInt("redeemedPoints") + " 分");
+            if (payload.optInt("earnedPoints") > 0) line(output, "本次获得积分：" + payload.optInt("earnedPoints") + " 分");
+            if (payload.has("pointsBalance")) line(output, "剩余积分：" + payload.optInt("pointsBalance") + " 分");
         }
         String footer = payload.optString("footer", "");
         if (!footer.isEmpty()) {

@@ -15,14 +15,26 @@ scp_args=(-o BindInterface="$ssh_interface" -o ServerAliveInterval=30 -o ServerA
 ./scripts/generate-live-env.sh
 source .deploy/order-dinner.env
 
-archive="$(mktemp -t order-dinner-deploy).tar.gz"
-COPYFILE_DISABLE=1 tar --exclude='./.git' --exclude='./node_modules' --exclude='./release' --exclude='./.deploy' --exclude='./android' --exclude='./ios' -czf "$archive" .
-
 echo "上传项目到 $ssh_user@$ssh_host:$remote_root"
-ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo mkdir -p '$remote_root' && sudo chown '$ssh_user':'$ssh_user' '$remote_root' && sudo find '$remote_root' -maxdepth 1 -mindepth 1 ! -name data ! -name backups -exec chown -R '$ssh_user':'$ssh_user' {} +"
-remote_archive="/tmp/order-dinner-deploy-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
-scp "${scp_args[@]}" "$archive" "$ssh_user@$ssh_host:$remote_archive"
-ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "tar -xzf '$remote_archive' -C '$remote_root'"
+release_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+remote_release="$remote_root/.deploy/releases/$release_id"
+remote_group="$(ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "id -gn '$ssh_user'")"
+ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo install -d -m 0750 -o '$ssh_user' -g '$remote_group' '$remote_root' '$remote_root/.deploy' '$remote_root/.deploy/releases' '$remote_release' '$remote_root/backups' && sudo chown '$ssh_user':'$remote_group' '$remote_root'"
+COPYFILE_DISABLE=1 tar \
+  --exclude='./.git' \
+  --exclude='./node_modules' \
+  --exclude='./release' \
+  --exclude='./.deploy' \
+  --exclude='./web/dist' \
+  --exclude='./server/dist' \
+  --exclude='*.log' \
+  --exclude='./android' \
+  --exclude='./ios' \
+  --exclude='./data' \
+  --exclude='./backups' \
+  --exclude='./.env' \
+  --exclude='./.env.*' \
+  -czf - . | ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "tar -xzf - -C '$remote_release'"
 if ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "test -f '$remote_root/.env'"; then
   echo "远端已有 .env，保留现有数据库与登录凭据"
 else
@@ -30,8 +42,11 @@ else
 fi
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "chmod 600 '$remote_root/.env'"
 
+echo "部署前备份数据库"
+ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "ORDER_DINNER_ROOT='$remote_root' '$remote_release/scripts/backup.sh'"
+
 echo "启动数据库与应用容器"
-ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "cd '$remote_root' && sudo docker network inspect love-web_love-network >/dev/null && sudo docker compose --env-file .env up -d --build"
+ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo docker network inspect love-web_love-network >/dev/null && sudo env ORDER_DINNER_BUILD_CONTEXT='$remote_release' docker compose --project-directory '$remote_root' --env-file '$remote_root/.env' -f '$remote_release/docker-compose.yml' up -d --build"
 
 echo "备份并增加 Caddy 路由"
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" 'bash -s' <<'REMOTE_SCRIPT'
@@ -61,9 +76,9 @@ REMOTE_SCRIPT
 
 echo "安装每日备份任务"
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo tee /etc/cron.d/order-dinner-backup >/dev/null" <<CRON
-0 3 * * * $ssh_user cd $remote_root && $remote_root/scripts/backup.sh >> $remote_root/backups/backup.log 2>&1
+0 3 * * * $ssh_user ORDER_DINNER_ROOT=$remote_root $remote_release/scripts/backup.sh >> $remote_root/backups/backup.log 2>&1
 CRON
-ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo chmod 644 /etc/cron.d/order-dinner-backup && sudo chown '$ssh_user':'$ssh_user' '$remote_root' && sudo find '$remote_root' -maxdepth 1 -mindepth 1 ! -name data ! -name backups -exec chown -R '$ssh_user':'$ssh_user' {} +"
+ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo chmod 644 /etc/cron.d/order-dinner-backup && sudo touch '$remote_root/backups/backup.log' && sudo chown '$ssh_user':'$remote_group' '$remote_root' '$remote_root/backups' '$remote_root/backups/backup.log' && sudo chmod 600 '$remote_root/backups/backup.log'"
 
 echo "线上健康检查"
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "curl --fail --silent --show-error --resolve '$public_host:1314:127.0.0.1' 'https://$public_host:1314/healthz'"

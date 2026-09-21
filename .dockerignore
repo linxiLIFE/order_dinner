@@ -5,3 +5,12 @@ release
 doc/LIVE_*.md
 android
 ios
+web/dist
+server/dist
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+data
+backups

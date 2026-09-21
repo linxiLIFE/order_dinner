@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS employees (
   name text NOT NULL,
   password_hash text NOT NULL,
   role text NOT NULL CHECK (role IN ('OWNER', 'CASHIER')),
+  auth_version integer NOT NULL DEFAULT 0 CHECK (auth_version >= 0),
   active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -236,9 +237,13 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   request_key text NOT NULL,
   employee_id uuid REFERENCES employees(id),
   response jsonb NOT NULL,
+  payload_hash text,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (scope, request_key)
 );
+
+CREATE INDEX IF NOT EXISTS idempotency_keys_created_at_idx ON idempotency_keys (created_at);
+CREATE INDEX IF NOT EXISTS print_jobs_claimed_at_idx ON print_jobs (claimed_at) WHERE status = 'CLAIMED';
 
 CREATE TABLE IF NOT EXISTS app_migrations (
   name text PRIMARY KEY,
@@ -271,6 +276,34 @@ export async function migrateAndSeed(): Promise<void> {
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_note text NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS option_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS manual_requested_at timestamptz`);
+  await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS auth_version integer NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS payload_hash text`);
+
+  await pool.query(
+    `UPDATE restaurant_tables t
+     SET status = CASE
+       WHEN EXISTS (SELECT 1 FROM orders o WHERE o.table_id = t.id AND o.status = 'OPEN') THEN 'OCCUPIED'
+       WHEN t.status = 'OCCUPIED' THEN 'AVAILABLE'
+       ELSE t.status
+     END
+     WHERE t.status <> CASE
+       WHEN EXISTS (SELECT 1 FROM orders o WHERE o.table_id = t.id AND o.status = 'OPEN') THEN 'OCCUPIED'
+       WHEN t.status = 'OCCUPIED' THEN 'AVAILABLE'
+       ELSE t.status
+     END`
+  );
+  const duplicateOpenTables = await pool.query<{ table_id: string; count: string }>(
+    `SELECT table_id, COUNT(*)::text AS count FROM orders
+     WHERE status = 'OPEN' AND table_id IS NOT NULL
+     GROUP BY table_id HAVING COUNT(*) > 1`
+  );
+  if (duplicateOpenTables.rows.length) {
+    throw new Error(`发现 ${duplicateOpenTables.rows.length} 张桌台存在多笔进行中订单；请先人工核对订单后再启动`);
+  }
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS orders_one_open_per_table_idx
+     ON orders (table_id) WHERE status = 'OPEN' AND table_id IS NOT NULL`
+  );
 
   for (let number = 1; number <= 12; number += 1) {
     await pool.query(
@@ -306,15 +339,20 @@ export async function migrateAndSeed(): Promise<void> {
     [username, passwordHash]
   );
 
-  await importOtherCategoryDishes();
-
   if (process.env.SEED_DEMO_DATA === "true") {
+    await seedOtherCategoryDishes();
     await seedDemoDishes();
   }
+
+  await pruneExpiredIdempotencyKeys();
 }
 
-async function importOtherCategoryDishes(): Promise<void> {
-  const migrationName = "20260920_other_category_menu_v1";
+export async function pruneExpiredIdempotencyKeys(): Promise<void> {
+  await pool.query(`DELETE FROM idempotency_keys WHERE created_at < now() - interval '90 days'`);
+}
+
+async function seedOtherCategoryDishes(): Promise<void> {
+  const migrationName = "20260920_other_category_menu_v2_demo_only";
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -325,29 +363,27 @@ async function importOtherCategoryDishes(): Promise<void> {
       return;
     }
 
-    const category = await client.query<{ id: string }>(
+    await client.query(
       `INSERT INTO categories (name, sort_order, active) VALUES ('其他', 999, true)
-       ON CONFLICT (name) DO UPDATE SET active = true, updated_at = now()
-       RETURNING id`
+       ON CONFLICT (name) DO NOTHING`
     );
-    const categoryId = category.rows[0]?.id;
+    const categoryResult = await client.query<{ id: string; active: boolean }>(
+      `SELECT id, active FROM categories WHERE name = '其他'`
+    );
+    const categoryId = categoryResult.rows[0]?.id;
     if (!categoryId) throw new Error("创建其他分类失败");
+    if (!categoryResult.rows[0].active) {
+      await client.query("COMMIT");
+      return;
+    }
 
     for (const [name, priceFen, costFen] of OTHER_CATEGORY_DISHES) {
-      const updated = await client.query(
-        `UPDATE dishes
-         SET category_id = $1, price_fen = $2, cost_fen = $3, on_sale = true, updated_at = now()
-         WHERE name = $4
-         RETURNING id`,
-        [categoryId, priceFen, costFen, name]
+      await client.query(
+        `INSERT INTO dishes (category_id, name, price_fen, cost_fen)
+         SELECT $1, $2, $3, $4
+         WHERE NOT EXISTS (SELECT 1 FROM dishes WHERE name = $2)`,
+        [categoryId, name, priceFen, costFen]
       );
-      if (!updated.rows.length) {
-        await client.query(
-          `INSERT INTO dishes (category_id, name, price_fen, cost_fen)
-           VALUES ($1, $2, $3, $4)`,
-          [categoryId, name, priceFen, costFen]
-        );
-      }
     }
 
     await client.query(`INSERT INTO app_migrations (name) VALUES ($1)`, [migrationName]);
@@ -361,13 +397,15 @@ async function importOtherCategoryDishes(): Promise<void> {
 }
 
 async function seedDemoDishes(): Promise<void> {
-  const category = await pool.query<{ id: string }>(
+  await pool.query(
     `INSERT INTO categories (name, sort_order) VALUES ('示例菜品', 10)
-     ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-     RETURNING id`
+     ON CONFLICT (name) DO NOTHING`
+  );
+  const category = await pool.query<{ id: string; active: boolean }>(
+    `SELECT id, active FROM categories WHERE name = '示例菜品'`
   );
   const categoryId = category.rows[0]?.id;
-  if (!categoryId) return;
+  if (!categoryId || !category.rows[0].active) return;
   const dishes = [
     ["示例套餐", "shilitaocan", 3800, 1600],
     ["清炒时蔬", "qingchaoshishu", 1800, 600],
