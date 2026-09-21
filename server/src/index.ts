@@ -862,7 +862,7 @@ app.post("/api/tables/:tableId/open", requireAuth, async (req: AuthenticatedRequ
       );
       const table = tableResult.rows[0];
       if (!table) fail("桌台不存在", 404);
-      if (table.status !== "AVAILABLE") fail("桌台已被占用或停用，请刷新桌台状态");
+      if (table.status !== "AVAILABLE") fail("桌台已被占用或停用，请刷新桌台状态", 409);
       let customerId: string | null = null;
       if (phone) {
         customerId = await findOrCreateCustomer(client, phone, customerName);

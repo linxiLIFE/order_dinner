@@ -459,15 +459,20 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
   const [confirmAction, setConfirmAction] = useState<"reopen" | "end" | null>(null);
   const [busy, setBusy] = useState(false);
   const orderStatusRef = useRef<string | null>(null);
+  const loadRequestSequence = useRef(0);
+  const draftReadyRef = useRef(false);
 
-  const setCurrentOrder = useCallback((next: Order | null) => {
+  const setCurrentOrder = useCallback((next: Order | null, invalidatePendingLoads = true) => {
+    if (invalidatePendingLoads) loadRequestSequence.current += 1;
     orderStatusRef.current = next?.status ?? null;
     setOrder(next);
   }, []);
 
   const load = useCallback(async (initializeDraft = false) => {
+    const requestSequence = ++loadRequestSequence.current;
     if (initializeDraft) {
-      setCurrentOrder(null);
+      draftReadyRef.current = false;
+      setCurrentOrder(null, false);
       setDraftReady(false);
       setPendingSubmission(null);
       setCart({});
@@ -478,11 +483,13 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
         api<{ categories: Category[] }>("/api/categories"),
         api<{ dishes: Dish[] }>("/api/dishes")
       ]);
+      if (requestSequence !== loadRequestSequence.current) return;
       const previousStatus = orderStatusRef.current;
-      setCurrentOrder(orderResult.order);
+      const shouldInitializeDraft = initializeDraft || !draftReadyRef.current;
+      setCurrentOrder(orderResult.order, false);
       setCategories(categoryResult.categories);
       setDishes(dishResult.dishes);
-      if (initializeDraft) {
+      if (shouldInitializeDraft) {
         const pending = getPendingIdempotentRequest(`items:${orderId}`);
         let savedLines: unknown = [];
         const rawDraft = localStorage.getItem(`order-draft:${encodeURIComponent(user.id)}:${encodeURIComponent(orderId)}`);
@@ -497,16 +504,20 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
         if (pending && Array.isArray(pending.payload.items)) savedLines = pending.payload.items;
         setCart(restoreCartLines(savedLines, dishResult.dishes));
         setPendingSubmission(pending);
+        draftReadyRef.current = true;
         setDraftReady(true);
       } else if (previousStatus === "OPEN" && orderResult.order.status !== "OPEN") {
         setMessage("订单已在其他设备结束；本机未提交菜品仍保留，请先核对订单状态");
       }
     } catch (error) {
-      setMessage(errorText(error));
+      if (requestSequence === loadRequestSequence.current) setMessage(errorText(error));
     }
   }, [orderId, setCurrentOrder, setMessage, user.id]);
 
-  useEffect(() => { void load(true); }, [load]);
+  useEffect(() => {
+    void load(true);
+    return () => { loadRequestSequence.current += 1; };
+  }, [load]);
   useEffect(() => {
     const handleUpdate = (event: Event) => {
       const detail = (event as CustomEvent<StoreEventDetail>).detail;
@@ -1238,30 +1249,55 @@ function AndroidPrinterPanel({ setMessage }: { setMessage: (message: string) => 
   const [state, setState] = useState<PrinterHostState | null>(null);
   const [busy, setBusy] = useState(false);
   const isAndroid = Capacitor.getPlatform() === "android";
+  const pairedRequestSequence = useRef(0);
+  const statusRequestSequence = useRef(0);
+  const selectedIdRef = useRef("");
+  const selectionRevision = useRef(0);
 
-  async function refreshStatus() {
-    if (!isAndroid) return;
+  function selectDevice(id: string) {
+    selectedIdRef.current = id;
+    selectionRevision.current += 1;
+    setSelectedId(id);
+  }
+
+  async function refreshStatus(): Promise<PrinterHostState | null> {
+    if (!isAndroid) return null;
+    const requestSequence = ++statusRequestSequence.current;
     try {
       const next = await PrinterHost.status();
+      if (requestSequence !== statusRequestSequence.current) return null;
       setState(next);
-      if (next.deviceId) setSelectedId(next.deviceId);
+      return next;
     } catch (error) {
-      setMessage(errorText(error));
+      if (requestSequence === statusRequestSequence.current) setMessage(errorText(error));
+      return null;
     }
   }
 
   async function loadPaired() {
+    const requestSequence = ++pairedRequestSequence.current;
+    const selectionRevisionAtStart = selectionRevision.current;
     setBusy(true);
     try {
       const result = await PrinterHost.listPaired();
+      if (requestSequence !== pairedRequestSequence.current) return;
       setDevices(result.devices);
-      await refreshStatus();
-      if (!selectedId && result.devices[0]) setSelectedId(result.devices[0].id);
+      const nextState = await refreshStatus();
+      if (requestSequence !== pairedRequestSequence.current
+        || selectionRevision.current !== selectionRevisionAtStart) return;
+      const selectionIsPaired = result.devices.some((device) => device.id === selectedIdRef.current);
+      if (!selectionIsPaired) {
+        const preferredId = nextState?.deviceId && result.devices.some((device) => device.id === nextState.deviceId)
+          ? nextState.deviceId
+          : result.devices[0]?.id || "";
+        selectedIdRef.current = preferredId;
+        setSelectedId(preferredId);
+      }
       if (!result.devices.length) setMessage("请先在安卓系统蓝牙设置中完成打印机配对");
     } catch (error) {
-      setMessage(errorText(error));
+      if (requestSequence === pairedRequestSequence.current) setMessage(errorText(error));
     } finally {
-      setBusy(false);
+      if (requestSequence === pairedRequestSequence.current) setBusy(false);
     }
   }
 
@@ -1287,6 +1323,7 @@ function AndroidPrinterPanel({ setMessage }: { setMessage: (message: string) => 
         printerToken: registration.printerToken,
         serverUrl: window.location.origin
       });
+      statusRequestSequence.current += 1;
       setState(next);
       setMessage("安卓打印服务已启用；只自动打印连接后新生成的任务");
     } catch (error) {
@@ -1299,7 +1336,9 @@ function AndroidPrinterPanel({ setMessage }: { setMessage: (message: string) => 
   async function stop() {
     setBusy(true);
     try {
-      setState(await PrinterHost.stop());
+      const next = await PrinterHost.stop();
+      statusRequestSequence.current += 1;
+      setState(next);
       setMessage("安卓打印服务已停用");
     } catch (error) {
       setMessage(errorText(error));
@@ -1309,7 +1348,7 @@ function AndroidPrinterPanel({ setMessage }: { setMessage: (message: string) => 
   }
 
   if (!isAndroid) return null;
-  return <div className="content-card printer-host-card"><div className="printer-host-heading"><div><h3>安卓打印主机</h3><p className="muted">先在系统蓝牙中配对打印机。断线期间产生的任务不会在重连后自动补打。</p></div><span className={`status-pill ${state?.connected ? "green" : state?.enabled ? "red" : "gray"}`}>{state?.connected ? "已连接" : state?.enabled ? "连接中" : "未启用"}</span></div><div className="printer-host-controls"><label>已配对打印机<select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}><option value="">请选择</option>{devices.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.id}</option>)}</select></label><button type="button" className="secondary" onClick={() => void loadPaired()} disabled={busy}>刷新设备</button><button type="button" className="primary" onClick={() => void enable()} disabled={busy || !selectedId}>启用打印</button>{state?.enabled && <button type="button" className="secondary danger-outline" onClick={() => void stop()} disabled={busy}>停用</button>}</div>{state?.message && <p className="printer-host-message">{state.message}</p>}</div>;
+  return <div className="content-card printer-host-card"><div className="printer-host-heading"><div><h3>安卓打印主机</h3><p className="muted">先在系统蓝牙中配对打印机。断线期间产生的任务不会在重连后自动补打。</p></div><span className={`status-pill ${state?.connected ? "green" : state?.enabled ? "red" : "gray"}`}>{state?.connected ? "已连接" : state?.enabled ? "连接中" : "未启用"}</span></div><div className="printer-host-controls"><label>已配对打印机<select value={selectedId} onChange={(event) => selectDevice(event.target.value)}><option value="">请选择</option>{devices.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.id}</option>)}</select></label><button type="button" className="secondary" onClick={() => void loadPaired()} disabled={busy}>刷新设备</button><button type="button" className="primary" onClick={() => void enable()} disabled={busy || !selectedId}>启用打印</button>{state?.enabled && <button type="button" className="secondary danger-outline" onClick={() => void stop()} disabled={busy}>停用</button>}</div>{state?.message && <p className="printer-host-message">{state.message}</p>}</div>;
 }
 
 function SettingsPage({ setMessage }: { setMessage: (message: string) => void }) {
@@ -1321,8 +1360,66 @@ function SettingsPage({ setMessage }: { setMessage: (message: string) => void })
   const [deleteTarget, setDeleteTarget] = useState<Table | null>(null);
   const [rotatedPrinterToken, setRotatedPrinterToken] = useState<{ id: string; name: string; token: string } | null>(null);
   const [employeeForm, setEmployeeForm] = useState({ username: "", name: "", password: "" });
-  async function load() { try { const [settingResult, tableResult, employeeResult, printerResult] = await Promise.all([api<{ settings: Settings }>("/api/settings"), api<{ tables: Table[] }>("/api/tables"), api<{ employees: Employee[] }>("/api/employees"), api<{ devices: PrinterDevice[] }>("/api/print-devices")]); setSettings(settingResult.settings); setTables(tableResult.tables); setEmployees(employeeResult.employees); setPrinterDevices(printerResult.devices); setLoaded(true); } catch (error) { setMessage(errorText(error)); } }
-  async function loadPrinters() { try { const result = await api<{ devices: PrinterDevice[] }>("/api/print-devices"); setPrinterDevices(result.devices); } catch { /* Keep the last known state during temporary connection loss. */ } }
+  const loadRequestSequence = useRef(0);
+  const settingsSnapshotSequence = useRef(0);
+  const printerSettingsRequestSequence = useRef(0);
+  const tablesRequestSequence = useRef(0);
+  const printerRequestSequence = useRef(0);
+  async function load() {
+    const requestSequence = ++loadRequestSequence.current;
+    const settingsSequence = ++settingsSnapshotSequence.current;
+    const printerSettingsSequenceAtStart = printerSettingsRequestSequence.current;
+    const tablesSequence = ++tablesRequestSequence.current;
+    const printersSequence = ++printerRequestSequence.current;
+    try {
+      const [settingResult, tableResult, employeeResult, printerResult] = await Promise.all([
+        api<{ settings: Settings }>("/api/settings"),
+        api<{ tables: Table[] }>("/api/tables"),
+        api<{ employees: Employee[] }>("/api/employees"),
+        api<{ devices: PrinterDevice[] }>("/api/print-devices")
+      ]);
+      if (settingsSequence === settingsSnapshotSequence.current) {
+        setSettings((current) => {
+          if (printerSettingsSequenceAtStart === printerSettingsRequestSequence.current) return settingResult.settings;
+          const latestPrinterFields = {
+            ...(Object.prototype.hasOwnProperty.call(current, "printer_device_id")
+              ? { printer_device_id: current.printer_device_id }
+              : {}),
+            ...(Object.prototype.hasOwnProperty.call(current, "printer_device_name")
+              ? { printer_device_name: current.printer_device_name }
+              : {})
+          };
+          return { ...settingResult.settings, ...latestPrinterFields };
+        });
+      }
+      if (tablesSequence === tablesRequestSequence.current) setTables(tableResult.tables);
+      if (requestSequence === loadRequestSequence.current) {
+        setEmployees(employeeResult.employees);
+        setLoaded(true);
+      }
+      if (printersSequence === printerRequestSequence.current) setPrinterDevices(printerResult.devices);
+    } catch (error) {
+      if (requestSequence === loadRequestSequence.current) setMessage(errorText(error));
+    }
+  }
+  async function loadPrinters() {
+    const requestSequence = ++printerRequestSequence.current;
+    try {
+      const result = await api<{ devices: PrinterDevice[] }>("/api/print-devices");
+      if (requestSequence === printerRequestSequence.current) setPrinterDevices(result.devices);
+    } catch {
+      /* Keep the last known state during temporary connection loss. */
+    }
+  }
+  async function loadTables() {
+    const requestSequence = ++tablesRequestSequence.current;
+    try {
+      const result = await api<{ tables: Table[] }>("/api/tables");
+      if (requestSequence === tablesRequestSequence.current) setTables(result.tables);
+    } catch {
+      /* Keep the last known state during temporary connection loss. */
+    }
+  }
   useEffect(() => { void load(); }, []);
   useEffect(() => {
     const timer = window.setInterval(() => { void loadPrinters(); }, 10_000);
@@ -1333,16 +1430,19 @@ function SettingsPage({ setMessage }: { setMessage: (message: string) => void })
       const type = (event as CustomEvent<StoreEventDetail>).detail?.type;
       if (type === "printer.updated") {
         void loadPrinters();
+        const requestSequence = ++printerSettingsRequestSequence.current;
         void api<{ settings: Settings }>("/api/settings").then(({ settings: next }) => {
-          setSettings((current) => ({
-            ...current,
-            printer_device_id: next.printer_device_id,
-            printer_device_name: next.printer_device_name
-          }));
+          if (requestSequence === printerSettingsRequestSequence.current) {
+            setSettings((current) => ({
+              ...current,
+              printer_device_id: next.printer_device_id,
+              printer_device_name: next.printer_device_name
+            }));
+          }
         }).catch(() => undefined);
       }
       if (["table.updated", "order.created", "order.updated", "order.settled", "order.ended", "order.reopened"].includes(type || "")) {
-        void api<{ tables: Table[] }>("/api/tables").then((result) => setTables(result.tables)).catch(() => undefined);
+        void loadTables();
       }
     };
     window.addEventListener("点单台数据更新", handleUpdate);
@@ -1432,19 +1532,50 @@ export default function App() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [message, setMessage] = useState("");
   const [checking, setChecking] = useState(Boolean(getToken()));
+  const tableRequestSequence = useRef(0);
+  const categoryRequestSequence = useRef(0);
 
-  async function refreshTables() { const result = await api<{ tables: Table[] }>("/api/tables"); setTables(result.tables); }
-  async function refreshCategories() { const result = await api<{ categories: Category[] }>("/api/categories"); setCategories(result.categories); }
-  async function loadHome() { try { await Promise.all([refreshTables(), refreshCategories()]); } catch (error) { setMessage(errorText(error)); } }
+  const refreshTables = useCallback(async () => {
+    const requestSequence = ++tableRequestSequence.current;
+    try {
+      const result = await api<{ tables: Table[] }>("/api/tables");
+      if (requestSequence === tableRequestSequence.current) setTables(result.tables);
+    } catch (error) {
+      if (requestSequence === tableRequestSequence.current) throw error;
+    }
+  }, []);
+  const refreshCategories = useCallback(async () => {
+    const requestSequence = ++categoryRequestSequence.current;
+    try {
+      const result = await api<{ categories: Category[] }>("/api/categories");
+      if (requestSequence === categoryRequestSequence.current) setCategories(result.categories);
+    } catch (error) {
+      if (requestSequence === categoryRequestSequence.current) throw error;
+    }
+  }, []);
+  const loadHome = useCallback(async () => {
+    try { await Promise.all([refreshTables(), refreshCategories()]); }
+    catch (error) { setMessage(errorText(error)); }
+  }, [refreshCategories, refreshTables]);
 
   useEffect(() => {
-    if (!getToken()) { setChecking(false); return; }
-    api<{ user: User }>("/api/auth/me").then((result) => setUser(result.user)).catch(() => setToken("")).finally(() => setChecking(false));
+    let active = true;
     const handler = () => { setUser(null); setChecking(false); };
     window.addEventListener("点单台登录失效", handler);
-    return () => window.removeEventListener("点单台登录失效", handler);
+    if (!getToken()) {
+      setChecking(false);
+    } else {
+      void api<{ user: User }>("/api/auth/me")
+        .then((result) => { if (active) setUser(result.user); })
+        .catch(() => { if (active) setToken(""); })
+        .finally(() => { if (active) setChecking(false); });
+    }
+    return () => {
+      active = false;
+      window.removeEventListener("点单台登录失效", handler);
+    };
   }, []);
-  useEffect(() => { if (user) void loadHome(); }, [user]);
+  useEffect(() => { if (user) void loadHome(); }, [loadHome, user]);
   useEffect(() => {
     if (!user) return;
     let cancelled = false;
@@ -1452,7 +1583,7 @@ export default function App() {
     let retryTimer: number | undefined;
     let retryDelay = 1_000;
     const refreshTableSnapshot = () => {
-      void api<{ tables: Table[] }>("/api/tables").then((result) => setTables(result.tables)).catch((error) => {
+      void refreshTables().catch((error) => {
         setMessage(errorText(error));
       });
     };
@@ -1485,7 +1616,7 @@ export default function App() {
             refreshTableSnapshot();
           }
           if (update.type === "menu.updated") {
-            void api<{ categories: Category[] }>("/api/categories").then((value) => setCategories(value.categories)).catch(() => undefined);
+            void refreshCategories().catch(() => undefined);
           }
           window.dispatchEvent(new CustomEvent("点单台数据更新", { detail: update }));
         };
@@ -1506,13 +1637,13 @@ export default function App() {
       window.clearInterval(fallbackTimer);
       source?.close();
     };
-  }, [user?.id]);
+  }, [refreshCategories, refreshTables, setMessage, user?.id]);
   useEffect(() => {
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<{ scope?: string }>).detail;
       const parts = String(detail?.scope || "").split(":");
       const orderId = parts[0] === "open" ? undefined : parts[1];
-      void api<{ tables: Table[] }>("/api/tables").then((result) => setTables(result.tables)).catch(() => undefined);
+      void refreshTables().catch(() => undefined);
       window.dispatchEvent(new CustomEvent("点单台数据更新", {
         detail: { type: "order.updated", orderId }
       }));
@@ -1520,7 +1651,7 @@ export default function App() {
     };
     window.addEventListener("点单台幂等请求冲突", handler);
     return () => window.removeEventListener("点单台幂等请求冲突", handler);
-  }, []);
+  }, [refreshTables]);
   useEffect(() => { if (!message) return; const timer = window.setTimeout(() => setMessage(""), 5000); return () => window.clearTimeout(timer); }, [message]);
 
   if (checking) return <main className="login-shell"><div className="loading">正在检查登录状态…</div></main>;

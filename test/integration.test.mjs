@@ -283,9 +283,10 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   const csvResponse = await fetch(`${baseUrl}/api/stats/export.csv?from=${businessDate.rows[0].business_date}&to=${businessDate.rows[0].business_date}`, {
     headers: { Authorization: `Bearer ${ownerToken}` }
   });
-  const csv = await csvResponse.text();
+  const csvBytes = new Uint8Array(await csvResponse.arrayBuffer());
+  const csv = new TextDecoder().decode(csvBytes);
   assert.equal(csvResponse.status, 200, csv);
-  assert.equal(csv.charCodeAt(0), 0xfeff, "CSV 应使用 UTF-8 BOM 兼容 Excel 中文");
+  assert.deepEqual([...csvBytes.subarray(0, 3)], [0xef, 0xbb, 0xbf], "CSV 应使用 UTF-8 BOM 兼容 Excel 中文");
   assert.match(csv, /"营业额"/);
   assert.match(csv, /"每桌平均消费"/);
   assert.match(csv, /"新客"/);
