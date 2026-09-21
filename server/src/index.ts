@@ -1027,6 +1027,7 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       const details = await orderDetails(client, orderId);
       const receiptPayload = {
         ...printOrderPayload(details, details.items as Array<Record<string, unknown>>, "结账小票"),
+        storeName: text(settings.store_name, "我的餐厅"),
         totals: {
           grossFen: totals.grossFen,
           giftFen: totals.giftFen,
@@ -1649,11 +1650,22 @@ app.get("/api/print-jobs", requireAuth, async (req, res) => {
       params.push(status);
       conditions.push(`pj.status = $${params.length}`);
     }
+    const today = businessDate();
+    params.push(today);
+    const dateParam = params.length;
+    conditions.push(`pj.created_at >= ($${dateParam}::date::timestamp AT TIME ZONE 'Asia/Shanghai')`);
+    conditions.push(`pj.created_at < (($${dateParam}::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')`);
+    const tableQuery = text(req.query.table);
+    if (tableQuery) {
+      params.push(`%${tableQuery}%`);
+      const tableParam = params.length;
+      conditions.push(`COALESCE(NULLIF(pj.payload->>'tableName', ''), NULLIF(pj.payload->>'tableNumber', '') || '号桌', '无桌台') ILIKE $${tableParam}`);
+    }
     params.push(limit);
     const result = await pool.query(
       `SELECT pj.id, pj.order_id, pj.batch_id, pj.kind, pj.copy_no, pj.payload, pj.status, pj.device_id, pj.attempts,
               pj.last_error, pj.manual_requested_at, pj.claimed_at, pj.sent_at, pj.created_at
-       FROM print_jobs pj ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+       FROM print_jobs pj WHERE ${conditions.join(" AND ")}
        ORDER BY pj.created_at DESC LIMIT $${params.length}`,
       params
     );

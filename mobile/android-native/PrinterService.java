@@ -36,6 +36,8 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -50,6 +52,7 @@ public class PrinterService extends Service {
     private static final String KEY_CURRENT_JOB = "current_job";
     private static final String CHANNEL_ID = "order_dinner_printer";
     private static final int NOTIFICATION_ID = 1314;
+    private static final int PRINT_COLUMNS = 42;
     private static final UUID SERIAL_PORT_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final Charset PRINTER_CHARSET = Charset.forName("GB18030");
     private static volatile boolean connected = false;
@@ -258,10 +261,22 @@ public class PrinterService extends Service {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         command(output, 0x1B, 0x40); // 初始化
         command(output, 0x1C, 0x26); // 中文模式
+        if (receipt) command(output, 0x1B, 0x33, 0x20); // 结账小票行距稍微加大
+
+        String storeName = receipt ? payload.optString("storeName", "").trim() : "";
+        if (!storeName.isEmpty()) {
+            command(output, 0x1B, 0x61, 0x01);
+            command(output, 0x1D, 0x21, 0x10);
+            line(output, storeName);
+            command(output, 0x1D, 0x21, 0x00);
+            line(output, "");
+        }
+
         command(output, 0x1B, 0x61, 0x01);
         command(output, 0x1D, 0x21, 0x11);
         line(output, payload.optString("title", receipt ? "结账小票" : "备菜单"));
         command(output, 0x1D, 0x21, 0x00);
+        line(output, "");
         command(output, 0x1B, 0x61, 0x01);
         command(output, 0x1D, 0x21, 0x11);
         line(output, tableName(payload));
@@ -285,8 +300,12 @@ public class PrinterService extends Service {
                 int quantity = item.optInt("quantity", 0);
                 String unit = item.optString("unit", "份");
                 int priceFen = item.optInt("priceFen", 0);
-                command(output, 0x1D, 0x21, 0x01);
-                line(output, item.optString("name", "菜品") + " × " + quantity + " " + unit);
+                String name = item.optString("name", "菜品");
+                String quantityLabel = "x" + quantity + unit;
+                command(output, 0x1D, 0x21, 0x10); // 双倍高度，不放大字宽，适配70毫米纸
+                for (String itemLine : alignDishAndQuantity(name, quantityLabel)) {
+                    line(output, itemLine);
+                }
                 command(output, 0x1D, 0x21, 0x00);
                 if (receipt) {
                     line(output, "  单价 " + money(priceFen) + "  小计 " + money(priceFen * quantity));
@@ -329,6 +348,54 @@ public class PrinterService extends Service {
 
     private void separator(ByteArrayOutputStream output) throws Exception {
         line(output, "------------------------------------------");
+    }
+
+    private List<String> alignDishAndQuantity(String name, String quantityLabel) {
+        String safeName = name == null || name.isEmpty() ? "菜品" : name;
+        int quantityWidth = displayWidth(quantityLabel);
+        int firstNameLimit = Math.max(1, PRINT_COLUMNS - quantityWidth - 1);
+        int firstEnd = prefixEnd(safeName, firstNameLimit);
+        String firstName = safeName.substring(0, firstEnd);
+        int gap = Math.max(1, PRINT_COLUMNS - displayWidth(firstName) - quantityWidth);
+
+        List<String> lines = new ArrayList<>();
+        lines.add(firstName + spaces(gap) + quantityLabel);
+        String remainder = safeName.substring(firstEnd);
+        while (!remainder.isEmpty()) {
+            int end = prefixEnd(remainder, PRINT_COLUMNS);
+            lines.add(remainder.substring(0, end));
+            remainder = remainder.substring(end);
+        }
+        return lines;
+    }
+
+    private int prefixEnd(String value, int maxWidth) {
+        int width = 0;
+        int index = 0;
+        while (index < value.length()) {
+            int codePoint = value.codePointAt(index);
+            int codePointWidth = codePoint <= 0x7F ? 1 : 2;
+            if (width + codePointWidth > maxWidth) break;
+            width += codePointWidth;
+            index += Character.charCount(codePoint);
+        }
+        return index;
+    }
+
+    private int displayWidth(String value) {
+        int width = 0;
+        for (int index = 0; index < value.length();) {
+            int codePoint = value.codePointAt(index);
+            width += codePoint <= 0x7F ? 1 : 2;
+            index += Character.charCount(codePoint);
+        }
+        return width;
+    }
+
+    private String spaces(int count) {
+        StringBuilder value = new StringBuilder();
+        for (int index = 0; index < count; index += 1) value.append(' ');
+        return value.toString();
     }
 
     private String tableName(JSONObject payload) {

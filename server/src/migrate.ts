@@ -1,5 +1,6 @@
 import bcrypt from "bcryptjs";
 import { pool } from "./db.js";
+import { OTHER_CATEGORY_DISHES } from "./menu.js";
 
 const schema = `
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -238,6 +239,11 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (scope, request_key)
 );
+
+CREATE TABLE IF NOT EXISTS app_migrations (
+  name text PRIMARY KEY,
+  completed_at timestamptz NOT NULL DEFAULT now()
+);
 `;
 
 const settings = {
@@ -300,8 +306,57 @@ export async function migrateAndSeed(): Promise<void> {
     [username, passwordHash]
   );
 
+  await importOtherCategoryDishes();
+
   if (process.env.SEED_DEMO_DATA === "true") {
     await seedDemoDishes();
+  }
+}
+
+async function importOtherCategoryDishes(): Promise<void> {
+  const migrationName = "20260920_other_category_menu_v1";
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [migrationName]);
+    const applied = await client.query(`SELECT 1 FROM app_migrations WHERE name = $1`, [migrationName]);
+    if (applied.rows.length) {
+      await client.query("COMMIT");
+      return;
+    }
+
+    const category = await client.query<{ id: string }>(
+      `INSERT INTO categories (name, sort_order, active) VALUES ('其他', 999, true)
+       ON CONFLICT (name) DO UPDATE SET active = true, updated_at = now()
+       RETURNING id`
+    );
+    const categoryId = category.rows[0]?.id;
+    if (!categoryId) throw new Error("创建其他分类失败");
+
+    for (const [name, priceFen, costFen] of OTHER_CATEGORY_DISHES) {
+      const updated = await client.query(
+        `UPDATE dishes
+         SET category_id = $1, price_fen = $2, cost_fen = $3, on_sale = true, updated_at = now()
+         WHERE name = $4
+         RETURNING id`,
+        [categoryId, priceFen, costFen, name]
+      );
+      if (!updated.rows.length) {
+        await client.query(
+          `INSERT INTO dishes (category_id, name, price_fen, cost_fen)
+           VALUES ($1, $2, $3, $4)`,
+          [categoryId, name, priceFen, costFen]
+        );
+      }
+    }
+
+    await client.query(`INSERT INTO app_migrations (name) VALUES ($1)`, [migrationName]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
 }
 

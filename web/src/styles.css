@@ -203,16 +203,16 @@ td { color: #303941; }
 .order-preview-row > small { grid-column: 1 / -1; color: #4d555c; line-height: 1.5; overflow-wrap: anywhere; }
 .order-preview-total { display: flex; justify-content: space-between; align-items: baseline; margin-top: 15px; padding: 12px 3px 0; border-top: 1px solid var(--border); }
 .order-preview-total strong { color: var(--primary-dark); font-size: 24px; }
-.print-paper { width: min(390px, 100%); margin: 0 auto; padding: 23px 20px; border: 1px dashed #bdc6cd; background: #fff; color: #252d34; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.7; box-shadow: 0 3px 14px rgba(30,50,70,.08); overflow-wrap: break-word; }
-.print-paper-title { text-align: center; font-size: 17px; font-weight: 700; margin-bottom: 9px; }
-.print-table-name { margin: 4px 0 10px; text-align: center; font-size: 28px; line-height: 1.25; font-weight: 800; color: #151a1e; overflow-wrap: anywhere; }
+.print-paper { box-sizing: border-box; width: min(70mm, 100%); margin: 0 auto; padding: 5mm; border: 1px dashed #bdc6cd; background: #fff; color: #252d34; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.7; box-shadow: 0 3px 14px rgba(30,50,70,.08); overflow-wrap: break-word; }
+.print-store-name { margin-bottom: 8px; text-align: center; font-size: 19px; font-weight: 700; line-height: 1.5; overflow-wrap: anywhere; }
+.print-paper-title { text-align: center; font-size: 17px; font-weight: 700; margin-bottom: 16px; }
+.print-table-name { margin: 8px 0 12px; text-align: center; font-size: 28px; line-height: 1.25; font-weight: 800; color: #151a1e; overflow-wrap: anywhere; }
 .print-paper hr { border: 0; border-top: 1px dashed #aeb7be; margin: 11px 0; }
 .print-line { display: flex; flex-direction: column; gap: 2px; padding: 8px 0; border-bottom: 1px dotted #d7dde2; }
 .print-line:last-of-type { border-bottom: 0; }
-.print-line-main { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: baseline; gap: 8px; }
+.print-line-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 8px; }
 .print-line-main strong { font-size: 19px; line-height: 1.35; color: #161b1f; }
-.print-line-main span { color: #3c464e; white-space: nowrap; }
-.print-line-main b { font-size: 15px; white-space: nowrap; }
+.print-line-main span { justify-self: end; color: #3c464e; text-align: right; white-space: nowrap; }
 .print-unit-price { color: #66737e; font-size: 12px; text-align: right; }
 .print-item-note, .print-order-note { color: #4d555c; font-weight: 600; }
 .print-item-note { font-size: 14px; }
