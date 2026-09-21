@@ -53,6 +53,7 @@ public class PrinterService extends Service {
     private static final String CHANNEL_ID = "order_dinner_printer";
     private static final int NOTIFICATION_ID = 1314;
     private static final int PRINT_COLUMNS = 42;
+    private static final int LARGE_PRINT_COLUMNS = PRINT_COLUMNS / 2;
     private static final UUID SERIAL_PORT_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final Charset PRINTER_CHARSET = Charset.forName("GB18030");
     private static volatile boolean connected = false;
@@ -266,8 +267,10 @@ public class PrinterService extends Service {
         String storeName = receipt ? payload.optString("storeName", "").trim() : "";
         if (!storeName.isEmpty()) {
             command(output, 0x1B, 0x61, 0x01);
-            command(output, 0x1D, 0x21, 0x10);
-            line(output, storeName);
+            command(output, 0x1D, 0x21, 0x11);
+            for (String storeNameLine : wrapText(storeName, LARGE_PRINT_COLUMNS)) {
+                line(output, storeNameLine);
+            }
             command(output, 0x1D, 0x21, 0x00);
             line(output, "");
         }
@@ -302,16 +305,11 @@ public class PrinterService extends Service {
                 int priceFen = item.optInt("priceFen", 0);
                 String name = item.optString("name", "菜品");
                 String quantityLabel = "x" + quantity + unit;
-                command(output, 0x1D, 0x21, 0x10); // 双倍高度，不放大字宽，适配70毫米纸
-                for (String itemLine : alignDishAndQuantity(name, quantityLabel)) {
-                    line(output, itemLine);
-                }
-                command(output, 0x1D, 0x21, 0x00);
+                String note = receipt ? "" : formatItemNote(item.optString("note", ""));
+                printDishItem(output, name, quantityLabel, note, receipt);
                 if (receipt) {
                     line(output, "  单价 " + money(priceFen) + "  小计 " + money(priceFen * quantity));
                 }
-                String note = formatItemNote(item.optString("note", ""));
-                if (!note.isEmpty()) line(output, "  " + note);
             }
         }
         if (receipt) {
@@ -360,36 +358,89 @@ public class PrinterService extends Service {
         line(output, "------------------------------------------");
     }
 
-    private List<String> alignDishAndQuantity(String name, String quantityLabel) {
+    private void printDishItem(
+        ByteArrayOutputStream output,
+        String name,
+        String quantityLabel,
+        String note,
+        boolean receipt
+    ) throws Exception {
         String safeName = name == null || name.isEmpty() ? "菜品" : name;
-        int quantityWidth = displayWidth(quantityLabel);
-        int firstNameLimit = Math.max(1, PRINT_COLUMNS - quantityWidth - 1);
-        int firstEnd = prefixEnd(safeName, firstNameLimit);
-        String firstName = safeName.substring(0, firstEnd);
-        int gap = Math.max(1, PRINT_COLUMNS - displayWidth(firstName) - quantityWidth);
+        String safeQuantity = quantityLabel == null ? "" : quantityLabel;
+        String safeNote = note == null ? "" : note;
+        boolean sameLargeLine =
+            displayWidth(safeName) + 1 + displayWidth(safeQuantity) <= LARGE_PRINT_COLUMNS;
 
-        List<String> lines = new ArrayList<>();
-        lines.add(firstName + spaces(gap) + quantityLabel);
-        String remainder = safeName.substring(firstEnd);
-        while (!remainder.isEmpty()) {
-            int end = prefixEnd(remainder, PRINT_COLUMNS);
-            lines.add(remainder.substring(0, end));
-            remainder = remainder.substring(end);
+        command(output, 0x1D, 0x21, 0x11); // 菜名与短菜名数量使用宽高双倍字体
+        if (sameLargeLine) {
+            line(output, alignLeftAndRight(safeName, safeQuantity, LARGE_PRINT_COLUMNS));
+        } else {
+            for (String nameLine : wrapText(safeName, LARGE_PRINT_COLUMNS)) {
+                line(output, nameLine);
+            }
         }
-        return lines;
+        command(output, 0x1D, 0x21, 0x00);
+
+        if (sameLargeLine) {
+            if (!receipt && !safeNote.isEmpty()) {
+                for (String noteLine : wrapText("  " + safeNote, PRINT_COLUMNS)) {
+                    line(output, noteLine);
+                }
+            }
+        } else if (!receipt && !safeNote.isEmpty()) {
+            printNoteAndQuantity(output, "  " + safeNote, safeQuantity);
+        } else {
+            line(output, alignRight(safeQuantity, PRINT_COLUMNS));
+        }
     }
 
-    private int prefixEnd(String value, int maxWidth) {
-        int width = 0;
+    private void printNoteAndQuantity(ByteArrayOutputStream output, String note, String quantityLabel) throws Exception {
+        int quantityWidth = displayWidth(quantityLabel);
+        int noteWidth = Math.max(1, PRINT_COLUMNS - quantityWidth - 1);
+        List<String> noteLines = wrapText(note, noteWidth);
+        if (noteLines.isEmpty()) {
+            line(output, alignRight(quantityLabel, PRINT_COLUMNS));
+            return;
+        }
+
+        for (int index = 0; index < noteLines.size() - 1; index += 1) {
+            line(output, noteLines.get(index));
+        }
+        String lastNoteLine = noteLines.get(noteLines.size() - 1);
+        int gap = Math.max(0, PRINT_COLUMNS - displayWidth(lastNoteLine) - quantityWidth);
+        line(output, lastNoteLine + spaces(gap) + quantityLabel);
+    }
+
+    private List<String> wrapText(String value, int maxWidth) {
+        List<String> lines = new ArrayList<>();
+        if (value == null || value.isEmpty()) return lines;
+
+        int widthLimit = Math.max(1, maxWidth);
+        int lineStart = 0;
+        int lineWidth = 0;
         int index = 0;
         while (index < value.length()) {
             int codePoint = value.codePointAt(index);
             int codePointWidth = codePoint <= 0x7F ? 1 : 2;
-            if (width + codePointWidth > maxWidth) break;
-            width += codePointWidth;
+            if (lineWidth > 0 && lineWidth + codePointWidth > widthLimit) {
+                lines.add(value.substring(lineStart, index));
+                lineStart = index;
+                lineWidth = 0;
+            }
+            lineWidth += codePointWidth;
             index += Character.charCount(codePoint);
         }
-        return index;
+        lines.add(value.substring(lineStart));
+        return lines;
+    }
+
+    private String alignLeftAndRight(String left, String right, int columns) {
+        int gap = columns - displayWidth(left) - displayWidth(right);
+        return left + spaces(Math.max(1, gap)) + right;
+    }
+
+    private String alignRight(String value, int columns) {
+        return spaces(Math.max(0, columns - displayWidth(value))) + value;
     }
 
     private int displayWidth(String value) {
