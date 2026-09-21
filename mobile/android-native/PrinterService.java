@@ -259,6 +259,8 @@ public class PrinterService extends Service {
         JSONObject payload = job.getJSONObject("payload");
         String kind = job.optString("kind", "KITCHEN");
         boolean receipt = "RECEIPT".equals(kind);
+        JSONArray printLines = payload.optJSONArray("printLines");
+        if (printLines != null) return renderPrintLines(receipt, printLines);
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         command(output, 0x1B, 0x40); // 初始化
         command(output, 0x1C, 0x26); // 中文模式
@@ -302,35 +304,22 @@ public class PrinterService extends Service {
                 JSONObject item = items.getJSONObject(index);
                 int quantity = item.optInt("quantity", 0);
                 String unit = item.optString("unit", "份");
-                int priceFen = item.optInt("priceFen", 0);
                 String name = item.optString("name", "菜品");
                 String quantityLabel = "x" + quantity + unit;
                 String note = receipt ? "" : formatItemNote(item.optString("note", ""));
                 printDishItem(output, name, quantityLabel, note, receipt);
-                if (receipt) {
-                    line(output, "  单价 " + money(priceFen) + "  小计 " + money(priceFen * quantity));
-                }
+                if (!receipt && !note.isEmpty() && index < items.length() - 1) line(output, "");
             }
         }
         if (receipt) {
             JSONObject totals = payload.optJSONObject("totals");
             if (totals != null) {
                 separator(output);
-                line(output, "菜品原价：" + money(totals.optInt("grossFen")));
-                if (totals.optInt("giftFen") > 0) line(output, "赠送：-" + money(totals.optInt("giftFen")));
-                if (totals.optInt("returnFen") > 0) line(output, "退菜：-" + money(totals.optInt("returnFen")));
-                if (totals.optInt("manualDiscountFen") > 0) line(output, "人工减免：-" + money(totals.optInt("manualDiscountFen")));
-                if (totals.optInt("pointsDiscountFen") > 0) line(output, "积分抵扣：-" + money(totals.optInt("pointsDiscountFen")));
                 line(output, "应收：" + money(totals.optInt("dueFen", totals.optInt("receivedFen"))));
-                command(output, 0x1D, 0x21, 0x01);
                 line(output, "实收：" + money(totals.optInt("receivedFen")));
-                command(output, 0x1D, 0x21, 0x00);
             }
-            String paymentMethod = payload.optString("paymentMethod", "");
-            if (!paymentMethod.isEmpty()) line(output, "收款方式：" + paymentMethod);
             if (payload.optInt("redeemedPoints") > 0) line(output, "本次抵扣积分：" + payload.optInt("redeemedPoints") + " 分");
             if (payload.optInt("earnedPoints") > 0) line(output, "本次获得积分：" + payload.optInt("earnedPoints") + " 分");
-            if (payload.has("pointsBalance")) line(output, "剩余积分：" + payload.optInt("pointsBalance") + " 分");
         }
         String footer = payload.optString("footer", "");
         if (!footer.isEmpty()) {
@@ -341,6 +330,27 @@ public class PrinterService extends Service {
         line(output, "");
         line(output, "");
         line(output, "");
+        command(output, 0x1D, 0x56, 0x42, 0x00);
+        return output.toByteArray();
+    }
+
+    private byte[] renderPrintLines(boolean receipt, JSONArray printLines) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        command(output, 0x1B, 0x40); // 初始化
+        command(output, 0x1C, 0x26); // 中文模式
+        if (receipt) command(output, 0x1B, 0x33, 0x20); // 结账小票行距稍微加大
+
+        for (int index = 0; index < printLines.length(); index += 1) {
+            JSONObject printLine = printLines.optJSONObject(index);
+            if (printLine == null) continue;
+            command(output, 0x1B, 0x61, "CENTER".equals(printLine.optString("align", "LEFT")) ? 0x01 : 0x00);
+            String size = printLine.optString("size", "NORMAL");
+            int sizeCommand = "LARGE".equals(size) ? 0x11 : "EMPHASIS".equals(size) ? 0x01 : 0x00;
+            command(output, 0x1D, 0x21, sizeCommand);
+            line(output, printLine.optString("text", ""));
+        }
+        command(output, 0x1D, 0x21, 0x00);
+        command(output, 0x1B, 0x61, 0x00);
         command(output, 0x1D, 0x56, 0x42, 0x00);
         return output.toByteArray();
     }
@@ -378,6 +388,8 @@ public class PrinterService extends Service {
             for (String nameLine : wrapText(safeName, LARGE_PRINT_COLUMNS)) {
                 line(output, nameLine);
             }
+            command(output, 0x1D, 0x21, 0x11);
+            line(output, alignRight(safeQuantity, LARGE_PRINT_COLUMNS));
         }
         command(output, 0x1D, 0x21, 0x00);
 
@@ -388,27 +400,10 @@ public class PrinterService extends Service {
                 }
             }
         } else if (!receipt && !safeNote.isEmpty()) {
-            printNoteAndQuantity(output, "  " + safeNote, safeQuantity);
-        } else {
-            line(output, alignRight(safeQuantity, PRINT_COLUMNS));
+            for (String noteLine : wrapText("  " + safeNote, PRINT_COLUMNS)) {
+                line(output, noteLine);
+            }
         }
-    }
-
-    private void printNoteAndQuantity(ByteArrayOutputStream output, String note, String quantityLabel) throws Exception {
-        int quantityWidth = displayWidth(quantityLabel);
-        int noteWidth = Math.max(1, PRINT_COLUMNS - quantityWidth - 1);
-        List<String> noteLines = wrapText(note, noteWidth);
-        if (noteLines.isEmpty()) {
-            line(output, alignRight(quantityLabel, PRINT_COLUMNS));
-            return;
-        }
-
-        for (int index = 0; index < noteLines.size() - 1; index += 1) {
-            line(output, noteLines.get(index));
-        }
-        String lastNoteLine = noteLines.get(noteLines.size() - 1);
-        int gap = Math.max(0, PRINT_COLUMNS - displayWidth(lastNoteLine) - quantityWidth);
-        line(output, lastNoteLine + spaces(gap) + quantityLabel);
     }
 
     private List<String> wrapText(String value, int maxWidth) {

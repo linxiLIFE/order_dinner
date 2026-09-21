@@ -273,6 +273,29 @@ function ConfirmDialog({ title, message, confirmText = "确认", danger = false,
   return <Dialog title={title} onClose={onClose} className="confirm-modal"><p className="dialog-message">{message}</p><div className="modal-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>返回</button><button type="button" className={danger ? "primary danger-button" : "primary"} onClick={onConfirm} disabled={busy}>{busy ? "处理中…" : confirmText}</button></div></Dialog>;
 }
 
+function PrintCopiesDialog({ title, defaultCopies, confirmText = "确认打印", busy = false, onClose, onConfirm }: {
+  title: string;
+  defaultCopies: number;
+  confirmText?: string;
+  busy?: boolean;
+  onClose: () => void;
+  onConfirm: (copies: number) => void;
+}) {
+  const [value, setValue] = useState(String(defaultCopies));
+  const [error, setError] = useState("");
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    const copies = Number(value);
+    if (!Number.isInteger(copies) || copies < 1 || copies > 20) {
+      setError("请输入 1 到 20 之间的整数");
+      return;
+    }
+    setError("");
+    onConfirm(copies);
+  }
+  return <Dialog title="打印份数" description={title} onClose={onClose} closeDisabled={busy} className="confirm-modal"><form noValidate onSubmit={submit}><label>本次打印份数<input type="number" min="1" max="20" step="1" value={value} onChange={(event) => setValue(event.target.value)} autoFocus disabled={busy} /></label>{error && <div className="message error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="primary" disabled={busy}>{busy ? "提交中…" : confirmText}</button></div></form></Dialog>;
+}
+
 function Login({ onLogin }: { onLogin: (user: User) => void }) {
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
@@ -449,6 +472,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
   const [cart, setCart] = useState<Record<string, CartLine>>({});
   const [draftReady, setDraftReady] = useState(false);
   const [pendingSubmission, setPendingSubmission] = useState<PendingIdempotentRequest | null>(null);
+  const [kitchenCopiesOpen, setKitchenCopiesOpen] = useState(false);
   const [checkoutOpen, setCheckoutOpen] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [optionTarget, setOptionTarget] = useState<Dish | null>(null);
@@ -544,7 +568,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
       localStorage.setItem(storageKey, JSON.stringify({
         version: 2,
         lines,
-        pending: pending ? { idempotencyKey: pending.idempotencyKey, items: pending.payload.items } : null
+        pending: pending ? { idempotencyKey: pending.idempotencyKey, items: pending.payload.items, copies: pending.payload.copies } : null
       }));
     } catch {
       setMessage("本机草稿保存失败，请检查设备存储空间");
@@ -646,25 +670,41 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
     }
   }
 
-  async function submitItems() {
+  function requestItemsSubmit() {
+    const pending = pendingSubmission || getPendingIdempotentRequest(`items:${orderId}`);
+    if (pending) {
+      setPendingSubmission(pending);
+      const storedCopies = Number(pending.payload.copies);
+      void submitItems(Number.isInteger(storedCopies) && storedCopies >= 1 && storedCopies <= 20 ? storedCopies : 2);
+      return;
+    }
+    const items = Object.values(cart).map((line) => ({ dishId: line.dish.id, quantity: line.quantity, note: line.customNote, options: line.selections }));
+    if (!items.length) return setMessage("请先选择菜品");
+    setKitchenCopiesOpen(true);
+  }
+
+  async function submitItems(copies: number) {
+    setKitchenCopiesOpen(false);
     const items = Object.values(cart).map((line) => ({ dishId: line.dish.id, quantity: line.quantity, note: line.customNote, options: line.selections }));
     if (!items.length) return setMessage("请先选择菜品");
     setBusy(true);
     try {
-      const request = prepareIdempotentRequest(`items:${orderId}`, { items });
+      const request = prepareIdempotentRequest(`items:${orderId}`, { items, copies });
       const exactItems = Array.isArray(request.payload.items) ? request.payload.items : items;
+      const storedCopies = Number(request.payload.copies);
+      const exactCopies = Number.isInteger(storedCopies) && storedCopies >= 1 && storedCopies <= 20 ? storedCopies : 2;
       setPendingSubmission(request);
       localStorage.setItem(`order-draft:${encodeURIComponent(user.id)}:${encodeURIComponent(orderId)}`, JSON.stringify({
         version: 2,
         lines: saveCartLines(cart),
-        pending: { idempotencyKey: request.idempotencyKey, items: exactItems }
+        pending: { idempotencyKey: request.idempotencyKey, items: exactItems, copies: exactCopies }
       }));
-      const result = await idempotentApi<{ order: Order }>(`/api/orders/${orderId}/items`, `items:${orderId}`, { items: exactItems });
+      const result = await idempotentApi<{ order: Order }>(`/api/orders/${orderId}/items`, `items:${orderId}`, { items: exactItems, copies: exactCopies });
       setCurrentOrder(result.order);
       setCart({});
       setPendingSubmission(null);
       localStorage.removeItem(`order-draft:${encodeURIComponent(user.id)}:${encodeURIComponent(orderId)}`);
-      setMessage("已提交，已生成两份备菜单打印任务");
+      setMessage(`已提交，已生成 ${exactCopies} 份备菜单打印任务`);
       await refreshTables();
     } catch (error) {
       setPendingSubmission(getPendingIdempotentRequest(`items:${orderId}`));
@@ -750,7 +790,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
       <aside className="current-order">
         <div className="order-card-heading"><h3>订单总览</h3><span>{order.items.length} 项已提交</span></div>
         <div className="order-lines">{order.items.map((item) => <div className="order-line" key={item.id}><div className="line-main"><strong>{item.name}</strong><span>{money(item.priceFen)} × {item.quantity}</span>{item.note && <small>{formatItemNote(item.note)}</small>}{(item.giftedQuantity > 0 || item.returnedQuantity > 0) && <small className="line-flags">{item.giftedQuantity ? `赠${item.giftedQuantity}` : ""}{item.returnedQuantity ? ` 退${item.returnedQuantity}` : ""}</small>}</div>{open && <div className="line-actions"><button onClick={() => openItemAction(item, "gift")} disabled={!item.availableQuantity || busy || Boolean(pendingSubmission)}>赠送</button><button onClick={() => openItemAction(item, "return")} disabled={!item.availableQuantity || busy || Boolean(pendingSubmission)}>退菜</button></div>}</div>)}</div>
-        {(Object.keys(cart).length > 0 || pendingSubmission) && <div className="cart-box"><div className="order-card-heading"><h3>{pendingSubmission ? "待确认提交" : "待提交"}</h3><span>{money(cartTotal)}</span></div>{Object.values(cart).map((line) => { const note = cartLineNote(line); return <div className="cart-line" key={line.key}><div><strong>{line.dish.name}</strong><small className={note ? "line-note" : "line-note placeholder"}>{note || "点击备注填写口味"}</small></div><button onClick={() => editNote(line.key)} disabled={Boolean(pendingSubmission) || busy}>备注</button><div className="quantity"><button onClick={() => changeCart(line.key, -1)} disabled={Boolean(pendingSubmission) || busy}>−</button><span>{line.quantity}</span><button onClick={() => changeCart(line.key, 1)} disabled={Boolean(pendingSubmission) || busy}>＋</button></div></div>; })}<button className="primary wide" onClick={submitItems} disabled={busy || !open}>{pendingSubmission ? "重试上次提交" : "提交并打印两份"}</button>{pendingSubmission && <small>上次提交结果尚未确认；重试会沿用同一请求编号和菜品内容。</small>}</div>}
+        {(Object.keys(cart).length > 0 || pendingSubmission) && <div className="cart-box"><div className="order-card-heading"><h3>{pendingSubmission ? "待确认提交" : "待提交"}</h3><span>{money(cartTotal)}</span></div>{Object.values(cart).map((line) => { const note = cartLineNote(line); return <div className="cart-line" key={line.key}><div><strong>{line.dish.name}</strong><small className={note ? "line-note" : "line-note placeholder"}>{note || "点击备注填写口味"}</small></div><button onClick={() => editNote(line.key)} disabled={Boolean(pendingSubmission) || busy}>备注</button><div className="quantity"><button onClick={() => changeCart(line.key, -1)} disabled={Boolean(pendingSubmission) || busy}>−</button><span>{line.quantity}</span><button onClick={() => changeCart(line.key, 1)} disabled={Boolean(pendingSubmission) || busy}>＋</button></div></div>; })}<button className="primary wide" onClick={requestItemsSubmit} disabled={busy || !open}>{pendingSubmission ? "重试上次提交" : "提交并打印"}</button>{pendingSubmission && <small>上次提交结果尚未确认；重试会沿用同一请求编号、菜品内容和份数。</small>}</div>}
         <div className="order-total"><span>当前应收</span><strong>{money(displayRevenue)}</strong><small>原价 {money(order.totals.grossFen + cartTotal)} · 赠送 {money(order.totals.giftFen)} · 退菜 {money(order.totals.returnFen)}</small>{user.role === "OWNER" && <div className="order-margin">本单毛利率 <strong>{displayMargin}%</strong></div>}</div>
       </aside>
     </div>
@@ -762,6 +802,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack }: {
     {actionTarget && <ItemActionDialog item={actionTarget.item} action={actionTarget.action} busy={busy} pendingRequest={pendingItemAction?.scope === `item-action:${orderId}:${actionTarget.item.id}:${actionTarget.action}` ? pendingItemAction.request : getPendingIdempotentRequest(`item-action:${orderId}:${actionTarget.item.id}:${actionTarget.action}`)} onClose={() => { setActionTarget(null); setPendingItemAction(null); }} onSubmit={itemAction} />}
     {confirmAction === "reopen" && <ConfirmDialog title="撤销并重新开账" message="原账单、积分冲销和新账单都会保留，是否继续？" confirmText="确认撤销重结" busy={busy} onClose={() => setConfirmAction(null)} onConfirm={() => void reopen()} />}
     {confirmAction === "end" && <ConfirmDialog title="直接结束本单" message="本单将释放桌台，不生成结账或收款记录；订单仍会保留在订单查询中。" confirmText="直接结束" danger busy={busy} onClose={() => setConfirmAction(null)} onConfirm={() => void endWithoutPayment()} />}
+    {kitchenCopiesOpen && <PrintCopiesDialog title="备菜单打印份数（默认 2 份）" defaultCopies={2} onClose={() => setKitchenCopiesOpen(false)} onConfirm={(copies) => void submitItems(copies)} />}
   </section>;
 }
 
@@ -865,6 +906,7 @@ function CheckoutPanel({ order, role, onClose, onDone }: { order: Order; role: U
     : (order.totals.subtotalFen / 100).toFixed(2));
   const [payment, setPayment] = useState(typeof initialPayload?.paymentMethod === "string" ? initialPayload.paymentMethod : "现金");
   const [busy, setBusy] = useState(false);
+  const [copiesOpen, setCopiesOpen] = useState(false);
   const [error, setError] = useState("");
   const manualFen = centsFromYuan(discount);
   const baseDueFen = Math.max(0, order.totals.subtotalFen - manualFen);
@@ -891,14 +933,26 @@ function CheckoutPanel({ order, role, onClose, onDone }: { order: Order; role: U
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (pendingRequest) {
+      const storedCopies = Number(pendingRequest.payload.receiptCopies);
+      await completeCheckout(Number.isInteger(storedCopies) && storedCopies >= 1 && storedCopies <= 20 ? storedCopies : 1);
+      return;
+    }
+    setCopiesOpen(true);
+  }
+
+  async function completeCheckout(copies: number) {
+    setCopiesOpen(false);
     setBusy(true);
     setError("");
     try {
-      const payload = { manualDiscountFen: manualFen, usePoints, receivedFen: centsFromYuan(received), paymentMethod: payment };
+      const payload = { manualDiscountFen: manualFen, usePoints, receivedFen: centsFromYuan(received), paymentMethod: payment, receiptCopies: copies };
       const request = prepareIdempotentRequest(checkoutScope, payload);
+      const storedCopies = Number(request.payload.receiptCopies);
+      const exactCopies = Number.isInteger(storedCopies) && storedCopies >= 1 && storedCopies <= 20 ? storedCopies : 1;
       setPendingRequest(request);
-      const result = await idempotentApi<{ order: Order; settlement: { receivedFen: number; pointsBalance: number } }>(`/api/orders/${order.id}/checkout`, checkoutScope, payload);
-      await onDone(result.order, `结账完成，打印任务已生成，积分余额 ${result.settlement.pointsBalance} 分`);
+      const result = await idempotentApi<{ order: Order; settlement: { receivedFen: number; pointsBalance: number } }>(`/api/orders/${order.id}/checkout`, checkoutScope, { ...payload, receiptCopies: exactCopies });
+      await onDone(result.order, `结账完成，小票已生成 ${exactCopies} 份打印任务，积分余额 ${result.settlement.pointsBalance} 分`);
     } catch (error) {
       setPendingRequest(getPendingIdempotentRequest(checkoutScope));
       setError(errorText(error));
@@ -907,7 +961,24 @@ function CheckoutPanel({ order, role, onClose, onDone }: { order: Order; role: U
     }
   }
 
-  return <Dialog title="确认结账" description={`${order.tableName || `${order.tableNumber || ""}号桌`} · ${order.customer.name}`} onClose={onClose} className="checkout-modal"><form noValidate onSubmit={submit}><div className="checkout-summary"><div><span>菜品原价</span><strong>{money(order.totals.grossFen)}</strong></div><div><span>赠送</span><strong>-{money(order.totals.giftFen)}</strong></div><div><span>退菜</span><strong>-{money(order.totals.returnFen)}</strong></div><div className="emphasis"><span>结账前应收</span><strong>{money(order.totals.subtotalFen)}</strong></div></div><div className="form-grid"><label>人工减免（元）<input type="number" min="0" step="0.01" value={discount} onChange={(event) => setDiscount(event.target.value)} disabled={Boolean(pendingRequest) || busy} /></label><label className="points-choice"><span>积分抵扣</span><span className="checkbox-row"><input type="checkbox" checked={usePoints} disabled={Boolean(pendingRequest) || !order.customer.id || !pointSettings.enabled || order.customer.points <= 0} onChange={(event) => setUsePoints(event.target.checked)} />使用积分</span><small>{!order.customer.id ? "散客不能使用积分" : !pointSettings.enabled ? "积分功能未开启" : `可用 ${order.customer.points} 分，自动抵扣 ${pointsUsed} 分（${money(pointsDiscountFen)}）`}</small></label><label>收款方式<select value={payment} onChange={(event) => setPayment(event.target.value)} disabled={Boolean(pendingRequest) || busy}><option>现金</option><option>微信</option><option>支付宝</option><option>银行卡</option><option>其他</option></select></label><label>实收金额（元）<input type="number" min="0" step="0.01" value={received} onChange={(event) => setReceived(event.target.value)} disabled={Boolean(pendingRequest) || busy} /></label></div>{pendingRequest && <p className="muted">结账结果尚未确认；重试会沿用原金额与收款方式。</p>}{error && <div className="message error">{error}</div>}<div className="payable-banner"><span>本次应收<strong>{money(dueFen)}</strong></span>{role === "OWNER" && <small>预计本单毛利率 {projectedMargin}%</small>}</div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>返回修改</button><button className="primary" disabled={busy}>{busy ? "结账中…" : pendingRequest ? "重试上次结账" : "确认收款并打印小票"}</button></div></form></Dialog>;
+  return <>
+    <Dialog title="确认结账" description={`${order.tableName || `${order.tableNumber || ""}号桌`} · ${order.customer.name}`} onClose={onClose} className="checkout-modal">
+      <form noValidate onSubmit={submit}>
+        <div className="checkout-summary"><div><span>菜品原价</span><strong>{money(order.totals.grossFen)}</strong></div><div><span>赠送</span><strong>-{money(order.totals.giftFen)}</strong></div><div><span>退菜</span><strong>-{money(order.totals.returnFen)}</strong></div><div className="emphasis"><span>结账前应收</span><strong>{money(order.totals.subtotalFen)}</strong></div></div>
+        <div className="form-grid">
+          <label>人工减免（元）<input type="number" min="0" step="0.01" value={discount} onChange={(event) => setDiscount(event.target.value)} disabled={Boolean(pendingRequest) || busy} /></label>
+          <label className="points-choice"><span>积分抵扣</span><span className="checkbox-row"><input type="checkbox" checked={usePoints} disabled={Boolean(pendingRequest) || !order.customer.id || !pointSettings.enabled || order.customer.points <= 0} onChange={(event) => setUsePoints(event.target.checked)} />使用积分</span><small>{!order.customer.id ? "散客不能使用积分" : !pointSettings.enabled ? "积分功能未开启" : `可用 ${order.customer.points} 分，自动抵扣 ${pointsUsed} 分（${money(pointsDiscountFen)}）`}</small></label>
+          <label>收款方式<select value={payment} onChange={(event) => setPayment(event.target.value)} disabled={Boolean(pendingRequest) || busy}><option>现金</option><option>微信</option><option>支付宝</option><option>银行卡</option><option>其他</option></select></label>
+          <label>实收金额（元）<input type="number" min="0" step="0.01" value={received} onChange={(event) => setReceived(event.target.value)} disabled={Boolean(pendingRequest) || busy} /></label>
+        </div>
+        {pendingRequest && <p className="muted">结账结果尚未确认；重试会沿用原金额、收款方式和打印份数。</p>}
+        {error && <div className="message error">{error}</div>}
+        <div className="payable-banner"><span>本次应收<strong>{money(dueFen)}</strong></span>{role === "OWNER" && <small>预计本单毛利率 {projectedMargin}%</small>}</div>
+        <div className="modal-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>返回修改</button><button className="primary" disabled={busy}>{busy ? "结账中…" : pendingRequest ? "重试上次结账" : "确认收款并打印小票"}</button></div>
+      </form>
+    </Dialog>
+    {copiesOpen && <PrintCopiesDialog title="小票打印份数（默认 1 份）" defaultCopies={1} confirmText="确认收款并打印" onClose={() => setCopiesOpen(false)} onConfirm={(copies) => void completeCheckout(copies)} />}
+  </>;
 }
 
 function OrderQueryPage({ openOrder, setMessage }: { openOrder: (orderId: string) => void; setMessage: (message: string) => void }) {
@@ -1170,7 +1241,9 @@ function PrintManagementPage({ setMessage }: { setMessage: (message: string) => 
   const [hasMore, setHasMore] = useState(false);
   const [nextOffset, setNextOffset] = useState(0);
   const [selected, setSelected] = useState<PrintJob | null>(null);
+  const [reprintTarget, setReprintTarget] = useState<PrintJob | null>(null);
   const [busy, setBusy] = useState(false);
+  const [reprintBusy, setReprintBusy] = useState(false);
   const tabs: Array<[string, string]> = [["PENDING", "打印队列"], ["CLAIMED", "打印中"], ["SENT", "已打印"], ["FAILED", "失败"], ["NEEDS_CHECK", "待核对"]];
   async function load(reset = true) {
     setBusy(true);
@@ -1193,21 +1266,43 @@ function PrintManagementPage({ setMessage }: { setMessage: (message: string) => 
   async function dispatch(job: PrintJob) {
     try { await api(`/api/print-jobs/${job.id}/dispatch`, { method: "POST" }); await load(); setMessage("已发送手动打印指令；设备离线时任务会继续保留"); } catch (error) { setMessage(errorText(error)); }
   }
-  async function reprint(job: PrintJob) {
-    try { await api(`/api/print-jobs/${job.id}/reprint`, { method: "POST" }); setStatus("PENDING"); setMessage("已生成补打任务"); } catch (error) { setMessage(errorText(error)); }
+  async function reprint(job: PrintJob, copies: number) {
+    setReprintBusy(true);
+    try {
+      await api(`/api/print-jobs/${job.id}/reprint`, { method: "POST", body: JSON.stringify({ copies }) });
+      setReprintTarget(null);
+      setStatus("PENDING");
+      setMessage(`已生成 ${copies} 份补打任务`);
+    } catch (error) {
+      setMessage(errorText(error));
+    } finally {
+      setReprintBusy(false);
+    }
   }
-  return <section className="page-section"><div className="section-heading"><div><h2>打印管理</h2><p className="muted">可按北京时间日期和桌台查询历史记录；结果不明的任务需人工核对。</p></div><button className="secondary" onClick={() => void load(true)} disabled={busy}>刷新</button></div><div className="print-tabs">{tabs.map(([key, label]) => <button key={key} className={status === key ? "category-chip selected" : "category-chip"} onClick={() => setStatus(key)}>{label}</button>)}</div><div className="filter-bar"><label>开始日期<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>结束日期<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label></div><div className="search-row large"><input placeholder="按桌台名称查找" value={tableQuery} onChange={(event) => setTableQuery(event.target.value)} /><button className="secondary" onClick={() => { setTableQuery(""); setFrom(""); setTo(""); }}>清空条件</button></div><div className="content-card"><table><thead><tr><th>生成时间</th><th>类型</th><th>桌台</th><th>订单号</th><th>份数</th><th>状态</th><th>设备</th><th>操作</th></tr></thead><tbody>{jobs.map((job) => { const payload = job.payload || {}; return <tr key={job.id}><td>{formatTime(job.created_at)}</td><td>{printKindText(job.kind)}{payload.reprintOf ? "（补打）" : ""}</td><td>{String(payload.tableName || (payload.tableNumber ? `${payload.tableNumber}号桌` : "无桌台"))}</td><td className="mono-text">{job.order_id ? job.order_id.slice(0, 8) : "—"}</td><td>{job.copy_no}</td><td><span className={`status-pill ${job.status === "SENT" ? "green" : job.status === "FAILED" || job.status === "NEEDS_CHECK" ? "red" : "gray"}`}>{printStatusText(job.status)}</span></td><td>{job.device_id || "—"}</td><td className="table-actions"><button className="text-button" onClick={() => setSelected(job)}>预览</button>{job.status === "SENT" ? <button className="text-button" onClick={() => void reprint(job)}>重新打印</button> : job.status !== "CLAIMED" ? <button className="text-button" onClick={() => void dispatch(job)}>{job.status === "PENDING" ? "打印" : "重新打印"}</button> : null}</td></tr>; })}</tbody></table>{!jobs.length && <div className="empty">当前没有{tabs.find(([key]) => key === status)?.[1] || "打印"}任务</div>}{hasMore && <div className="filter-actions"><button className="secondary" onClick={() => void load(false)} disabled={busy}>{busy ? "读取中…" : "加载更早记录"}</button></div>}</div>{selected && <PrintPreviewDialog job={selected} onClose={() => setSelected(null)} />}</section>;
+  function requestReprint(job: PrintJob) {
+    if (job.kind === "RETURN") {
+      void reprint(job, 1);
+      return;
+    }
+    setReprintTarget(job);
+  }
+  return <section className="page-section"><div className="section-heading"><div><h2>打印管理</h2><p className="muted">可按北京时间日期和桌台查询历史记录；结果不明的任务需人工核对。</p></div><button className="secondary" onClick={() => void load(true)} disabled={busy}>刷新</button></div><div className="print-tabs">{tabs.map(([key, label]) => <button key={key} className={status === key ? "category-chip selected" : "category-chip"} onClick={() => setStatus(key)}>{label}</button>)}</div><div className="filter-bar"><label>开始日期<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>结束日期<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label></div><div className="search-row large"><input placeholder="按桌台名称查找" value={tableQuery} onChange={(event) => setTableQuery(event.target.value)} /><button className="secondary" onClick={() => { setTableQuery(""); setFrom(""); setTo(""); }}>清空条件</button></div><div className="content-card"><table><thead><tr><th>生成时间</th><th>类型</th><th>桌台</th><th>订单号</th><th>份数</th><th>状态</th><th>设备</th><th>操作</th></tr></thead><tbody>{jobs.map((job) => { const payload = job.payload || {}; return <tr key={job.id}><td>{formatTime(job.created_at)}</td><td>{printKindText(job.kind)}{payload.reprintOf ? "（补打）" : ""}</td><td>{String(payload.tableName || (payload.tableNumber ? `${payload.tableNumber}号桌` : "无桌台"))}</td><td className="mono-text">{job.order_id ? job.order_id.slice(0, 8) : "—"}</td><td>{job.copy_no}</td><td><span className={`status-pill ${job.status === "SENT" ? "green" : job.status === "FAILED" || job.status === "NEEDS_CHECK" ? "red" : "gray"}`}>{printStatusText(job.status)}</span></td><td>{job.device_id || "—"}</td><td className="table-actions"><button className="text-button" onClick={() => setSelected(job)}>预览</button>{job.status === "SENT" ? <button className="text-button" onClick={() => requestReprint(job)}>重新打印</button> : job.status !== "CLAIMED" ? <button className="text-button" onClick={() => void dispatch(job)}>{job.status === "PENDING" ? "打印" : "重新打印"}</button> : null}</td></tr>; })}</tbody></table>{!jobs.length && <div className="empty">当前没有{tabs.find(([key]) => key === status)?.[1] || "打印"}任务</div>}{hasMore && <div className="filter-actions"><button className="secondary" onClick={() => void load(false)} disabled={busy}>{busy ? "读取中…" : "加载更早记录"}</button></div>}</div>{selected && <PrintPreviewDialog job={selected} onClose={() => setSelected(null)} />}{reprintTarget && <PrintCopiesDialog title={`${printKindText(reprintTarget.kind)}补打份数（默认 ${reprintTarget.kind === "KITCHEN" ? 2 : 1} 份）`} defaultCopies={reprintTarget.kind === "KITCHEN" ? 2 : 1} confirmText="确认补打" busy={reprintBusy} onClose={() => setReprintTarget(null)} onConfirm={(copies) => void reprint(reprintTarget, copies)} />}</section>;
 }
 
 function PrintPreviewDialog({ job, onClose }: { job: PrintJob; onClose: () => void }) {
   const payload = job.payload || {};
-  const items = Array.isArray(payload.items) ? payload.items as Array<Record<string, unknown>> : [];
-  const totals = payload.totals && typeof payload.totals === "object" ? payload.totals as Record<string, unknown> : null;
-  const isReceipt = job.kind === "RECEIPT";
-  const hasFooter = Boolean(payload.footer);
-  const orderNote = isReceipt ? "" : String(payload.orderNote || "");
-  const tableName = String(payload.tableName || (payload.tableNumber ? `${payload.tableNumber}号桌` : "无桌台"));
-  return <Dialog title="打印结果预览" description={`${printKindText(job.kind)} · ${printStatusText(job.status)}`} onClose={onClose} className="print-preview-modal"><div className="print-paper">{isReceipt && payload.storeName ? <div className="print-store-name">{String(payload.storeName)}</div> : null}<div className="print-paper-title">{String(payload.title || printKindText(job.kind))}</div><div className="print-table-name">{tableName}</div><div>人数：{String(payload.peopleCount || "—")}　顾客：{String(payload.customer || "散客")}</div>{payload.batchNo ? <div>批次：第 {String(payload.batchNo)} 批</div> : null}{isReceipt ? <><div>开台时间：{formatTime(String(payload.openedAt || ""))}</div><div>结账时间：{formatTime(String(payload.settledAt || payload.createdAt || ""))}</div></> : <div>时间：{formatTime(String(payload.createdAt || job.created_at))}</div>}{orderNote && <div className="print-order-note">本单备注：{orderNote}</div>}<hr />{items.map((item, index) => { const quantity = Number(item.quantity || 0); const priceFen = Number(item.priceFen || 0); const note = formatItemNote(String(item.note || "")); return <div className="print-line" key={`${String(item.name)}-${index}`}><div className="print-line-main"><strong>{String(item.name)}</strong><span>x{quantity}{item.unit ? String(item.unit) : ""}</span></div>{isReceipt && <div className="print-unit-price">单价 {money(priceFen)}　小计 {money(priceFen * quantity)}</div>}{note && <div className="print-item-note">{note}</div>}</div>; })}{totals && <><hr />{isReceipt && <><div>菜品原价：{money(Number(totals.grossFen || 0))}</div>{Number(totals.giftFen || 0) > 0 && <div>赠送：-{money(Number(totals.giftFen))}</div>}{Number(totals.returnFen || 0) > 0 && <div>退菜：-{money(Number(totals.returnFen))}</div>}{Number(totals.manualDiscountFen || 0) > 0 && <div>人工减免：-{money(Number(totals.manualDiscountFen))}</div>}{Number(totals.pointsDiscountFen || 0) > 0 && <div>积分抵扣：-{money(Number(totals.pointsDiscountFen))}</div>}</>}<div>应收：{money(Number(totals.dueFen ?? totals.receivedFen ?? 0))}</div><div className="print-total">实收：{money(Number(totals.receivedFen || 0))}</div>{isReceipt && <>{payload.paymentMethod && <div>收款方式：{String(payload.paymentMethod)}</div>}{Number(payload.redeemedPoints || 0) > 0 && <div>本次抵扣积分：{String(payload.redeemedPoints)} 分</div>}{Number(payload.earnedPoints || 0) > 0 && <div>本次获得积分：{String(payload.earnedPoints)} 分</div>}{payload.pointsBalance !== undefined && <div>剩余积分：{String(payload.pointsBalance)} 分</div>}</>}</>}{hasFooter ? <><hr /><div className="print-footer">{String(payload.footer)}</div></> : null}</div><div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button></div></Dialog>;
+  const lines = Array.isArray(payload.printLines) ? payload.printLines as Array<{ text?: unknown; align?: unknown; size?: unknown }> : [];
+  return <Dialog title="打印结果预览" description={`${printKindText(job.kind)} · ${printStatusText(job.status)}`} onClose={onClose} className="print-preview-modal">
+    <div className="print-paper" aria-label="与安卓打印任务共用的打印版式">
+      {lines.map((line, index) => {
+        const align = line.align === "CENTER" ? "center" : "left";
+        const size = line.size === "LARGE" ? "large" : line.size === "EMPHASIS" ? "emphasis" : "normal";
+        return <div key={index} className={`print-preview-line print-align-${align} print-size-${size}`}>{line.text ? String(line.text) : "\u00a0"}</div>;
+      })}
+      {!lines.length && <div className="message">此打印任务尚未包含统一版式数据，请刷新预览。</div>}
+    </div>
+    <div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button></div>
+  </Dialog>;
 }
 
 function StatsPage({ setMessage }: { setMessage: (message: string) => void }) {

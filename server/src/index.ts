@@ -537,10 +537,11 @@ async function makePrintJobs(
   copies = 2
 ): Promise<void> {
   for (let copyNo = 1; copyNo <= copies; copyNo += 1) {
+    const printPayload = preparePrintPayload(kind, { ...(payload as object), copyNo } as Record<string, unknown>);
     await client.query(
       `INSERT INTO print_jobs (order_id, batch_id, kind, copy_no, payload)
        VALUES ($1, $2, $3, $4, $5::jsonb)`,
-      [orderId, batchId, kind, copyNo, JSON.stringify({ ...(payload as object), copyNo })]
+      [orderId, batchId, kind, copyNo, JSON.stringify(printPayload)]
     );
   }
 }
@@ -591,7 +592,7 @@ function printOrderPayload(order: Record<string, unknown>, items: Array<Record<s
       tableNameSize: "LARGE",
       dishNameSize: "LARGE",
       quantityInline: true,
-      showItemPrice: title === "结账小票"
+      showItemPrice: false
     },
     items: items.map((item) => ({
       name: item.name,
@@ -601,6 +602,153 @@ function printOrderPayload(order: Record<string, unknown>, items: Array<Record<s
       note: item.note || ""
     }))
   };
+}
+
+function normalizeReprintTitle(value: unknown): string {
+  const title = typeof value === "string" ? value.trim() : "";
+  const base = title.replace(/(?:\s*[（(]补打[）)])+\s*$/u, "").trim() || "打印任务";
+  return `${base}（补打）`;
+}
+
+type PrinterLine = { text: string; align: "LEFT" | "CENTER"; size: "NORMAL" | "LARGE" | "EMPHASIS" };
+
+function printerDisplayWidth(value: string): number {
+  return Array.from(value).reduce((width, character) => width + (character.codePointAt(0)! <= 0x7f ? 1 : 2), 0);
+}
+
+function wrapPrinterText(value: string, maxWidth: number): string[] {
+  if (!value) return [];
+  const lines: string[] = [];
+  let line = "";
+  let lineWidth = 0;
+  for (const character of value) {
+    const characterWidth = character.codePointAt(0)! <= 0x7f ? 1 : 2;
+    if (lineWidth > 0 && lineWidth + characterWidth > maxWidth) {
+      lines.push(line);
+      line = "";
+      lineWidth = 0;
+    }
+    line += character;
+    lineWidth += characterWidth;
+  }
+  lines.push(line);
+  return lines;
+}
+
+function printerTime(value: unknown): string {
+  if (typeof value !== "string" || !value || value === "null") return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((entry) => entry.type === type)?.value || "00";
+  return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
+}
+
+function printerMoney(value: unknown): string {
+  const fen = Number(value || 0);
+  return `￥${(Number.isFinite(fen) ? fen / 100 : 0).toFixed(2)}`;
+}
+
+function printerItemNote(value: unknown): string {
+  const parts = String(value || "").split(/[；;]/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 1) parts[0] = parts[0].replace(/^备注[：:]\s*/, "");
+  return parts.filter(Boolean).join("，");
+}
+
+function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Record<string, unknown>): PrinterLine[] {
+  const receipt = kind === "RECEIPT";
+  const lines: PrinterLine[] = [];
+  const push = (
+    value: string,
+    align: PrinterLine["align"] = "LEFT",
+    size: PrinterLine["size"] = "NORMAL",
+    maxWidth = size === "NORMAL" ? 42 : 21
+  ) => {
+    const wrapped = value ? wrapPrinterText(value, maxWidth) : [""];
+    for (const text of wrapped) lines.push({ text, align, size });
+  };
+  const stringValue = (value: unknown, fallback = "") => value === null || value === undefined ? fallback : String(value);
+  const tableName = stringValue(payload.tableName) || (Number(payload.tableNumber) > 0 ? `${Number(payload.tableNumber)}号桌` : "无桌台");
+  const large = "LARGE" as const;
+  const normal = "NORMAL" as const;
+  const center = "CENTER" as const;
+
+  const storeName = receipt ? stringValue(payload.storeName).trim() : "";
+  if (storeName) {
+    push(storeName, center, large);
+    push("");
+  }
+  push(stringValue(payload.title, receipt ? "结账小票" : kind === "RETURN" ? "退菜单" : "备菜单"), center, large);
+  push("");
+  push(tableName, center, large);
+  push(`人数：${Number(payload.peopleCount) || 0}    顾客：${stringValue(payload.customer, "散客")}`);
+  if (payload.batchNo !== undefined && payload.batchNo !== null) push(`批次：第 ${Number(payload.batchNo) || 0} 批`);
+  if (receipt) {
+    push(`开台时间：${printerTime(payload.openedAt)}`);
+    push(`结账时间：${printerTime(payload.settledAt || payload.createdAt)}`);
+  } else {
+    push(`时间：${printerTime(payload.createdAt)}`);
+  }
+  const orderNote = stringValue(payload.orderNote);
+  if (!receipt && orderNote) push(`本单备注：${orderNote}`);
+  push("------------------------------------------");
+
+  const items = Array.isArray(payload.items) ? payload.items as Array<Record<string, unknown>> : [];
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+    const item = items[itemIndex];
+    const name = stringValue(item.name) || "菜品";
+    const quantity = Number(item.quantity) || 0;
+    const unit = stringValue(item.unit, "份");
+    const quantityLabel = `x${quantity}${unit}`;
+    const note = receipt ? "" : printerItemNote(item.note);
+    const sameLargeLine = printerDisplayWidth(name) + 1 + printerDisplayWidth(quantityLabel) <= 21;
+    if (sameLargeLine) {
+      const gap = Math.max(1, 21 - printerDisplayWidth(name) - printerDisplayWidth(quantityLabel));
+      push(`${name}${" ".repeat(gap)}${quantityLabel}`, "LEFT", large);
+    } else {
+      for (const nameLine of wrapPrinterText(name, 21)) push(nameLine, "LEFT", large);
+      const quantityWidth = printerDisplayWidth(quantityLabel);
+      push(`${" ".repeat(Math.max(0, 21 - quantityWidth))}${quantityLabel}`, "LEFT", large, 21);
+    }
+    if (!receipt && note) {
+      for (const noteLine of wrapPrinterText(`  ${note}`, 42)) push(noteLine);
+      if (itemIndex < items.length - 1) push("");
+    }
+  }
+
+  if (receipt) {
+    const totals = payload.totals && typeof payload.totals === "object" ? payload.totals as Record<string, unknown> : {};
+    push("------------------------------------------");
+    push(`应收：${printerMoney(totals.dueFen ?? totals.receivedFen)}`);
+    push(`实收：${printerMoney(totals.receivedFen)}`);
+    if (Number(payload.redeemedPoints) > 0) push(`本次抵扣积分：${Number(payload.redeemedPoints)} 分`);
+    if (Number(payload.earnedPoints) > 0) push(`本次获得积分：${Number(payload.earnedPoints)} 分`);
+  }
+  const footer = stringValue(payload.footer);
+  if (footer) {
+    push("------------------------------------------");
+    push(footer, center);
+  }
+  push("");
+  push("");
+  push("");
+  return lines;
+}
+
+function preparePrintPayload(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Record<string, unknown>): Record<string, unknown> {
+  const normalized = payload.reprintOf
+    ? { ...payload, title: normalizeReprintTitle(payload.title) }
+    : { ...payload };
+  return { ...normalized, printLines: buildPrinterLines(kind, normalized) };
 }
 
 const loginSchema = z.object({ username: z.string().trim().min(1).max(120), password: z.string().min(1).max(200) });
@@ -1112,6 +1260,9 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
     const orderId = routeParam(req, "orderId");
     const requestKey = requiredIdempotencyKey(req.body?.idempotencyKey);
     const requestPayload = idempotencyPayload(req.body);
+    const printCopies = requestPayload.copies === undefined
+      ? 2
+      : requirePositiveInteger(requestPayload.copies, "备菜单打印份数必须在1到20份之间", 20);
     const rawItems = Array.isArray(requestPayload.items) ? requestPayload.items : [];
     if (!rawItems.length) fail("请选择至少一道菜品");
     const response = await withTransaction(async (client) => {
@@ -1163,7 +1314,7 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
         batch.rows[0].id,
         "KITCHEN",
         { ...printOrderPayload(details, inserted, "备菜单"), batchNo: batch.rows[0].batch_no },
-        2
+        printCopies
       );
       await logOperation(client, user.id, "ADD_ITEMS", "ORDER", orderId, { batchNo: batch.rows[0].batch_no, items: inserted });
       await saveIdempotent(client, `items:${orderId}`, requestKey, user.id, details, requestPayload);
@@ -1293,6 +1444,9 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
     const orderId = routeParam(req, "orderId");
     const requestKey = requiredIdempotencyKey(req.body?.idempotencyKey);
     const requestPayload = idempotencyPayload(req.body);
+    const receiptCopies = requestPayload.receiptCopies === undefined
+      ? 1
+      : requirePositiveInteger(requestPayload.receiptCopies, "小票打印份数必须在1到20份之间", 20);
     const response = await withTransaction(async (client) => {
       const previous = await readIdempotent(client, `checkout:${orderId}`, requestKey, user.id, requestPayload, user.role === "OWNER");
       if (previous) return previous;
@@ -1407,7 +1561,7 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
         pointsBalance: newBalance,
         footer: text(settings.receipt_footer, "谢谢光临")
       };
-      await makePrintJobs(client, orderId, null, "RECEIPT", receiptPayload, 1);
+      await makePrintJobs(client, orderId, null, "RECEIPT", receiptPayload, receiptCopies);
       await logOperation(client, user.id, "CHECKOUT", "ORDER", orderId, {
         settlementId: settlement.rows[0].id,
         receivedFen,
@@ -2271,7 +2425,10 @@ app.get("/api/print-jobs", requireAuth, async (req, res) => {
       params
     );
     const hasMore = result.rows.length > limit;
-    const jobs = result.rows.slice(0, limit);
+    const jobs = result.rows.slice(0, limit).map((job) => ({
+      ...job,
+      payload: preparePrintPayload(job.kind, job.payload)
+    }));
     res.json({ jobs, hasMore, nextOffset: offset + jobs.length });
   } catch (error) {
     publicError(res, error);
@@ -2430,7 +2587,11 @@ app.post("/api/print-jobs/claim", requirePrinterDevice, async (req, res) => {
       );
       return updated.rows[0];
     });
-    res.json({ job: result });
+    const job = result ? {
+      ...result,
+      payload: preparePrintPayload(result.kind, result.payload)
+    } : null;
+    res.json({ job });
   } catch (error) {
     publicError(res, error);
   }
@@ -2508,6 +2669,9 @@ app.post("/api/print-jobs/:jobId/reprint", requireAuth, async (req: Authenticate
   try {
     const user = currentUser(req);
     const jobId = routeParam(req, "jobId");
+    const copies = req.body?.copies === undefined
+      ? 1
+      : requirePositiveInteger(req.body.copies, "补打份数必须在1到20份之间", 20);
     const result = await withTransaction(async (client) => {
       const originalResult = await client.query<{
         id: string;
@@ -2525,20 +2689,24 @@ app.post("/api/print-jobs/:jobId/reprint", requireAuth, async (req: Authenticate
       const original = originalResult.rows[0];
       if (!original) fail("打印任务不存在", 404);
       if (!["SENT", "FAILED", "NEEDS_CHECK"].includes(original.status)) fail("当前打印任务还不能补打");
-      const payload = {
+      const basePayload = {
         ...original.payload,
-        title: `${text(original.payload?.title) || "打印任务"}（补打）`,
+        title: normalizeReprintTitle(original.payload?.title),
         reprintOf: original.id,
-        createdAt: new Date().toISOString(),
-        copyNo: original.copy_no
+        createdAt: new Date().toISOString()
       };
-      const inserted = await client.query<{ id: string }>(
-        `INSERT INTO print_jobs (order_id, batch_id, kind, copy_no, payload, manual_requested_at)
-         VALUES ($1, $2, $3, $4, $5::jsonb, now()) RETURNING id`,
-        [original.order_id, original.batch_id, original.kind, original.copy_no, JSON.stringify(payload)]
-      );
-      await logOperation(client, user.id, "REPRINT_JOB", "PRINT_JOB", inserted.rows[0].id, { originalJobId: original.id });
-      return { jobId: inserted.rows[0].id };
+      const jobIds: string[] = [];
+      for (let copyNo = 1; copyNo <= copies; copyNo += 1) {
+        const payload = preparePrintPayload(original.kind, { ...basePayload, copyNo });
+        const inserted = await client.query<{ id: string }>(
+          `INSERT INTO print_jobs (order_id, batch_id, kind, copy_no, payload, manual_requested_at)
+           VALUES ($1, $2, $3, $4, $5::jsonb, now()) RETURNING id`,
+          [original.order_id, original.batch_id, original.kind, copyNo, JSON.stringify(payload)]
+        );
+        jobIds.push(inserted.rows[0].id);
+      }
+      await logOperation(client, user.id, "REPRINT_JOB", "PRINT_JOB", jobIds[0], { originalJobId: original.id, copies });
+      return { jobId: jobIds[0], jobIds, copies };
     });
     res.status(201).json(result);
   } catch (error) {
