@@ -1,6 +1,6 @@
 {
   "name": "order-dinner",
-  "version": "1.0.0",
+  "version": "1.0.10",
   "private": true,
   "description": "餐厅员工点单系统",
   "type": "module",
@@ -16,6 +16,7 @@
     "test": "npm run build && node --test test/*.test.mjs",
     "package:win": "npm run build:web && electron-builder --win nsis --x64",
     "package:android": "bash scripts/package-android.sh",
+    "publish:updates": "node scripts/publish-updates.mjs",
     "package:all": "npm run package:win && npm run package:android"
   },
   "dependencies": {
@@ -53,7 +54,7 @@
     "appId": "com.orderdinner.pos",
     "productName": "餐厅点单台",
     "directories": {
-      "output": "release/desktop"
+      "output": "release/desktop/${version}"
     },
     "files": [
       "desktop/**/*",
@@ -67,7 +68,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },

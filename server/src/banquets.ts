@@ -1,0 +1,781 @@
+import express, { type Request, type Response } from "express";
+import crypto from "node:crypto";
+import { pool, withReadOnlySnapshot, withTransaction, type DbClient } from "./db.js";
+import { requireAuth } from "./auth.js";
+import type { AuthenticatedRequest } from "./types.js";
+import { normalizeCustomerPhone, requirePositiveInteger } from "./domain.js";
+import { publicError } from "./utils.js";
+
+type BanquetState = "RESERVED" | "CANCELLED" | "CONVERTED";
+type Reservation = {
+  id: string;
+  hall_id: string | null;
+  hall_name: string | null;
+  table_id: string | null;
+  table_name: string;
+  table_number: number | null;
+  table_seats: number | null;
+  starts_at: string;
+  ends_at: string;
+  customer_name: string;
+  customer_phone: string | null;
+  people_count: number;
+  points_earning_enabled: boolean;
+  status: BanquetState;
+  preorder: Array<Record<string, unknown>>;
+  order_id: string | null;
+  note: string;
+  created_by: string;
+  created_at: string;
+  deposit_balance_fen: number;
+};
+
+function reject(message: string, status = 400): never {
+  const error = new Error(message) as Error & { status: number };
+  error.status = status;
+  throw error;
+}
+
+function text(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value.trim() : fallback;
+}
+
+function userOf(req: AuthenticatedRequest) {
+  if (!req.user) reject("请先登录", 401);
+  return req.user;
+}
+
+function routeId(req: Request, name: string): string {
+  return text(req.params[name]);
+}
+
+function positiveInt(value: unknown, label: string, max = 100_000): number {
+  return requirePositiveInteger(value, `${label}必须是大于零的整数`, max);
+}
+
+function nonNegativeInt(value: unknown, label: string, max = 1_000_000_000): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > max) reject(`${label}格式不正确`);
+  return parsed;
+}
+
+function validDate(value: unknown, label: string): string {
+  if (typeof value !== "string" || !value.trim()) reject(`${label}不正确`);
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) reject(`${label}不正确`);
+  return parsed.toISOString();
+}
+
+function payloadWithoutKey(body: unknown): Record<string, unknown> {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+  const { idempotencyKey: _key, ...payload } = body as Record<string, unknown>;
+  return payload;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function payloadHash(value: unknown): string {
+  return crypto.createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+function requestKey(body: unknown): string {
+  const key = text((body as { idempotencyKey?: unknown } | null)?.idempotencyKey);
+  if (!key || key.length > 200) reject("请求编号缺失，请刷新后重试");
+  return key;
+}
+
+async function idempotent<T>(
+  client: DbClient,
+  scope: string,
+  key: string,
+  employeeId: string,
+  payload: unknown,
+  work: () => Promise<T>
+): Promise<T> {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`banquet:${scope}:${key}`]);
+  const previous = await client.query<{ response: T; employee_id: string | null; payload_hash: string | null }>(
+    `SELECT response, employee_id, payload_hash FROM idempotency_keys WHERE scope = $1 AND request_key = $2`,
+    [`banquet:${scope}`, key]
+  );
+  const row = previous.rows[0];
+  if (row) {
+    if (row.employee_id && row.employee_id !== employeeId) reject("请求编号已被其他账号使用", 409);
+    if (row.payload_hash && row.payload_hash !== payloadHash(payload)) reject("上次请求尚未确认且内容已变化，请刷新后核对宴席状态", 409);
+    return row.response;
+  }
+  const result = await work();
+  await client.query(
+    `INSERT INTO idempotency_keys (scope, request_key, employee_id, response, payload_hash)
+     VALUES ($1, $2, $3, $4::jsonb, $5)`,
+    [`banquet:${scope}`, key, employeeId, JSON.stringify(result), payloadHash(payload)]
+  );
+  return result;
+}
+
+async function logOperation(client: DbClient, employeeId: string, action: string, entityId: string, detail: unknown = {}): Promise<void> {
+  await client.query(
+    `INSERT INTO operation_logs (employee_id, action, entity_type, entity_id, detail)
+     VALUES ($1, $2, 'BANQUET', $3, $4::jsonb)`,
+    [employeeId, action, entityId, JSON.stringify(detail)]
+  );
+}
+
+async function depositBalance(client: DbClient, reservationId: string, lock = false): Promise<number> {
+  if (lock) await client.query(`SELECT id FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]);
+  const result = await client.query<{ balance: string | number }>(
+    `SELECT COALESCE(SUM(CASE kind
+       WHEN 'RECEIVE' THEN amount_fen
+       WHEN 'RESTORE' THEN amount_fen
+       WHEN 'REFUND' THEN -amount_fen
+       WHEN 'APPLY' THEN -amount_fen
+       ELSE 0 END), 0)::bigint AS balance
+     FROM banquet_deposit_ledger WHERE reservation_id = $1`,
+    [reservationId]
+  );
+  return Math.max(0, Number(result.rows[0]?.balance || 0));
+}
+
+async function reservationDetails(client: DbClient, reservationId: string): Promise<Record<string, unknown>> {
+  const result = await client.query<Reservation>(
+    `SELECT r.*, h.name AS hall_name,
+            COALESCE(t.name, h.name, '未指定桌台') AS table_name,
+            t.number AS table_number, t.seats AS table_seats,
+            COALESCE(d.balance, 0)::bigint AS deposit_balance_fen
+     FROM banquet_reservations r
+     LEFT JOIN banquet_halls h ON h.id = r.hall_id
+     LEFT JOIN restaurant_tables t ON t.id = r.table_id
+     LEFT JOIN LATERAL (
+       SELECT SUM(CASE kind WHEN 'RECEIVE' THEN amount_fen WHEN 'RESTORE' THEN amount_fen
+                            WHEN 'REFUND' THEN -amount_fen WHEN 'APPLY' THEN -amount_fen ELSE 0 END) AS balance
+       FROM banquet_deposit_ledger WHERE reservation_id = r.id
+     ) d ON true
+     WHERE r.id = $1`,
+    [reservationId]
+  );
+  const row = result.rows[0];
+  if (!row) reject("宴席预定不存在", 404);
+  const ledger = await client.query(
+    `SELECT id, kind, amount_fen, payment_method, settlement_id, note, created_at
+     FROM banquet_deposit_ledger WHERE reservation_id = $1 ORDER BY created_at DESC, id DESC`,
+    [reservationId]
+  );
+  return { ...row, deposit_balance_fen: Number(row.deposit_balance_fen || 0), deposit_ledger: ledger.rows };
+}
+
+async function findOrCreateCustomer(client: DbClient, phone: string, name: string | null): Promise<string> {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`customer-phone:${phone}`]);
+  const digits = `regexp_replace(phone, '[^0-9]', '', 'g')`;
+  const matches = await client.query<{ id: string }>(
+    `SELECT id FROM customers
+     WHERE CASE
+       WHEN ${digits} LIKE '0086%' THEN substring(${digits} FROM 5)
+       WHEN length(${digits}) = 13 AND ${digits} LIKE '86%' THEN substring(${digits} FROM 3)
+       ELSE ${digits}
+     END = $1 FOR UPDATE`,
+    [phone]
+  );
+  if (matches.rows.length > 1) reject("该手机号存在多条旧顾客档案，请先核对后再开宴席", 409);
+  if (matches.rows[0]) {
+    const updated = await client.query<{ id: string }>(
+      `UPDATE customers SET phone = $1, name = COALESCE($2, name), updated_at = now() WHERE id = $3 RETURNING id`,
+      [phone, name, matches.rows[0].id]
+    );
+    return updated.rows[0].id;
+  }
+  const inserted = await client.query<{ id: string }>(
+    `INSERT INTO customers (phone, name) VALUES ($1, $2) RETURNING id`, [phone, name]
+  );
+  return inserted.rows[0].id;
+}
+
+type OptionGroup = { id: string; name: string; required: boolean; allow_multiple: boolean; options: Array<{ id: string; label: string }> };
+
+async function snapshotOptions(client: DbClient, dishId: string, rawSelections: unknown, customNote: unknown) {
+  const groupsResult = await client.query<OptionGroup>(
+    `SELECT g.id, g.name, g.required, g.allow_multiple,
+            COALESCE((SELECT json_agg(json_build_object('id', o.id, 'label', o.label) ORDER BY o.sort_order, o.id)
+                      FROM dish_options o WHERE o.group_id = g.id AND o.active = true), '[]'::json) AS options
+     FROM dish_option_groups g WHERE g.dish_id = $1 AND g.active = true ORDER BY g.sort_order, g.name, g.id`,
+    [dishId]
+  );
+  const requested = Array.isArray(rawSelections) ? rawSelections : [];
+  const snapshot: Array<Record<string, unknown>> = [];
+  const noteParts: string[] = [];
+  for (const group of groupsResult.rows) {
+    const row = requested.find((value) => text((value as { groupId?: unknown })?.groupId) === group.id) as { optionIds?: unknown } | undefined;
+    const optionIds = Array.from(new Set(Array.isArray(row?.optionIds) ? row.optionIds.map((id) => text(id)).filter(Boolean) : []));
+    if (group.required && !optionIds.length) reject(`请选择${group.name}`);
+    if (!group.allow_multiple && optionIds.length > 1) reject(`${group.name}只能选择一项`);
+    const selected = optionIds.map((id) => group.options.find((option) => option.id === id)).filter(Boolean) as Array<{ id: string; label: string }>;
+    if (selected.length !== optionIds.length) reject(`${group.name}包含无效选项`);
+    if (selected.length) {
+      noteParts.push(`${group.name}：${selected.map((option) => option.label).join("、")}`);
+      snapshot.push({ groupId: group.id, groupName: group.name, optionIds, labels: selected.map((option) => option.label) });
+    }
+  }
+  const note = text(customNote).slice(0, 300);
+  if (note) noteParts.push(snapshot.length ? `备注：${note}` : note);
+  return { note: noteParts.join("，").slice(0, 500), snapshot };
+}
+
+type BanquetPrintLine = { text: string; align: "LEFT" | "CENTER"; size: "NORMAL" | "LARGE" | "EMPHASIS" };
+
+function banquetKitchenPrintLines(payload: Record<string, unknown>): BanquetPrintLine[] {
+  const lines: BanquetPrintLine[] = [];
+  const width = (value: string) => Array.from(value).reduce((sum, character) => sum + (character.codePointAt(0)! <= 0x7f ? 1 : 2), 0);
+  const wrap = (value: string, maxWidth: number) => {
+    const result: string[] = [];
+    let line = "";
+    let lineWidth = 0;
+    for (const character of value) {
+      const nextWidth = character.codePointAt(0)! <= 0x7f ? 1 : 2;
+      if (line && lineWidth + nextWidth > maxWidth) {
+        result.push(line);
+        line = "";
+        lineWidth = 0;
+      }
+      line += character;
+      lineWidth += nextWidth;
+    }
+    if (line) result.push(line);
+    return result;
+  };
+  const push = (text: string, align: BanquetPrintLine["align"] = "LEFT", size: BanquetPrintLine["size"] = "NORMAL") => {
+    lines.push({ text, align, size });
+  };
+  const title = `${typeof payload.tableName === "string" ? payload.tableName : "宴席"}~备菜单`;
+  push(title, "CENTER", "LARGE");
+  push(`人数：${Number(payload.peopleCount) || 0}    顾客：${String(payload.customer || "宴席客人")}`);
+  const createdAt = new Date(String(payload.createdAt || ""));
+  const time = Number.isNaN(createdAt.getTime()) ? "—" : createdAt.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+  push(`时间：${time}`);
+  if (payload.orderNote) push(`本单备注：${String(payload.orderNote)}`);
+  push("------------------------------------------");
+
+  const items = Array.isArray(payload.items) ? payload.items as Array<Record<string, unknown>> : [];
+  for (const [index, item] of items.entries()) {
+    const name = String(item.name || "菜品");
+    const quantityLabel = `x${Number(item.quantity) || 0}${String(item.unit || "份")}`;
+    if (width(name) + width(quantityLabel) + 1 <= 42) {
+      push(`${name}${" ".repeat(Math.max(1, 42 - width(name) - width(quantityLabel)))}${quantityLabel}`, "LEFT", "EMPHASIS");
+    } else {
+      for (const nameLine of wrap(name, 42)) push(nameLine, "LEFT", "EMPHASIS");
+      push(`${" ".repeat(Math.max(0, 42 - width(quantityLabel)))}${quantityLabel}`, "LEFT", "EMPHASIS");
+    }
+    const note = String(item.note || "").trim();
+    if (note) for (const noteLine of wrap(`  ${note}`, 42)) push(noteLine);
+    if (note && index < items.length - 1) push("");
+  }
+  push("");
+  push("");
+  push("");
+  return lines;
+}
+
+/** Create the banquet tables after the base POS schema has been migrated. Safe to run on every start. */
+export async function runBanquetMigrations(db: DbClient = pool): Promise<void> {
+  await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_earning_enabled boolean NOT NULL DEFAULT true`);
+  await db.query(`ALTER TABLE settlements ADD COLUMN IF NOT EXISTS deposit_applied_fen integer NOT NULL DEFAULT 0 CHECK (deposit_applied_fen >= 0)`);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS banquet_halls (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      name text NOT NULL UNIQUE,
+      seats integer NOT NULL DEFAULT 1 CHECK (seats > 0),
+      active boolean NOT NULL DEFAULT true,
+      sort_order integer NOT NULL DEFAULT 0,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS banquet_reservations (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      hall_id uuid NOT NULL REFERENCES banquet_halls(id),
+      starts_at timestamptz NOT NULL,
+      ends_at timestamptz NOT NULL,
+      customer_name text NOT NULL DEFAULT '',
+      customer_phone text,
+      people_count integer NOT NULL CHECK (people_count > 0),
+      points_earning_enabled boolean NOT NULL DEFAULT true,
+      status text NOT NULL DEFAULT 'RESERVED' CHECK (status IN ('RESERVED', 'CANCELLED', 'CONVERTED')),
+      preorder jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(preorder) = 'array'),
+      order_id uuid UNIQUE REFERENCES orders(id),
+      note text NOT NULL DEFAULT '',
+      created_by uuid REFERENCES employees(id),
+      updated_by uuid REFERENCES employees(id),
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      CHECK (ends_at > starts_at)
+    )`);
+  // Older releases used banquet_halls. New reservations bind to an existing POS table.
+  // Keep the old column nullable so historical reservations can still be read and settled.
+  await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS table_id uuid REFERENCES restaurant_tables(id)`);
+  await db.query(`ALTER TABLE banquet_reservations ALTER COLUMN hall_id DROP NOT NULL`);
+  await db.query(`CREATE INDEX IF NOT EXISTS banquet_reservations_hall_time_idx ON banquet_reservations (hall_id, starts_at, ends_at) WHERE status = 'RESERVED'`);
+  await db.query(`CREATE INDEX IF NOT EXISTS banquet_reservations_table_time_idx ON banquet_reservations (table_id, starts_at, ends_at) WHERE status = 'RESERVED'`);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS banquet_deposit_ledger (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      reservation_id uuid NOT NULL REFERENCES banquet_reservations(id),
+      settlement_id uuid REFERENCES settlements(id),
+      kind text NOT NULL CHECK (kind IN ('RECEIVE', 'REFUND', 'APPLY', 'RESTORE')),
+      amount_fen integer NOT NULL CHECK (amount_fen > 0),
+      payment_method text NOT NULL DEFAULT '现金',
+      request_key text,
+      reverses_ledger_id uuid REFERENCES banquet_deposit_ledger(id),
+      operator_id uuid REFERENCES employees(id),
+      note text NOT NULL DEFAULT '',
+      created_at timestamptz NOT NULL DEFAULT now(),
+      CHECK ((kind IN ('APPLY', 'RESTORE') AND settlement_id IS NOT NULL) OR kind IN ('RECEIVE', 'REFUND'))
+    )`);
+  await db.query(`ALTER TABLE banquet_deposit_ledger ADD COLUMN IF NOT EXISTS payment_method text NOT NULL DEFAULT '现金'`);
+  await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS banquet_deposit_apply_settlement_idx ON banquet_deposit_ledger (settlement_id) WHERE kind = 'APPLY'`);
+  await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS banquet_deposit_restore_source_idx ON banquet_deposit_ledger (reverses_ledger_id) WHERE kind = 'RESTORE'`);
+  await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS banquet_deposit_request_key_idx ON banquet_deposit_ledger (reservation_id, request_key) WHERE request_key IS NOT NULL`);
+  await db.query(`CREATE INDEX IF NOT EXISTS banquet_deposit_reservation_idx ON banquet_deposit_ledger (reservation_id, created_at DESC)`);
+}
+
+export const banquetRouter = express.Router();
+banquetRouter.use(requireAuth);
+
+banquetRouter.get("/halls", async (_req, res) => {
+  try {
+    const result = await pool.query(`SELECT id, name, seats, active, sort_order FROM banquet_halls ORDER BY sort_order, name, id`);
+    res.json({ halls: result.rows });
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.post("/halls", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    if (user.role !== "OWNER") reject("只有老板可以管理宴会厅", 403);
+    const name = text(req.body?.name).slice(0, 100);
+    if (!name) reject("请填写厅名");
+    const seats = req.body?.seats === undefined ? 1 : positiveInt(req.body.seats, "座位数", 10_000);
+    const hallId = await withTransaction(async (client) => {
+      const result = await client.query<{ id: string }>(
+        `INSERT INTO banquet_halls (name, seats, sort_order) VALUES ($1, $2, COALESCE((SELECT max(sort_order) + 1 FROM banquet_halls), 0)) RETURNING id`,
+        [name, seats]
+      );
+      await logOperation(client, user.id, "CREATE_BANQUET_HALL", result.rows[0].id, { name, seats });
+      return result.rows[0].id;
+    });
+    res.status(201).json({ hallId });
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.patch("/halls/:hallId", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    if (user.role !== "OWNER") reject("只有老板可以管理宴会厅", 403);
+    const hallId = routeId(req, "hallId");
+    const updates: string[] = [];
+    const values: unknown[] = [];
+    const add = (sql: string, value: unknown) => { values.push(value); updates.push(`${sql} = $${values.length}`); };
+    if (req.body?.name !== undefined) {
+      const name = text(req.body.name).slice(0, 100);
+      if (!name) reject("请填写厅名");
+      add("name", name);
+    }
+    if (req.body?.seats !== undefined) add("seats", positiveInt(req.body.seats, "座位数", 10_000));
+    if (req.body?.active !== undefined) {
+      if (typeof req.body.active !== "boolean") reject("启用状态不正确");
+      add("active", req.body.active);
+    }
+    if (!updates.length) reject("没有需要保存的内容");
+    await withTransaction(async (client) => {
+      values.push(hallId);
+      const result = await client.query(`UPDATE banquet_halls SET ${updates.join(", ")}, updated_at = now() WHERE id = $${values.length} RETURNING id` , values);
+      if (!result.rows[0]) reject("宴会厅不存在", 404);
+      await logOperation(client, user.id, "UPDATE_BANQUET_HALL", hallId, req.body);
+    });
+    res.json({ ok: true });
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.get("/reservations", async (req, res) => {
+  try {
+    const values: unknown[] = [];
+    const conditions: string[] = [];
+    if (text(req.query.from)) { values.push(validDate(req.query.from, "开始时间")); conditions.push(`r.starts_at >= $${values.length}::timestamptz`); }
+    if (text(req.query.to)) { values.push(validDate(req.query.to, "结束时间")); conditions.push(`r.starts_at < $${values.length}::timestamptz`); }
+    if (["RESERVED", "CANCELLED", "CONVERTED"].includes(text(req.query.status))) { values.push(text(req.query.status)); conditions.push(`r.status = $${values.length}`); }
+    const result = await pool.query(
+      `SELECT r.id, r.hall_id, h.name AS hall_name, r.table_id,
+              COALESCE(t.name, h.name, '未指定桌台') AS table_name,
+              t.number AS table_number, t.seats AS table_seats,
+              r.starts_at, r.ends_at, r.customer_name, r.customer_phone,
+              r.people_count, r.points_earning_enabled, r.status, r.preorder, r.order_id, r.note,
+              COALESCE(d.balance, 0)::bigint AS deposit_balance_fen
+       FROM banquet_reservations r
+       LEFT JOIN banquet_halls h ON h.id = r.hall_id
+       LEFT JOIN restaurant_tables t ON t.id = r.table_id
+       LEFT JOIN LATERAL (
+         SELECT SUM(CASE kind WHEN 'RECEIVE' THEN amount_fen WHEN 'RESTORE' THEN amount_fen
+                              WHEN 'REFUND' THEN -amount_fen WHEN 'APPLY' THEN -amount_fen ELSE 0 END) AS balance
+         FROM banquet_deposit_ledger WHERE reservation_id = r.id
+       ) d ON true
+       ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+       ORDER BY r.starts_at DESC, COALESCE(t.number, 0), COALESCE(t.name, h.name) LIMIT 500`, values
+    );
+    res.json({ reservations: result.rows.map((row) => ({ ...row, deposit_balance_fen: Number(row.deposit_balance_fen || 0) })) });
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.post("/reservations", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    const key = requestKey(req.body);
+    const payload = payloadWithoutKey(req.body);
+    const tableId = text(payload.tableId);
+    const hallId = text(payload.hallId);
+    if (!tableId && !hallId) reject("请选择已有桌台");
+    const startsAt = validDate(payload.startsAt, "开始时间");
+    const endsAt = validDate(payload.endsAt, "结束时间");
+    if (Date.parse(endsAt) <= Date.parse(startsAt)) reject("结束时间必须晚于开始时间");
+    const people = positiveInt(payload.peopleCount, "用餐人数", 100_000);
+    const customerName = text(payload.customerName).slice(0, 120);
+    const customerPhone = normalizeCustomerPhone(payload.customerPhone);
+    const pointsEarningEnabled = payload.pointsEarningEnabled === undefined ? true : payload.pointsEarningEnabled;
+    if (typeof pointsEarningEnabled !== "boolean") reject("积分累计选择不正确");
+    const note = text(payload.note).slice(0, 500);
+    const result = await withTransaction(async (client) => idempotent(client, "reservation:create", key, user.id, payload, async () => {
+      let table: { id: string; number: number; name: string; status: string } | undefined;
+      if (tableId) {
+        const tableResult = await client.query<{ id: string; number: number; name: string; status: string }>(
+          `SELECT id, number, name, status FROM restaurant_tables WHERE id = $1 FOR UPDATE`, [tableId]
+        );
+        table = tableResult.rows[0];
+        if (!table) reject("桌台不存在", 404);
+        if (table.status === "DISABLED") reject("该桌台已停用", 409);
+        const overlap = await client.query(
+          `SELECT id FROM banquet_reservations
+           WHERE table_id = $1 AND (status = 'RESERVED' OR (status = 'CONVERTED' AND ends_at > now()))
+             AND starts_at < $3::timestamptz AND ends_at > $2::timestamptz
+           LIMIT 1`, [tableId, startsAt, endsAt]
+        );
+        if (overlap.rows[0]) reject("该桌台在此时间段已有宴席预定", 409);
+      } else {
+        // Accept the old hall payload for one release so older installed clients can finish a booking.
+        const hallResult = await client.query<{ id: string; name: string; active: boolean }>(
+          `SELECT id, name, active FROM banquet_halls WHERE id = $1 FOR UPDATE`, [hallId]
+        );
+        const hall = hallResult.rows[0];
+        if (!hall) reject("宴会厅不存在", 404);
+        if (!hall.active) reject("宴会厅已停用", 409);
+        const overlap = await client.query(
+          `SELECT id FROM banquet_reservations
+           WHERE hall_id = $1 AND (status = 'RESERVED' OR (status = 'CONVERTED' AND ends_at > now()))
+             AND starts_at < $3::timestamptz AND ends_at > $2::timestamptz
+           LIMIT 1`, [hallId, startsAt, endsAt]
+        );
+        if (overlap.rows[0]) reject("该厅在此时间段已有预定", 409);
+      }
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO banquet_reservations
+         (table_id, hall_id, starts_at, ends_at, customer_name, customer_phone, people_count, points_earning_enabled, note, created_by, updated_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING id`,
+        [tableId || null, tableId ? null : hallId, startsAt, endsAt, customerName, customerPhone, people, pointsEarningEnabled, note, user.id]
+      );
+      await logOperation(client, user.id, "CREATE_BANQUET_RESERVATION", inserted.rows[0].id, { tableId: tableId || null, hallId: hallId || null, startsAt, endsAt, peopleCount: people });
+      return { reservation: await reservationDetails(client, inserted.rows[0].id) };
+    }));
+    res.status(201).json(result);
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.get("/reservations/:reservationId", async (req, res) => {
+  try {
+    const result = await withReadOnlySnapshot((client) => reservationDetails(client, routeId(req, "reservationId")));
+    res.json({ reservation: result });
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.patch("/reservations/:reservationId", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    const reservationId = routeId(req, "reservationId");
+    const startsAt = req.body?.startsAt === undefined ? undefined : validDate(req.body.startsAt, "开始时间");
+    const endsAt = req.body?.endsAt === undefined ? undefined : validDate(req.body.endsAt, "结束时间");
+    if ((startsAt === undefined) !== (endsAt === undefined)) reject("改期时请同时填写开始和结束时间");
+    if (startsAt && endsAt && Date.parse(endsAt) <= Date.parse(startsAt)) reject("结束时间必须晚于开始时间");
+    const cancel = req.body?.status === "CANCELLED";
+    if (req.body?.status !== undefined && !cancel) reject("预定状态不正确");
+    if (!cancel && !startsAt) reject("请填写改期时间或取消预定");
+    const response = await withTransaction(async (client) => {
+      const current = await client.query<{ id: string; hall_id: string | null; table_id: string | null; status: BanquetState }>(
+        `SELECT id, hall_id, table_id, status FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
+      );
+      const reservation = current.rows[0];
+      if (!reservation) reject("宴席预定不存在", 404);
+      if (reservation.status !== "RESERVED") reject("只有待办预定可以改期或取消", 409);
+      if (cancel) {
+        await client.query(`UPDATE banquet_reservations SET status = 'CANCELLED', updated_by = $1, updated_at = now() WHERE id = $2`, [user.id, reservationId]);
+        await logOperation(client, user.id, "CANCEL_BANQUET_RESERVATION", reservationId, { note: text(req.body?.note) });
+      } else {
+        if (reservation.table_id) {
+          await client.query(`SELECT id FROM restaurant_tables WHERE id = $1 FOR UPDATE`, [reservation.table_id]);
+          const overlap = await client.query(
+            `SELECT id FROM banquet_reservations
+             WHERE table_id = $1 AND id <> $2 AND (status = 'RESERVED' OR (status = 'CONVERTED' AND ends_at > now()))
+               AND starts_at < $4::timestamptz AND ends_at > $3::timestamptz
+             LIMIT 1`, [reservation.table_id, reservationId, startsAt, endsAt]
+          );
+          if (overlap.rows[0]) reject("该桌台在此时间段已有宴席预定", 409);
+        } else if (reservation.hall_id) {
+          await client.query(`SELECT id FROM banquet_halls WHERE id = $1 FOR UPDATE`, [reservation.hall_id]);
+          const overlap = await client.query(
+            `SELECT id FROM banquet_reservations
+             WHERE hall_id = $1 AND id <> $2 AND (status = 'RESERVED' OR (status = 'CONVERTED' AND ends_at > now()))
+               AND starts_at < $4::timestamptz AND ends_at > $3::timestamptz
+             LIMIT 1`, [reservation.hall_id, reservationId, startsAt, endsAt]
+          );
+          if (overlap.rows[0]) reject("该厅在此时间段已有预定", 409);
+        } else {
+          reject("该宴席没有绑定桌台，无法改期", 409);
+        }
+        await client.query(
+          `UPDATE banquet_reservations SET starts_at = $1, ends_at = $2, updated_by = $3, updated_at = now() WHERE id = $4`,
+          [startsAt, endsAt, user.id, reservationId]
+        );
+        await logOperation(client, user.id, "RESCHEDULE_BANQUET_RESERVATION", reservationId, { startsAt, endsAt });
+      }
+      return { reservation: await reservationDetails(client, reservationId) };
+    });
+    res.json(response);
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.put("/reservations/:reservationId/preorder", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    const reservationId = routeId(req, "reservationId");
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (rawItems.length > 300) reject("预点菜数量过多");
+    const reservation = await withTransaction(async (client) => {
+      const current = await client.query<{ status: BanquetState }>(`SELECT status FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]);
+      if (!current.rows[0]) reject("宴席预定不存在", 404);
+      if (current.rows[0].status !== "RESERVED") reject("只有待办预定可以修改预点菜", 409);
+      const snapshot: Array<Record<string, unknown>> = [];
+      for (const raw of rawItems) {
+        const dishId = text(raw?.dishId);
+        const quantity = positiveInt(raw?.quantity, "菜品数量", 100_000);
+        const dishResult = await client.query<{
+          id: string; name: string; category_name: string | null; unit: string; price_fen: number; cost_fen: number;
+        }>(
+          `SELECT d.id, d.name, c.name AS category_name, d.unit, d.price_fen, d.cost_fen
+           FROM dishes d LEFT JOIN categories c ON c.id = d.category_id WHERE d.id = $1 AND d.on_sale = true`, [dishId]
+        );
+        const dish = dishResult.rows[0];
+        if (!dish) reject("菜品不存在或已停售", 409);
+        const options = await snapshotOptions(client, dish.id, raw?.options, raw?.note);
+        snapshot.push({
+          dishId: dish.id, name: dish.name, categoryName: dish.category_name || "未分类", unit: dish.unit,
+          priceFen: dish.price_fen, costFen: dish.cost_fen, quantity, note: options.note, optionSnapshot: options.snapshot
+        });
+      }
+      await client.query(`UPDATE banquet_reservations SET preorder = $1::jsonb, updated_by = $2, updated_at = now() WHERE id = $3`, [JSON.stringify(snapshot), user.id, reservationId]);
+      await logOperation(client, user.id, "SAVE_BANQUET_PREORDER", reservationId, { itemCount: snapshot.length });
+      return reservationDetails(client, reservationId);
+    });
+    res.json({ reservation });
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.post("/reservations/:reservationId/deposits/receive", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    const reservationId = routeId(req, "reservationId");
+    const key = requestKey(req.body);
+    const payload = payloadWithoutKey(req.body);
+    const amount = positiveInt(payload.amountFen, "定金金额", 1_000_000_000);
+    const paymentMethod = text(payload.paymentMethod) || "现金";
+    if (!["现金", "微信", "支付宝", "银行卡", "其他"].includes(paymentMethod)) reject("收款方式不正确");
+    const result = await withTransaction(async (client) => idempotent(client, `deposit-receive:${reservationId}`, key, user.id, payload, async () => {
+      const reservation = await client.query<{ status: BanquetState }>(`SELECT status FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]);
+      if (!reservation.rows[0]) reject("宴席预定不存在", 404);
+      if (reservation.rows[0].status === "CANCELLED") reject("已取消的宴席不能再收定金", 409);
+      await client.query(
+        `INSERT INTO banquet_deposit_ledger (reservation_id, kind, amount_fen, payment_method, request_key, operator_id, note)
+         VALUES ($1, 'RECEIVE', $2, $3, $4, $5, $6)`,
+        [reservationId, amount, paymentMethod, key, user.id, text(payload.note).slice(0, 300)]
+      );
+      await logOperation(client, user.id, "RECEIVE_BANQUET_DEPOSIT", reservationId, { amountFen: amount });
+      return { reservation: await reservationDetails(client, reservationId) };
+    }));
+    res.status(201).json(result);
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.post("/reservations/:reservationId/deposits/refund", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    if (user.role !== "OWNER") reject("只有老板可以办理定金退款", 403);
+    const reservationId = routeId(req, "reservationId");
+    const key = requestKey(req.body);
+    const payload = payloadWithoutKey(req.body);
+    const amount = positiveInt(payload.amountFen, "退款金额", 1_000_000_000);
+    const paymentMethod = text(payload.paymentMethod) || "现金";
+    if (!["现金", "微信", "支付宝", "银行卡", "其他"].includes(paymentMethod)) reject("退款方式不正确");
+    const result = await withTransaction(async (client) => idempotent(client, `deposit-refund:${reservationId}`, key, user.id, payload, async () => {
+      const reservation = await client.query(`SELECT id FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]);
+      if (!reservation.rows[0]) reject("宴席预定不存在", 404);
+      const available = await depositBalance(client, reservationId);
+      if (amount > available) reject(`可退定金只有 ${available} 分`, 409);
+      await client.query(
+        `INSERT INTO banquet_deposit_ledger (reservation_id, kind, amount_fen, payment_method, request_key, operator_id, note)
+         VALUES ($1, 'REFUND', $2, $3, $4, $5, $6)`,
+        [reservationId, amount, paymentMethod, key, user.id, text(payload.note).slice(0, 300)]
+      );
+      await logOperation(client, user.id, "REFUND_BANQUET_DEPOSIT", reservationId, { amountFen: amount });
+      return { reservation: await reservationDetails(client, reservationId) };
+    }));
+    res.status(201).json(result);
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.post("/reservations/:reservationId/convert", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    const reservationId = routeId(req, "reservationId");
+    const key = requestKey(req.body);
+    const payload = payloadWithoutKey(req.body);
+    const response = await withTransaction(async (client) => idempotent(client, `reservation-convert:${reservationId}`, key, user.id, payload, async () => {
+      const selected = await client.query<Reservation & { table_status: string | null }>(
+        `SELECT r.*, h.name AS hall_name,
+                COALESCE(t.name, h.name, '未指定桌台') AS table_name,
+                t.number AS table_number, t.seats AS table_seats, t.status AS table_status
+         FROM banquet_reservations r
+         LEFT JOIN banquet_halls h ON h.id = r.hall_id
+         LEFT JOIN restaurant_tables t ON t.id = r.table_id
+         WHERE r.id = $1 FOR UPDATE OF r`,
+        [reservationId]
+      );
+      const reservation = selected.rows[0];
+      if (!reservation) reject("宴席预定不存在", 404);
+      if (reservation.status !== "RESERVED") reject("该宴席已取消或已经转成账单", 409);
+      if (reservation.table_id) {
+        const tableResult = await client.query<{ id: string; number: number; name: string; status: string }>(
+          `SELECT id, number, name, status FROM restaurant_tables WHERE id = $1 FOR UPDATE`, [reservation.table_id]
+        );
+        const table = tableResult.rows[0];
+        if (!table) reject("关联桌台不存在，请重新建立预定", 409);
+        if (table.status === "DISABLED") reject("关联桌台已停用，不能开立账单", 409);
+        const openOrder = await client.query(`SELECT id FROM orders WHERE table_id = $1 AND status = 'OPEN' LIMIT 1`, [table.id]);
+        if (openOrder.rows[0]) reject("该桌台当前已有进行中的账单，请先处理桌台状态", 409);
+      } else if (!reservation.hall_id) {
+        reject("该宴席没有绑定桌台，请重新建立预定", 409);
+      }
+      const phone = normalizeCustomerPhone(reservation.customer_phone);
+      const customerId = phone ? await findOrCreateCustomer(client, phone, reservation.customer_name || null) : null;
+      const orderResult = await client.query<{ id: string }>(
+        `INSERT INTO orders
+         (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, created_by, order_note, points_earning_enabled)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [reservation.table_id, reservation.table_number, reservation.table_name, customerId,
+          customerId ? null : (reservation.customer_name || "宴席客人"), reservation.people_count, user.id,
+          `宴席预定 ${reservationId}`, reservation.points_earning_enabled]
+      );
+      const orderId = orderResult.rows[0].id;
+      if (reservation.table_id) {
+        await client.query(`UPDATE restaurant_tables SET status = 'OCCUPIED', updated_at = now() WHERE id = $1`, [reservation.table_id]);
+      }
+      const preorder = Array.isArray(reservation.preorder) ? reservation.preorder : [];
+      if (preorder.length) {
+        const batch = await client.query<{ id: string }>(
+          `INSERT INTO order_batches (order_id, batch_no, kind, created_by) VALUES ($1, 1, 'INITIAL', $2) RETURNING id`, [orderId, user.id]
+        );
+        const printableItems: Array<Record<string, unknown>> = [];
+        for (const item of preorder) {
+          const inserted = await client.query(
+            `INSERT INTO order_items
+             (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, quantity, note, option_snapshot)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)`,
+            [batch.rows[0].id, orderId, item.dishId, item.name, item.categoryName || "未分类", item.unit || "份", item.priceFen, item.costFen || 0, item.quantity, item.note || "", JSON.stringify(item.optionSnapshot || [])]
+          );
+          void inserted;
+          printableItems.push({ name: item.name, quantity: item.quantity, unit: item.unit || "份", priceFen: Number(item.priceFen || 0), note: item.note || "" });
+        }
+        await client.query(`UPDATE orders SET order_version = 1, updated_at = now() WHERE id = $1`, [orderId]);
+        const printPayload = {
+          title: "宴席备菜单", orderId, tableNumber: reservation.table_number, tableName: reservation.table_name,
+          peopleCount: reservation.people_count, customer: reservation.customer_name || "宴席客人",
+          phone: reservation.customer_phone, orderNote: "宴席预定转单", openedAt: new Date().toISOString(), settledAt: null,
+          createdAt: new Date().toISOString(), layout: { tableNameSize: "LARGE", dishNameSize: "LARGE", quantityInline: true, showItemPrice: false },
+          items: printableItems
+        };
+        const printLines = banquetKitchenPrintLines(printPayload);
+        for (const copyNo of [1, 2]) {
+          await client.query(
+            `INSERT INTO print_jobs (order_id, batch_id, kind, copy_no, payload) VALUES ($1, $2, 'KITCHEN', $3, $4::jsonb)`,
+            [orderId, batch.rows[0].id, copyNo, JSON.stringify({ ...printPayload, copyNo, printLines })]
+          );
+        }
+      }
+      await client.query(
+        `UPDATE banquet_reservations SET status = 'CONVERTED', order_id = $1, updated_by = $2, updated_at = now() WHERE id = $3`,
+        [orderId, user.id, reservationId]
+      );
+      await logOperation(client, user.id, "CONVERT_BANQUET_TO_ORDER", reservationId, { orderId, itemCount: preorder.length });
+      return { orderId, reservationId };
+    }));
+    res.status(201).json(response);
+  } catch (error) { publicError(res, error); }
+});
+
+/** Apply some or all available banquet deposit inside the checkout's transaction. */
+export async function applyBanquetDepositForCheckout(
+  client: DbClient,
+  orderId: string,
+  settlementId: string,
+  operatorId: string,
+  desiredFen: number
+): Promise<number> {
+  const desired = nonNegativeInt(desiredFen, "定金抵扣金额");
+  if (!desired) return 0;
+  const result = await client.query<{ id: string }>(
+    `SELECT id FROM banquet_reservations WHERE order_id = $1 FOR UPDATE`, [orderId]
+  );
+  const reservation = result.rows[0];
+  if (!reservation) return 0;
+  const previous = await client.query<{ amount_fen: number }>(
+    `SELECT amount_fen FROM banquet_deposit_ledger WHERE settlement_id = $1 AND kind = 'APPLY'`, [settlementId]
+  );
+  if (previous.rows[0]) return Number(previous.rows[0].amount_fen);
+  const available = await depositBalance(client, reservation.id);
+  const applied = Math.min(desired, available);
+  if (!applied) return 0;
+  await client.query(
+    `INSERT INTO banquet_deposit_ledger (reservation_id, settlement_id, kind, amount_fen, operator_id, note)
+     VALUES ($1, $2, 'APPLY', $3, $4, '结账抵扣宴席定金')`,
+    [reservation.id, settlementId, applied, operatorId]
+  );
+  return applied;
+}
+
+/** Restore a previously applied deposit by appending a compensating ledger entry. */
+export async function reverseBanquetDepositForSettlement(
+  client: DbClient,
+  settlementId: string,
+  operatorId: string
+): Promise<void> {
+  const applied = await client.query<{ id: string; reservation_id: string; amount_fen: number }>(
+    `SELECT id, reservation_id, amount_fen FROM banquet_deposit_ledger WHERE settlement_id = $1 AND kind = 'APPLY'`,
+    [settlementId]
+  );
+  const source = applied.rows[0];
+  if (!source) return;
+  await client.query(`SELECT id FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [source.reservation_id]);
+  const restored = await client.query(`SELECT id FROM banquet_deposit_ledger WHERE reverses_ledger_id = $1 AND kind = 'RESTORE'`, [source.id]);
+  if (restored.rows[0]) return;
+  await client.query(
+    `INSERT INTO banquet_deposit_ledger (reservation_id, settlement_id, kind, amount_fen, reverses_ledger_id, operator_id, note)
+     VALUES ($1, $2, 'RESTORE', $3, $4, $5, '撤销结账恢复宴席定金')`,
+    [source.reservation_id, settlementId, source.amount_fen, source.id, operatorId]
+  );
+}

@@ -1,5 +1,6 @@
 node_modules
 release
+updates
 .git
 .deploy
 doc/LIVE_*.md

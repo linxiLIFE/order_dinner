@@ -8,6 +8,7 @@ import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { pool, withReadOnlySnapshot, withTransaction, type DbClient } from "./db.js";
 import { migrateAndSeed, pruneExpiredIdempotencyKeys } from "./migrate.js";
+import { applyBanquetDepositForCheckout, banquetRouter, reverseBanquetDepositForSettlement, runBanquetMigrations } from "./banquets.js";
 import { createToken, requireAuth, requireRole } from "./auth.js";
 import type { AuthenticatedRequest, AuthUser } from "./types.js";
 import {
@@ -34,6 +35,7 @@ const app = express();
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
 const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web/dist");
+const updatesDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../updates");
 
 app.use(cors({ origin: true, credentials: false }));
 app.use(express.json({ limit: "2mb" }));
@@ -43,6 +45,7 @@ app.use((_req, res, next) => {
   res.setHeader("Referrer-Policy", "same-origin");
   next();
 });
+app.use("/api/banquets", banquetRouter);
 
 class AppError extends Error {
   status: number;
@@ -374,11 +377,18 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
   const totals = calculateTotals(items);
   const settlementResult = await client.query(
     `SELECT s.id, s.version, s.gross_fen, s.gift_fen, s.return_fen,
-            s.manual_discount_fen, s.points_discount_fen, s.received_fen,
+            s.manual_discount_fen, s.points_discount_fen, s.deposit_applied_fen, s.received_fen,
             s.payment_method, s.earned_points, s.redeemed_points, s.reason,
             s.status, s.settled_at, e.name AS operator_name
      FROM settlements s LEFT JOIN employees e ON e.id = s.operator_id
      WHERE s.order_id = $1 ORDER BY s.version DESC, s.settled_at DESC`,
+    [orderId]
+  );
+  const banquetDeposit = await client.query<{ balance_fen: string }>(
+    `SELECT COALESCE(SUM(CASE WHEN ledger.kind IN ('RECEIVE', 'RESTORE') THEN ledger.amount_fen ELSE -ledger.amount_fen END), 0)::text AS balance_fen
+     FROM banquet_reservations reservation
+     JOIN banquet_deposit_ledger ledger ON ledger.reservation_id = reservation.id
+     WHERE reservation.order_id = $1`,
     [orderId]
   );
   const activeSettlement = settlementResult.rows.find((row) => row.status === "ACTIVE") as {
@@ -387,6 +397,7 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     return_fen?: number;
     manual_discount_fen?: number;
     points_discount_fen?: number;
+    deposit_applied_fen?: number;
   } | undefined;
   const settledRevenueFen = activeSettlement
     ? Number(activeSettlement.gross_fen || 0)
@@ -419,6 +430,7 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     endedAt: order.ended_at,
     endReason: order.end_reason,
     orderNote: order.order_note,
+    banquetDepositBalanceFen: Number(banquetDeposit.rows[0]?.balance_fen || 0),
     items: items.map((item) => ({
       id: item.id,
       dishId: item.dish_id,
@@ -560,12 +572,13 @@ async function currentOrder(client: DbClient, orderId: string, lock = false) {
     table_id: string | null;
     customer_id: string | null;
     guest_label: string | null;
+    points_earning_enabled: boolean;
     people_count: number;
     status: string;
     order_version: number;
     business_date: string;
   }>(
-    `SELECT id, table_id, customer_id, guest_label, people_count, status, order_version, business_date
+    `SELECT id, table_id, customer_id, guest_label, points_earning_enabled, people_count, status, order_version, business_date
      FROM orders WHERE id = $1 ${lock ? "FOR UPDATE" : ""}`,
     [orderId]
   );
@@ -646,9 +659,9 @@ function wrapPrinterText(value: string, maxWidth: number): string[] {
 }
 
 function printerTime(value: unknown): string {
-  if (typeof value !== "string" || !value || value === "null") return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
+  if (value === null || value === undefined || value === "" || value === "null") return "—";
+  const date = value instanceof Date ? value : new Date(String(value));
+  if (Number.isNaN(date.getTime())) return String(value);
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
@@ -672,6 +685,32 @@ function printerItemNote(value: unknown): string {
   const parts = String(value || "").split(/[；;]/).map((part) => part.trim()).filter(Boolean);
   if (parts.length === 1) parts[0] = parts[0].replace(/^备注[：:]\s*/, "");
   return parts.filter(Boolean).join("，");
+}
+
+const RECEIPT_DISH_COLUMNS = 20;
+const RECEIPT_QUANTITY_COLUMNS = 6;
+const RECEIPT_UNIT_PRICE_COLUMNS = 8;
+const RECEIPT_SUBTOTAL_COLUMNS = 8;
+const RECEIPT_TOTAL_COLUMNS = RECEIPT_DISH_COLUMNS + RECEIPT_QUANTITY_COLUMNS + RECEIPT_UNIT_PRICE_COLUMNS + RECEIPT_SUBTOTAL_COLUMNS;
+
+function receiptCell(value: string, width: number, align: "LEFT" | "CENTER" | "RIGHT" = "LEFT"): string {
+  const text = wrapPrinterText(value, width)[0] || "";
+  const gap = Math.max(0, width - printerDisplayWidth(text));
+  if (align === "RIGHT") return `${" ".repeat(gap)}${text}`;
+  if (align === "CENTER") {
+    const leftGap = Math.floor(gap / 2);
+    return `${" ".repeat(leftGap)}${text}${" ".repeat(gap - leftGap)}`;
+  }
+  return `${text}${" ".repeat(gap)}`;
+}
+
+function receiptRow(dish: string, quantity: string, unitPrice: string, subtotal: string): string {
+  return [
+    receiptCell(dish, RECEIPT_DISH_COLUMNS),
+    receiptCell(quantity, RECEIPT_QUANTITY_COLUMNS, "RIGHT"),
+    receiptCell(unitPrice, RECEIPT_UNIT_PRICE_COLUMNS, "RIGHT"),
+    receiptCell(subtotal, RECEIPT_SUBTOTAL_COLUMNS, "RIGHT")
+  ].join("");
 }
 
 function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Record<string, unknown>): PrinterLine[] {
@@ -728,11 +767,14 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
   const storeName = receipt ? stringValue(payload.storeName).trim() : "";
   if (storeName) {
     push(storeName, center, large);
-    push("");
   }
-  push(stringValue(payload.title, receipt ? "结账小票" : kind === "RETURN" ? "退菜单" : "备菜单"), center, large);
-  push("");
-  push(tableName, center, large);
+  const rawTitle = stringValue(payload.title).trim();
+  const reprintSuffix = rawTitle.includes("补打") ? "（补打）" : "";
+  const title = receipt
+    ? rawTitle || "结账小票"
+    : `${tableName}~${kind === "RETURN" ? "退菜单" : "备菜单"}${reprintSuffix}`;
+  push(title, center, large);
+  if (receipt) push(tableName, center, large);
   push(`人数：${Number(payload.peopleCount) || 0}    顾客：${stringValue(payload.customer, "散客")}`);
   if (payload.batchNo !== undefined && payload.batchNo !== null) push(`批次：第 ${Number(payload.batchNo) || 0} 批`);
   if (receipt) {
@@ -744,6 +786,7 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
   const orderNote = stringValue(payload.orderNote);
   if (!receipt && orderNote) push(`本单备注：${orderNote}`);
   push("------------------------------------------");
+  if (receipt) push(receiptRow("菜品", "份数", "单价", "小计"), "LEFT", emphasis, RECEIPT_TOTAL_COLUMNS);
 
   const items = Array.isArray(payload.items) ? payload.items as Array<Record<string, unknown>> : [];
   for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
@@ -751,21 +794,36 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     const name = stringValue(item.name) || "菜品";
     const quantity = Number(item.quantity) || 0;
     const unit = stringValue(item.unit, "份");
-    const quantityLabel = `x${quantity}${unit}`;
+    const quantityLabel = receipt ? `${quantity}${unit}` : `x${quantity}${unit}`;
     const note = receipt ? "" : printerItemNote(item.note);
-    const sameDishLine = printerDisplayWidth(name) + 1 + printerDisplayWidth(quantityLabel) <= dishColumns;
-    if (sameDishLine) {
-      const gap = Math.max(1, dishColumns - printerDisplayWidth(name) - printerDisplayWidth(quantityLabel));
-      push(`${name}${" ".repeat(gap)}${quantityLabel}`, "LEFT", emphasis);
-      if (note) {
-        for (const noteLine of wrapPrinterText(`  ${note}`, dishColumns)) push(noteLine, "LEFT", normal, dishColumns);
+    if (receipt) {
+      const unitPriceFen = Number(item.priceFen ?? item.price_fen ?? 0);
+      const subtotalFen = unitPriceFen * quantity;
+      const nameLines = wrapPrinterText(name, RECEIPT_DISH_COLUMNS);
+      push(
+        receiptRow(nameLines[0] || "菜品", quantityLabel, printerMoney(unitPriceFen), printerMoney(subtotalFen)),
+        "LEFT",
+        emphasis,
+        RECEIPT_TOTAL_COLUMNS
+      );
+      for (const nameLine of nameLines.slice(1)) {
+        push(receiptCell(nameLine, RECEIPT_DISH_COLUMNS), "LEFT", emphasis, RECEIPT_TOTAL_COLUMNS);
       }
     } else {
-      for (const nameLine of wrapPrinterText(name, dishColumns)) push(nameLine, "LEFT", emphasis, dishColumns);
-      if (note) printNoteAndQuantity(note, quantityLabel);
-      else pushRight(quantityLabel, emphasis, dishColumns);
+      const sameDishLine = printerDisplayWidth(name) + 1 + printerDisplayWidth(quantityLabel) <= dishColumns;
+      if (sameDishLine) {
+        const gap = Math.max(1, dishColumns - printerDisplayWidth(name) - printerDisplayWidth(quantityLabel));
+        push(`${name}${" ".repeat(gap)}${quantityLabel}`, "LEFT", emphasis);
+        if (note) {
+          for (const noteLine of wrapPrinterText(`  ${note}`, dishColumns)) push(noteLine, "LEFT", normal, dishColumns);
+        }
+      } else {
+        for (const nameLine of wrapPrinterText(name, dishColumns)) push(nameLine, "LEFT", emphasis, dishColumns);
+        if (note) printNoteAndQuantity(note, quantityLabel);
+        else pushRight(quantityLabel, emphasis, dishColumns);
+      }
+      if (note && itemIndex < items.length - 1) push("");
     }
-    if (note && itemIndex < items.length - 1) push("");
   }
 
   if (receipt) {
@@ -780,6 +838,7 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     printDiscount("退菜", totals.returnFen);
     printDiscount("人工减免", totals.manualDiscountFen);
     printDiscount("积分抵扣", totals.pointsDiscountFen);
+    printDiscount("宴席定金抵扣", totals.depositAppliedFen);
     push(`应收：${printerMoney(totals.dueFen ?? totals.receivedFen)}`);
     push(`实收：${printerMoney(totals.receivedFen)}`, "LEFT", emphasis);
     const paymentMethod = stringValue(payload.paymentMethod).trim();
@@ -816,6 +875,12 @@ const settingsSchema = z.object({
   receipt_footer: z.string().max(500).optional(),
   points_enabled: z.boolean().optional(),
   points_earn_fen: z.number().int().min(1).max(1_000_000_000).optional(),
+  points_redeem_tiers: z.array(z.object({
+    points: z.number().int().min(1).max(1_000_000_000),
+    discountFen: z.number().int().min(1).max(1_000_000_000)
+  }).strict()).min(1).max(20).refine((tiers) => new Set(tiers.map((tier) => tier.points)).size === tiers.length, "积分档位不能重复").optional(),
+  points_min_spend_fen: z.number().int().min(1).max(1_000_000_000).optional(),
+  points_allow_below_minimum: z.boolean().optional(),
   points_redeem_points: z.number().int().min(1).max(1_000_000_000).optional(),
   points_redeem_fen: z.number().int().min(1).max(1_000_000_000).optional(),
   printer_device_id: z.string().trim().max(120).optional(),
@@ -1001,6 +1066,10 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
               c.id AS customer_id, c.name AS customer_name, c.phone AS customer_phone,
               COALESCE((SELECT SUM((quantity - returned_quantity) * price_fen - gifted_quantity * price_fen)
                         FROM order_items WHERE order_id = o.id), 0) AS current_fen
+              ,(SELECT COUNT(*)::int FROM banquet_reservations br
+                WHERE br.table_id = t.id AND br.status = 'RESERVED' AND br.ends_at > now()) AS banquet_reservation_count
+              ,(SELECT MIN(br.starts_at) FROM banquet_reservations br
+                WHERE br.table_id = t.id AND br.status = 'RESERVED' AND br.ends_at > now()) AS next_banquet_reservation_at
        FROM restaurant_tables t
        LEFT JOIN orders o ON o.table_id = t.id AND o.status = 'OPEN'
        LEFT JOIN customers c ON c.id = o.customer_id
@@ -1012,6 +1081,8 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
       name: row.name,
       seats: row.seats,
       status: row.status,
+      reservationCount: Number(row.banquet_reservation_count || 0),
+      nextReservationAt: row.next_banquet_reservation_at,
       order: row.order_id
         ? {
             id: row.order_id,
@@ -1516,8 +1587,15 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       const settings = await getSettings(client);
       const enabled = settingBoolean(settings, "points_enabled", true);
       const earnFen = settingNumber(settings, "points_earn_fen", 100);
-      const redeemPoints = settingNumber(settings, "points_redeem_points", 10);
-      const redeemFen = settingNumber(settings, "points_redeem_fen", 100);
+      const configuredTiers = Array.isArray(settings.points_redeem_tiers)
+        ? settings.points_redeem_tiers as Array<{ points: number; discountFen: number }>
+        : [{ points: settingNumber(settings, "points_redeem_points", 10), discountFen: settingNumber(settings, "points_redeem_fen", 100) }];
+      const redeemTiers = configuredTiers
+        .filter((tier) => Number.isSafeInteger(Number(tier?.points)) && Number(tier.points) > 0 && Number.isSafeInteger(Number(tier?.discountFen)) && Number(tier.discountFen) > 0)
+        .map((tier) => ({ points: Number(tier.points), discountFen: Number(tier.discountFen) }))
+        .sort((a, b) => a.points - b.points);
+      const minimumSpendFen = settingNumber(settings, "points_min_spend_fen", redeemTiers[0]?.discountFen || 24000);
+      const allowBelowMinimum = settingBoolean(settings, "points_allow_below_minimum", false);
       const manualInput = req.body?.manualDiscountFen === undefined
         ? 0
         : requireNonNegativeInteger(req.body.manualDiscountFen, "人工减免金额格式不正确");
@@ -1545,18 +1623,24 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
         fail("散客不能使用积分");
       }
       if (usePoints && !enabled) fail("积分功能未开启");
-      const maxByBalance = Math.floor(customerBalance / redeemPoints) * redeemPoints;
-      const maxByAmount = Math.floor(Math.max(0, totals.subtotalFen - manualDiscountFen) / redeemFen) * redeemPoints;
-      const requestedPoints = usePoints ? Math.min(maxByBalance, maxByAmount) : 0;
-      const pointsDiscountFen = Math.floor(requestedPoints / redeemPoints) * redeemFen;
-      const receivedFen = totals.subtotalFen - manualDiscountFen - pointsDiscountFen;
-      const paidFen = req.body?.receivedFen === undefined
-        ? receivedFen
+      const remainingBeforePoints = totals.subtotalFen - manualDiscountFen;
+      const pointsEligible = remainingBeforePoints >= minimumSpendFen || allowBelowMinimum;
+      const affordableTiers = redeemTiers.filter((tier) => tier.points <= customerBalance);
+      const fittingTiers = affordableTiers.filter((tier) => tier.discountFen <= remainingBeforePoints);
+      const selectedTier = usePoints && pointsEligible && remainingBeforePoints > 0
+        ? (fittingTiers.at(-1) || affordableTiers[0])
+        : undefined;
+      const requestedPoints = selectedTier?.points ?? 0;
+      const pointsDiscountFen = Math.min(totals.subtotalFen - manualDiscountFen, selectedTier?.discountFen ?? 0);
+      const dueBeforeDepositFen = totals.subtotalFen - manualDiscountFen - pointsDiscountFen;
+      const requestedReceivedFen = req.body?.receivedFen === undefined
+        ? null
         : requireNonNegativeInteger(req.body.receivedFen, "实收金额格式不正确");
-      if (paidFen !== receivedFen) fail(`收款金额不匹配，应收 ${receivedFen} 分`);
       const paymentMethod = text(req.body?.paymentMethod) || "现金";
       if (!["现金", "微信", "支付宝", "银行卡", "其他"].includes(paymentMethod)) fail("收款方式不正确");
-      const earnedPoints = enabled && order.customer_id ? Math.floor(receivedFen / earnFen) : 0;
+      const earnedPoints = enabled && order.points_earning_enabled && order.customer_id
+        ? Math.floor(dueBeforeDepositFen / earnFen)
+        : 0;
       const settlement = await client.query<{ id: string }>(
         `INSERT INTO settlements
          (order_id, gross_fen, gift_fen, return_fen, manual_discount_fen, points_discount_fen,
@@ -1569,13 +1653,27 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
           totals.returnFen,
           manualDiscountFen,
           pointsDiscountFen,
-          receivedFen,
+          dueBeforeDepositFen,
           paymentMethod,
           earnedPoints,
           requestedPoints,
           user.id,
           text(req.body?.reason)
         ]
+      );
+      const depositAppliedFen = await applyBanquetDepositForCheckout(
+        client,
+        orderId,
+        settlement.rows[0].id,
+        user.id,
+        dueBeforeDepositFen
+      );
+      const receivedFen = dueBeforeDepositFen - depositAppliedFen;
+      const paidFen = requestedReceivedFen ?? receivedFen;
+      if (paidFen !== receivedFen) fail(`收款金额不匹配，应收 ${receivedFen} 分`);
+      await client.query(
+        `UPDATE settlements SET received_fen = $1, deposit_applied_fen = $2 WHERE id = $3`,
+        [receivedFen, depositAppliedFen, settlement.rows[0].id]
       );
       const newBalance = customerBalance - requestedPoints + earnedPoints;
       if (order.customer_id) {
@@ -1611,6 +1709,7 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
           returnFen: totals.returnFen,
           manualDiscountFen,
           pointsDiscountFen,
+          depositAppliedFen,
           dueFen: receivedFen,
           receivedFen
         },
@@ -1695,6 +1794,7 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
         }
         await client.query(`UPDATE customers SET points_balance = $1, updated_at = now() WHERE id = $2`, [balanceAfter, original.customer_id]);
       }
+      await reverseBanquetDepositForSettlement(client, settlement.id, user.id);
       await client.query(
         `UPDATE settlements SET status = 'REVERSED', reversed_by = $1, reversed_at = now() WHERE id = $2`,
         [user.id, settlement.id]
@@ -1702,10 +1802,10 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
       await client.query(`UPDATE orders SET status = 'REVERSED', updated_at = now() WHERE id = $1`, [orderId]);
       const newOrder = await client.query<{ id: string }>(
         `INSERT INTO orders
-         (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, status,
+         (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, points_earning_enabled, status,
           parent_order_id, created_by, business_date, order_note, order_version)
-         SELECT NULL, COALESCE(source.table_number_snapshot, t.number), COALESCE(source.table_name_snapshot, t.name),
-                source.customer_id, source.guest_label, source.people_count, 'OPEN', $1, $2,
+         SELECT source.table_id, COALESCE(source.table_number_snapshot, t.number), COALESCE(source.table_name_snapshot, t.name),
+                source.customer_id, source.guest_label, source.people_count, source.points_earning_enabled, 'OPEN', $1, $2,
                 source.business_date, source.order_note,
                 COALESCE((SELECT MAX(batch_no) FROM order_batches WHERE order_id = source.id), 0)
          FROM orders source LEFT JOIN restaurant_tables t ON t.id = source.table_id WHERE source.id = $3
@@ -1713,6 +1813,14 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
         [orderId, user.id, orderId]
       );
       const newOrderId = newOrder.rows[0].id;
+      const reopenedTable = await client.query<{ table_id: string | null }>(`SELECT table_id FROM orders WHERE id = $1`, [newOrderId]);
+      if (reopenedTable.rows[0]?.table_id) {
+        await client.query(`UPDATE restaurant_tables SET status = 'OCCUPIED', updated_at = now() WHERE id = $1`, [reopenedTable.rows[0].table_id]);
+      }
+      await client.query(
+        `UPDATE banquet_reservations SET order_id = $1, updated_by = $2, updated_at = now() WHERE order_id = $3`,
+        [newOrderId, user.id, orderId]
+      );
       const batches = await client.query<{ id: string; batch_no: number; kind: string }>(
         `SELECT id, batch_no, kind FROM order_batches WHERE order_id = $1 ORDER BY batch_no`,
         [orderId]
@@ -1748,7 +1856,7 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
       type: "order.reopened",
       orderId,
       newOrderId: String(((response as Record<string, unknown>).order as Record<string, unknown>).id),
-      tableId: null
+      tableId: String(((response as Record<string, unknown>).order as Record<string, unknown>).tableId || "") || null
     });
     res.json(response);
   } catch (error) {
@@ -2153,7 +2261,7 @@ app.get("/api/customers/:customerId", requireAuth, async (req, res) => {
       [customerId]
     );
     const visits = await pool.query(
-      `SELECT o.id, o.business_date, o.people_count, s.received_fen, s.payment_method, s.settled_at
+      `SELECT o.id, o.business_date, o.people_count, s.received_fen + s.deposit_applied_fen AS received_fen, s.payment_method, s.settled_at
        FROM orders o JOIN settlements s ON s.order_id = o.id AND s.status = 'ACTIVE'
        WHERE o.customer_id = $1 ORDER BY s.settled_at DESC LIMIT 50`,
       [customerId]
@@ -2773,6 +2881,7 @@ app.post("/api/print-jobs/:jobId/reprint", requireAuth, async (req: Authenticate
   }
 });
 
+app.use("/updates", express.static(updatesDist));
 app.use(express.static(webDist));
 app.get("*", (req: Request, res: Response, next: NextFunction) => {
   if (req.path.startsWith("/api/") || req.path === "/healthz") {
@@ -2794,6 +2903,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 async function start(): Promise<void> {
   await migrateAndSeed();
+  await runBanquetMigrations(pool);
   const idempotencyCleanup = setInterval(() => {
     void pruneExpiredIdempotencyKeys().catch((error) => console.error("幂等记录清理失败", error));
   }, 24 * 60 * 60 * 1000);

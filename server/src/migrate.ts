@@ -279,6 +279,13 @@ const settings = {
   receipt_footer: "谢谢光临",
   points_enabled: true,
   points_earn_fen: 100,
+  points_redeem_tiers: [
+    { points: 5000, discountFen: 24000 },
+    { points: 8000, discountFen: 38000 },
+    { points: 10000, discountFen: 52000 }
+  ],
+  points_min_spend_fen: 24000,
+  points_allow_below_minimum: false,
   points_redeem_points: 10,
   points_redeem_fen: 100,
   printer_device_id: "",

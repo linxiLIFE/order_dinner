@@ -2,6 +2,7 @@ node_modules/
 web/dist/
 server/dist/
 release/
+/updates/
 .env
 .env.*
 !.env.example

@@ -54,6 +54,10 @@ public class PrinterService extends Service {
     private static final int NOTIFICATION_ID = 1314;
     private static final int PRINT_COLUMNS = 42;
     private static final int LARGE_PRINT_COLUMNS = PRINT_COLUMNS / 2;
+    private static final int RECEIPT_DISH_COLUMNS = 20;
+    private static final int RECEIPT_QUANTITY_COLUMNS = 6;
+    private static final int RECEIPT_UNIT_PRICE_COLUMNS = 8;
+    private static final int RECEIPT_SUBTOTAL_COLUMNS = 8;
     private static final UUID SERIAL_PORT_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final Charset PRINTER_CHARSET = Charset.forName("GB18030");
     private static volatile boolean connected = false;
@@ -264,7 +268,7 @@ public class PrinterService extends Service {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         command(output, 0x1B, 0x40); // 初始化
         command(output, 0x1C, 0x26); // 中文模式
-        if (receipt) command(output, 0x1B, 0x33, 0x20); // 结账小票行距稍微加大
+        if (receipt) command(output, 0x1B, 0x33, 0x18); // 结账小票减少顶部和行间空白
 
         String storeName = receipt ? payload.optString("storeName", "").trim() : "";
         if (!storeName.isEmpty()) {
@@ -274,18 +278,26 @@ public class PrinterService extends Service {
                 line(output, storeNameLine);
             }
             command(output, 0x1D, 0x21, 0x00);
-            line(output, "");
         }
 
+        String table = tableName(payload);
+        String title = payload.optString("title", "").trim();
+        if (!receipt) {
+            String kindTitle = "RETURN".equals(kind) ? "退菜单" : "备菜单";
+            String reprintSuffix = title.contains("补打") ? "（补打）" : "";
+            title = table + "~" + kindTitle + reprintSuffix;
+        }
+        if (title.isEmpty()) title = receipt ? "结账小票" : table + "~备菜单";
         command(output, 0x1B, 0x61, 0x01);
         command(output, 0x1D, 0x21, 0x11);
-        line(output, payload.optString("title", receipt ? "结账小票" : "备菜单"));
+        line(output, title);
         command(output, 0x1D, 0x21, 0x00);
-        line(output, "");
-        command(output, 0x1B, 0x61, 0x01);
-        command(output, 0x1D, 0x21, 0x11);
-        line(output, tableName(payload));
-        command(output, 0x1D, 0x21, 0x00);
+        if (receipt) {
+            command(output, 0x1B, 0x61, 0x01);
+            command(output, 0x1D, 0x21, 0x11);
+            line(output, table);
+            command(output, 0x1D, 0x21, 0x00);
+        }
         command(output, 0x1B, 0x61, 0x00);
         line(output, "人数：" + payload.optInt("peopleCount", 0) + "    顾客：" + payload.optString("customer", "散客"));
         if (payload.has("batchNo")) line(output, "批次：第 " + payload.optInt("batchNo") + " 批");
@@ -298,6 +310,7 @@ public class PrinterService extends Service {
         String orderNote = payload.optString("orderNote", "");
         if (!receipt && !orderNote.isEmpty()) line(output, "本单备注：" + orderNote);
         separator(output);
+        if (receipt) line(output, receiptRow("菜品", "份数", "单价", "小计"));
         JSONArray items = payload.optJSONArray("items");
         if (items != null) {
             for (int index = 0; index < items.length(); index += 1) {
@@ -305,10 +318,24 @@ public class PrinterService extends Service {
                 int quantity = item.optInt("quantity", 0);
                 String unit = item.optString("unit", "份");
                 String name = item.optString("name", "菜品");
-                String quantityLabel = "x" + quantity + unit;
-                String note = receipt ? "" : formatItemNote(item.optString("note", ""));
-                printDishItem(output, name, quantityLabel, note, receipt);
-                if (!receipt && !note.isEmpty() && index < items.length() - 1) line(output, "");
+                if (receipt) {
+                    int unitPriceFen = item.has("priceFen") ? item.optInt("priceFen", 0) : item.optInt("price_fen", 0);
+                    List<String> nameLines = wrapText(name, RECEIPT_DISH_COLUMNS);
+                    line(output, receiptRow(
+                        nameLines.isEmpty() ? "菜品" : nameLines.get(0),
+                        quantity + unit,
+                        money(unitPriceFen),
+                        money(unitPriceFen * quantity)
+                    ));
+                    for (int lineIndex = 1; lineIndex < nameLines.size(); lineIndex += 1) {
+                        line(output, receiptCell(nameLines.get(lineIndex), RECEIPT_DISH_COLUMNS, "LEFT"));
+                    }
+                } else {
+                    String quantityLabel = "x" + quantity + unit;
+                    String note = formatItemNote(item.optString("note", ""));
+                    printDishItem(output, name, quantityLabel, note, false);
+                    if (!note.isEmpty() && index < items.length() - 1) line(output, "");
+                }
             }
         }
         if (receipt) {
@@ -338,7 +365,7 @@ public class PrinterService extends Service {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         command(output, 0x1B, 0x40); // 初始化
         command(output, 0x1C, 0x26); // 中文模式
-        if (receipt) command(output, 0x1B, 0x33, 0x20); // 结账小票行距稍微加大
+        if (receipt) command(output, 0x1B, 0x33, 0x18); // 结账小票减少顶部和行间空白
 
         for (int index = 0; index < printLines.length(); index += 1) {
             JSONObject printLine = printLines.optJSONObject(index);
@@ -436,6 +463,26 @@ public class PrinterService extends Service {
 
     private String alignRight(String value, int columns) {
         return spaces(Math.max(0, columns - displayWidth(value))) + value;
+    }
+
+    private String receiptCell(String value, int columns, String alignment) {
+        String safeValue = value == null ? "" : value;
+        List<String> wrapped = wrapText(safeValue, columns);
+        String text = wrapped.isEmpty() ? "" : wrapped.get(0);
+        int gap = Math.max(0, columns - displayWidth(text));
+        if ("RIGHT".equals(alignment)) return spaces(gap) + text;
+        if ("CENTER".equals(alignment)) {
+            int leftGap = gap / 2;
+            return spaces(leftGap) + text + spaces(gap - leftGap);
+        }
+        return text + spaces(gap);
+    }
+
+    private String receiptRow(String dish, String quantity, String unitPrice, String subtotal) {
+        return receiptCell(dish, RECEIPT_DISH_COLUMNS, "LEFT")
+            + receiptCell(quantity, RECEIPT_QUANTITY_COLUMNS, "RIGHT")
+            + receiptCell(unitPrice, RECEIPT_UNIT_PRICE_COLUMNS, "RIGHT")
+            + receiptCell(subtotal, RECEIPT_SUBTOTAL_COLUMNS, "RIGHT");
     }
 
     private int displayWidth(String value) {

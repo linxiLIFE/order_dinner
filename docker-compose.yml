@@ -31,6 +31,8 @@ services:
       - .env
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-order_dinner}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-order_dinner}
+    volumes:
+      - ${ORDER_DINNER_BUILD_CONTEXT:-.}/updates:/app/updates:ro
     expose:
       - "3000"
     networks:

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Capacitor, registerPlugin } from "@capacitor/core";
+import { BanquetPage } from "./BanquetPage.js";
 import {
   api,
   businessDate,
@@ -16,13 +17,15 @@ import {
   type User
 } from "./api.js";
 
-type Page = "tables" | "orders" | "customers" | "dishes" | "stats" | "print" | "settings";
+type Page = "tables" | "banquets" | "orders" | "customers" | "dishes" | "stats" | "print" | "settings";
 type Table = {
   id: string;
   number: number;
   name: string;
   seats: number;
   status: string;
+  reservationCount?: number;
+  nextReservationAt?: string | null;
   order: { id: string; peopleCount: number; currentFen: number; openedAt: string; customer: { name: string; phone: string | null } } | null;
 };
 type Category = { id: string; name: string; sort_order?: number; active?: boolean };
@@ -73,6 +76,7 @@ type Order = {
   endedAt: string | null;
   endReason: string;
   orderNote: string;
+  banquetDepositBalanceFen?: number;
   items: OrderItem[];
   totals: { grossFen: number; giftFen: number; returnFen: number; subtotalFen: number; costFen?: number; lossFen?: number };
   revenueFen: number | null;
@@ -86,6 +90,7 @@ type Order = {
     return_fen: number;
     manual_discount_fen: number;
     points_discount_fen: number;
+    deposit_applied_fen: number;
     received_fen: number;
     payment_method: string;
     earned_points: number;
@@ -97,7 +102,23 @@ type Order = {
   }>;
 };
 type Settings = Record<string, unknown>;
+type PointsTier = { points: number; discountFen: number };
 type StoreEventDetail = { type?: string; orderId?: string; newOrderId?: string; tableId?: string | null; scope?: string };
+
+const FONT_SIZE_STORAGE_KEY = "order-dinner-font-size";
+const DEFAULT_FONT_SIZE = 16;
+const MIN_FONT_SIZE = 12;
+const MAX_FONT_SIZE = 24;
+
+function readFontSizePreference() {
+  try {
+    const stored = Number(window.localStorage.getItem(FONT_SIZE_STORAGE_KEY));
+    if (Number.isFinite(stored) && stored >= MIN_FONT_SIZE && stored <= MAX_FONT_SIZE) return stored;
+  } catch {
+    // Keep the default if local storage is unavailable.
+  }
+  return DEFAULT_FONT_SIZE;
+}
 type OrderSearchRow = {
   id: string;
   table_id: string | null;
@@ -156,6 +177,22 @@ interface PrinterHostPlugin {
   status(): Promise<PrinterHostState>;
 }
 const PrinterHost = registerPlugin<PrinterHostPlugin>("PrinterHost");
+type UpdateResult = { available?: boolean; currentVersion?: string; latestVersion?: string; version?: string; notes?: string; message?: string; downloaded?: boolean; started?: boolean; permissionRequired?: boolean };
+interface UpdateHostPlugin {
+  checkForUpdate(): Promise<UpdateResult>;
+  downloadUpdate(): Promise<UpdateResult>;
+  installUpdate(): Promise<UpdateResult>;
+}
+interface DesktopUpdateBridge {
+  获取版本(): Promise<string>;
+  检查更新(): Promise<UpdateResult>;
+  下载并安装更新(): Promise<UpdateResult>;
+}
+const UpdateHost = registerPlugin<UpdateHostPlugin>("UpdateHost");
+
+function desktopUpdateBridge(): DesktopUpdateBridge | undefined {
+  return (window as unknown as { 点单台桌面?: DesktopUpdateBridge }).点单台桌面;
+}
 
 function cartLineNote(line: CartLine): string {
   const optionNotes = line.selections.flatMap((selection) => {
@@ -244,6 +281,13 @@ function restoreCartLines(rawLines: unknown, dishes: Dish[]): Record<string, Car
 function centsFromYuan(value: string): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed * 100)) : 0;
+}
+
+function selectPointsTier(tiers: PointsTier[], balance: number, amountFen: number): PointsTier | undefined {
+  const affordable = tiers.filter((tier) => tier.points <= balance).sort((a, b) => a.points - b.points);
+  if (amountFen <= 0 || !affordable.length) return undefined;
+  const fullDiscountTiers = affordable.filter((tier) => tier.discountFen <= amountFen);
+  return fullDiscountTiers.at(-1) || affordable[0];
 }
 
 function statusText(status: string): string {
@@ -342,28 +386,54 @@ function Header({ user, page, setPage, onLogout, selectedOrder }: {
   onLogout: () => void;
   selectedOrder: boolean;
 }) {
-  const links: Array<[Page, string]> = [["tables", "桌台"], ["orders", "订单查询"], ["customers", "顾客"], ["dishes", "菜品"], ["print", "打印管理"]];
-  if (user.role === "OWNER") links.push(["stats", "营业统计"], ["settings", "设置"]);
+  const activeLinkRef = useRef<HTMLButtonElement | null>(null);
+  const links: Array<[Page, string]> = [["tables", "桌台"], ["banquets", "宴席预定"], ["orders", "订单查询"], ["customers", "顾客"], ["dishes", "菜品"], ["print", "打印管理"]];
+  if (user.role === "OWNER") links.push(["stats", "营业统计"]);
+  links.push(["settings", "设置"]);
+  useEffect(() => {
+    activeLinkRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [page]);
   return (
     <header className="topbar">
       <button className="wordmark" onClick={() => setPage("tables")}>餐厅点单台</button>
       <nav className="main-nav">
-        {links.map(([key, label]) => <button key={key} className={page === key && !selectedOrder ? "nav-link active" : "nav-link"} onClick={() => setPage(key)}>{label}</button>)}
+        {links.map(([key, label]) => <button key={key} ref={page === key && !selectedOrder ? activeLinkRef : undefined} className={page === key && !selectedOrder ? "nav-link active" : "nav-link"} onClick={() => setPage(key)}>{label}</button>)}
       </nav>
       <div className="user-area"><span>{user.name}</span><span className="role-tag">{user.role === "OWNER" ? "老板" : "收银员"}</span><button className="text-button" onClick={onLogout}>退出</button></div>
     </header>
   );
 }
 
-function TablesPage({ tables, refresh, openOrder, setMessage }: {
+function TablesPage({ tables, refresh, openOrder, openBanquets, setMessage }: {
   tables: Table[];
   refresh: () => Promise<void>;
   openOrder: (orderId: string) => void;
+  openBanquets: () => void;
   setMessage: (message: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [openingTable, setOpeningTable] = useState<Table | null>(null);
   const [pendingOpenRequest, setPendingOpenRequest] = useState<PendingIdempotentRequest | null>(null);
+  const [todayBanquetCount, setTodayBanquetCount] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadTodayReservations = async () => {
+      const today = businessDate();
+      const nextDay = new Date(`${today}T12:00:00+08:00`);
+      nextDay.setDate(nextDay.getDate() + 1);
+      const tomorrow = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(nextDay);
+      try {
+        const result = await api<{ reservations: Array<{ id: string }> }>(`/api/banquets/reservations?from=${encodeURIComponent(`${today}T00:00:00+08:00`)}&to=${encodeURIComponent(`${tomorrow}T00:00:00+08:00`)}&status=RESERVED`);
+        if (!cancelled) setTodayBanquetCount(result.reservations.length);
+      } catch {
+        if (!cancelled) setTodayBanquetCount(0);
+      }
+    };
+    void loadTodayReservations();
+    const timer = window.setInterval(() => void loadTodayReservations(), 30_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
 
   useEffect(() => {
     for (const table of tables) {
@@ -415,7 +485,7 @@ function TablesPage({ tables, refresh, openOrder, setMessage }: {
 
   return (
       <section className="page-section">
-      <div className="section-heading"><div><h2>桌台</h2><p className="muted">选择空桌开台，或继续处理进行中的账单</p></div><button className="secondary" onClick={refresh} disabled={busy}>刷新</button></div>
+      <div className="section-heading"><div><h2>桌台</h2><p className="muted">选择空桌开台，或继续处理进行中的账单</p></div><div className="heading-actions"><button className="secondary" onClick={openBanquets}>宴席预定{todayBanquetCount > 0 && <span className="reservation-count">{todayBanquetCount}</span>}</button><button className="secondary" onClick={refresh} disabled={busy}>刷新</button></div></div>
       <div className="table-grid">
         {tables.map((table) => {
           const occupied = Boolean(table.order);
@@ -424,6 +494,7 @@ function TablesPage({ tables, refresh, openOrder, setMessage }: {
             <div className="table-number">{table.number}<small>号桌</small></div>
             <div className="table-state">{table.status === "DISABLED" ? "停用" : occupied ? "用餐中" : "空桌"}</div>
             <div className="table-detail">{occupied ? `${table.order!.customer.name} · ${table.order!.peopleCount} 人` : `${table.seats} 人桌`}</div>
+            {table.reservationCount ? <div className="table-reservation">宴席预定 {table.reservationCount} 条{table.nextReservationAt ? ` · ${formatTime(table.nextReservationAt)}` : ""}</div> : null}
             {occupied && <div className="table-total">{money(table.order!.currentFen)}</div>}
           </button>;
         })}
@@ -900,7 +971,16 @@ function CheckoutPanel({ order, role, onClose, onDone }: { order: Order; role: U
   const initialPayload = pendingRequest?.payload;
   const [discount, setDiscount] = useState(initialPayload ? (Number(initialPayload.manualDiscountFen || 0) / 100).toFixed(2) : "0");
   const [usePoints, setUsePoints] = useState(initialPayload ? Boolean(initialPayload.usePoints) : false);
-  const [pointSettings, setPointSettings] = useState({ enabled: true, redeemPoints: 10, redeemFen: 100 });
+  const [pointSettings, setPointSettings] = useState({
+    enabled: true,
+    minimumSpendFen: 24000,
+    allowBelowMinimum: false,
+    tiers: [
+      { points: 5000, discountFen: 24000 },
+      { points: 8000, discountFen: 38000 },
+      { points: 10000, discountFen: 52000 }
+    ] as PointsTier[]
+  });
   const [received, setReceived] = useState(initialPayload?.receivedFen !== undefined
     ? (Number(initialPayload.receivedFen) / 100).toFixed(2)
     : (order.totals.subtotalFen / 100).toFixed(2));
@@ -910,19 +990,27 @@ function CheckoutPanel({ order, role, onClose, onDone }: { order: Order; role: U
   const [error, setError] = useState("");
   const manualFen = centsFromYuan(discount);
   const baseDueFen = Math.max(0, order.totals.subtotalFen - manualFen);
-  const maxByBalance = Math.floor(Math.max(0, Number(order.customer.points || 0)) / pointSettings.redeemPoints) * pointSettings.redeemPoints;
-  const maxByAmount = Math.floor(baseDueFen / pointSettings.redeemFen) * pointSettings.redeemPoints;
-  const pointsUsed = usePoints ? Math.min(maxByBalance, maxByAmount) : 0;
-  const pointsDiscountFen = Math.floor(pointsUsed / pointSettings.redeemPoints) * pointSettings.redeemFen;
-  const dueFen = Math.max(0, baseDueFen - pointsDiscountFen);
-  const projectedMargin = dueFen > 0 ? Math.round(((dueFen - Number(order.totals.costFen || 0)) / dueFen) * 10000) / 100 : 0;
+  const pointsEligible = baseDueFen >= pointSettings.minimumSpendFen || pointSettings.allowBelowMinimum;
+  const availableTier = pointsEligible
+    ? selectPointsTier(pointSettings.tiers, Math.max(0, Number(order.customer.points || 0)), baseDueFen)
+    : undefined;
+  const pointsUsed = usePoints ? (availableTier?.points ?? 0) : 0;
+  const pointsDiscountFen = usePoints ? Math.min(baseDueFen, availableTier?.discountFen ?? 0) : 0;
+  const dueBeforeDepositFen = Math.max(0, baseDueFen - pointsDiscountFen);
+  const depositAvailableFen = Math.max(0, Number(order.banquetDepositBalanceFen || 0));
+  const depositAppliedFen = Math.min(dueBeforeDepositFen, depositAvailableFen);
+  const dueFen = dueBeforeDepositFen - depositAppliedFen;
+  const projectedMargin = dueBeforeDepositFen > 0 ? Math.round(((dueBeforeDepositFen - Number(order.totals.costFen || 0)) / dueBeforeDepositFen) * 10000) / 100 : 0;
 
   useEffect(() => {
     api<{ settings: Settings }>("/api/settings").then(({ settings }) => {
       const next = {
         enabled: Boolean(settings.points_enabled),
-        redeemPoints: Math.max(1, Number(settings.points_redeem_points) || 10),
-        redeemFen: Math.max(1, Number(settings.points_redeem_fen) || 100)
+        minimumSpendFen: Math.max(0, Number(settings.points_min_spend_fen) || 24000),
+        allowBelowMinimum: Boolean(settings.points_allow_below_minimum),
+        tiers: Array.isArray(settings.points_redeem_tiers)
+          ? (settings.points_redeem_tiers as PointsTier[]).filter((tier) => Number(tier?.points) > 0 && Number(tier?.discountFen) > 0)
+          : [{ points: Math.max(1, Number(settings.points_redeem_points) || 10), discountFen: Math.max(1, Number(settings.points_redeem_fen) || 100) }]
       };
       setPointSettings(next);
       if (!next.enabled) setUsePoints(false);
@@ -964,10 +1052,10 @@ function CheckoutPanel({ order, role, onClose, onDone }: { order: Order; role: U
   return <>
     <Dialog title="确认结账" description={`${order.tableName || `${order.tableNumber || ""}号桌`} · ${order.customer.name}`} onClose={onClose} className="checkout-modal">
       <form noValidate onSubmit={submit}>
-        <div className="checkout-summary"><div><span>菜品原价</span><strong>{money(order.totals.grossFen)}</strong></div><div><span>赠送</span><strong>-{money(order.totals.giftFen)}</strong></div><div><span>退菜</span><strong>-{money(order.totals.returnFen)}</strong></div><div className="emphasis"><span>结账前应收</span><strong>{money(order.totals.subtotalFen)}</strong></div></div>
+        <div className="checkout-summary"><div><span>菜品原价</span><strong>{money(order.totals.grossFen)}</strong></div><div><span>赠送</span><strong>-{money(order.totals.giftFen)}</strong></div><div><span>退菜</span><strong>-{money(order.totals.returnFen)}</strong></div><div className="emphasis"><span>结账前应收</span><strong>{money(order.totals.subtotalFen)}</strong></div>{depositAvailableFen > 0 && <div><span>宴席定金抵扣</span><strong>-{money(depositAppliedFen)}</strong></div>}</div>
         <div className="form-grid">
           <label>人工减免（元）<input type="number" min="0" step="0.01" value={discount} onChange={(event) => setDiscount(event.target.value)} disabled={Boolean(pendingRequest) || busy} /></label>
-          <label className="points-choice"><span>积分抵扣</span><span className="checkbox-row"><input type="checkbox" checked={usePoints} disabled={Boolean(pendingRequest) || !order.customer.id || !pointSettings.enabled || order.customer.points <= 0} onChange={(event) => setUsePoints(event.target.checked)} />使用积分</span><small>{!order.customer.id ? "散客不能使用积分" : !pointSettings.enabled ? "积分功能未开启" : `可用 ${order.customer.points} 分，自动抵扣 ${pointsUsed} 分（${money(pointsDiscountFen)}）`}</small></label>
+          <label className="points-choice"><span>积分抵扣</span><span className="checkbox-row"><input type="checkbox" checked={usePoints} disabled={Boolean(pendingRequest) || !order.customer.id || !pointSettings.enabled || !availableTier} onChange={(event) => setUsePoints(event.target.checked)} />使用积分</span><small>{!order.customer.id ? "散客不能使用积分" : !pointSettings.enabled ? "积分功能未开启" : !pointsEligible ? `本单不足 ${money(pointSettings.minimumSpendFen)}，不能使用积分` : !availableTier ? `当前积分不足 ${pointSettings.tiers.length ? Math.min(...pointSettings.tiers.map((tier) => tier.points)) : 0} 分档位` : usePoints ? `使用 ${pointsUsed} 分，抵扣 ${money(pointsDiscountFen)}` : `可用 ${order.customer.points} 分，抵扣 ${money(Math.min(baseDueFen, availableTier.discountFen))}`}</small></label>
           <label>收款方式<select value={payment} onChange={(event) => setPayment(event.target.value)} disabled={Boolean(pendingRequest) || busy}><option>现金</option><option>微信</option><option>支付宝</option><option>银行卡</option><option>其他</option></select></label>
           <label>实收金额（元）<input type="number" min="0" step="0.01" value={received} onChange={(event) => setReceived(event.target.value)} disabled={Boolean(pendingRequest) || busy} /></label>
         </div>
@@ -1029,7 +1117,7 @@ function OrderQueryPage({ openOrder, setMessage }: { openOrder: (orderId: string
 }
 
 function OrderDetailDialog({ order, onClose, onContinue }: { order: Order; onClose: () => void; onContinue?: () => void }) {
-  return <Dialog title="订单详情" description={`${order.tableName || (order.tableNumber ? `${order.tableNumber}号桌` : "无桌台")} · ${statusText(order.status)}`} onClose={onClose} className="detail-modal large-modal"><div className="detail-summary"><div><span>顾客</span><strong>{order.customer.name || "散客"}</strong></div><div><span>手机号</span><strong>{order.customer.phone || "未填写"}</strong></div><div><span>人数</span><strong>{order.peopleCount} 人</strong></div><div><span>开台时间</span><strong>{formatTime(order.openedAt)}</strong></div><div><span>结束时间</span><strong>{formatTime(order.endedAt || order.settledAt)}</strong></div><div><span>本单毛利率</span><strong>{order.grossMarginPercent === null ? "—" : `${order.grossMarginPercent}%`}</strong></div></div>{order.orderNote && <p className="order-note"><span>本单备注：</span>{order.orderNote}</p>}<h3>菜品明细</h3><div className="mini-list order-detail-items">{order.items.map((item) => <div key={item.id}><span>{item.name} × {item.quantity}{item.note ? `（${item.note}）` : ""}</span><strong>{money(item.priceFen * item.quantity)}</strong><small>{item.giftedQuantity ? `赠送 ${item.giftedQuantity}` : ""}{item.returnedQuantity ? ` 退菜 ${item.returnedQuantity}` : ""}</small></div>)}</div><div className="checkout-summary detail-checkout-summary"><div><span>原价</span><strong>{money(order.totals.grossFen)}</strong></div><div><span>赠送</span><strong>-{money(order.totals.giftFen)}</strong></div><div><span>退菜</span><strong>-{money(order.totals.returnFen)}</strong></div><div className="emphasis"><span>有效收入</span><strong>{money(order.revenueFen ?? order.totals.subtotalFen)}</strong></div></div>{order.endReason && <p className="muted">结束说明：{order.endReason}</p>}{order.settlements.length > 0 && <><h3>结账记录</h3><div className="mini-list">{order.settlements.map((settlement) => <div key={settlement.id}><span>第 {settlement.version} 次 · {settlement.payment_method} · {settlement.status === "ACTIVE" ? "有效" : "已撤销"}</span><strong>{money(settlement.received_fen)}</strong><small>{formatTime(settlement.settled_at)} · {settlement.operator_name || "未知操作员"} · 积分抵扣 {settlement.redeemed_points} 分 · 人工减免 {money(settlement.manual_discount_fen)}</small></div>)}</div></>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>关闭</button>{onContinue && <button type="button" className="primary" onClick={onContinue}>继续处理</button>}</div></Dialog>;
+  return <Dialog title="订单详情" description={`${order.tableName || (order.tableNumber ? `${order.tableNumber}号桌` : "无桌台")} · ${statusText(order.status)}`} onClose={onClose} className="detail-modal large-modal"><div className="detail-summary"><div><span>顾客</span><strong>{order.customer.name || "散客"}</strong></div><div><span>手机号</span><strong>{order.customer.phone || "未填写"}</strong></div><div><span>人数</span><strong>{order.peopleCount} 人</strong></div><div><span>开台时间</span><strong>{formatTime(order.openedAt)}</strong></div><div><span>结束时间</span><strong>{formatTime(order.endedAt || order.settledAt)}</strong></div><div><span>本单毛利率</span><strong>{order.grossMarginPercent === null ? "—" : `${order.grossMarginPercent}%`}</strong></div></div>{order.orderNote && <p className="order-note"><span>本单备注：</span>{order.orderNote}</p>}<h3>菜品明细</h3><div className="mini-list order-detail-items">{order.items.map((item) => <div key={item.id}><span>{item.name} × {item.quantity}{item.note ? `（${item.note}）` : ""}</span><strong>{money(item.priceFen * item.quantity)}</strong><small>{item.giftedQuantity ? `赠送 ${item.giftedQuantity}` : ""}{item.returnedQuantity ? ` 退菜 ${item.returnedQuantity}` : ""}</small></div>)}</div><div className="checkout-summary detail-checkout-summary"><div><span>原价</span><strong>{money(order.totals.grossFen)}</strong></div><div><span>赠送</span><strong>-{money(order.totals.giftFen)}</strong></div><div><span>退菜</span><strong>-{money(order.totals.returnFen)}</strong></div><div className="emphasis"><span>有效收入</span><strong>{money(order.revenueFen ?? order.totals.subtotalFen)}</strong></div></div>{order.endReason && <p className="muted">结束说明：{order.endReason}</p>}{order.settlements.length > 0 && <><h3>结账记录</h3><div className="mini-list">{order.settlements.map((settlement) => <div key={settlement.id}><span>第 {settlement.version} 次 · {settlement.payment_method} · {settlement.status === "ACTIVE" ? "有效" : "已撤销"}</span><strong>{money(settlement.received_fen)}</strong><small>{formatTime(settlement.settled_at)} · {settlement.operator_name || "未知操作员"} · 积分抵扣 {settlement.redeemed_points} 分 · 定金抵扣 {money(settlement.deposit_applied_fen || 0)} · 人工减免 {money(settlement.manual_discount_fen)}</small></div>)}</div></>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>关闭</button>{onContinue && <button type="button" className="primary" onClick={onContinue}>继续处理</button>}</div></Dialog>;
 }
 
 function CustomersPage({ setMessage }: { setMessage: (message: string) => void }) {
@@ -1446,7 +1534,83 @@ function AndroidPrinterPanel({ setMessage }: { setMessage: (message: string) => 
   return <div className="content-card printer-host-card"><div className="printer-host-heading"><div><h3>安卓打印主机</h3><p className="muted">先在系统蓝牙中配对打印机。断线期间产生的任务不会在重连后自动补打。</p></div><span className={`status-pill ${state?.connected ? "green" : state?.enabled ? "red" : "gray"}`}>{state?.connected ? "已连接" : state?.enabled ? "连接中" : "未启用"}</span></div><div className="printer-host-controls"><label>已配对打印机<select value={selectedId} onChange={(event) => selectDevice(event.target.value)}><option value="">请选择</option>{devices.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.id}</option>)}</select></label><button type="button" className="secondary" onClick={() => void loadPaired()} disabled={busy}>刷新设备</button><button type="button" className="primary" onClick={() => void enable()} disabled={busy || !selectedId}>启用打印</button>{state?.enabled && <button type="button" className="secondary danger-outline" onClick={() => void stop()} disabled={busy}>停用</button>}</div>{state?.message && <p className="printer-host-message">{state.message}</p>}</div>;
 }
 
-function SettingsPage({ setMessage }: { setMessage: (message: string) => void }) {
+function ClientUpdatePanel({ setMessage }: { setMessage: (message: string) => void }) {
+  const isAndroid = Capacitor.getPlatform() === "android";
+  const isDesktop = Boolean(desktopUpdateBridge());
+  const [status, setStatus] = useState<UpdateResult | null>(null);
+  const [downloadedVersion, setDownloadedVersion] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function check() {
+    setBusy(true);
+    try {
+      const result = isAndroid
+        ? await UpdateHost.checkForUpdate()
+        : await desktopUpdateBridge()!.检查更新();
+      setStatus(result);
+      setDownloadedVersion("");
+      if (!result.available) setMessage(result.message || "当前已经是最新版本");
+    } catch (error) {
+      const message = errorText(error);
+      setStatus({ message });
+      setMessage(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function download() {
+    if (!status?.latestVersion) return;
+    setBusy(true);
+    try {
+      if (isAndroid) {
+        const result = await UpdateHost.downloadUpdate();
+        if (result.downloaded) setDownloadedVersion(result.version || status.latestVersion);
+        setStatus({ ...status, ...result });
+        setMessage(result.message || "更新包已下载");
+      } else {
+        const result = await desktopUpdateBridge()!.下载并安装更新();
+        setStatus({ ...status, ...result });
+        setMessage(result.message || "更新安装程序已启动");
+      }
+    } catch (error) {
+      const message = errorText(error);
+      setStatus({ ...status, message });
+      setMessage(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function install() {
+    setBusy(true);
+    try {
+      const result = await UpdateHost.installUpdate();
+      setStatus({ ...status, ...result });
+      setMessage(result.message || "系统安装程序已打开");
+    } catch (error) {
+      const message = errorText(error);
+      setStatus({ ...status, message });
+      setMessage(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <div className="content-card client-update-card"><h3>客户端更新</h3>
+    {!isAndroid && !isDesktop
+      ? <p className="muted">当前使用网页版，发布后刷新页面即可使用最新版。</p>
+      : <>
+        <p className="muted">{status?.currentVersion ? `当前版本 ${status.currentVersion}` : "检查安卓或 Windows 客户端的新版本"}{status?.latestVersion ? ` · 最新版本 ${status.latestVersion}` : ""}</p>
+        {status?.message && <p className="update-message">{status.message}</p>}
+        {status?.notes && <p className="muted">更新内容：{status.notes}</p>}
+        <div className="update-actions">
+          <button type="button" className="secondary" onClick={() => void check()} disabled={busy}>{busy ? "请稍候…" : "检查更新"}</button>
+          {status?.available && isAndroid && !downloadedVersion && <button type="button" className="primary" onClick={() => void download()} disabled={busy}>{busy ? "下载中…" : "下载更新包"}</button>}
+          {status?.available && isAndroid && downloadedVersion && <button type="button" className="primary" onClick={() => void install()} disabled={busy}>安装 {downloadedVersion}</button>}
+          {status?.available && isDesktop && <button type="button" className="primary" onClick={() => void download()} disabled={busy}>{busy ? "下载并校验中…" : "下载并安装更新"}</button>}
+        </div>
+      </>}
+  </div>;
+}
+
+function SettingsPage({ setMessage, fontSize, setFontSize }: { setMessage: (message: string) => void; fontSize: number; setFontSize: (fontSize: number) => void }) {
   const [settings, setSettings] = useState<Settings>({});
   const [tables, setTables] = useState<Table[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -1544,6 +1708,15 @@ function SettingsPage({ setMessage }: { setMessage: (message: string) => void })
     return () => window.removeEventListener("点单台数据更新", handleUpdate);
   }, []);
   function value(key: string, fallback = "") { return String(settings[key] ?? fallback); }
+  const pointsTiers = Array.isArray(settings.points_redeem_tiers)
+    ? settings.points_redeem_tiers as PointsTier[]
+    : [{ points: 5000, discountFen: 24000 }, { points: 8000, discountFen: 38000 }, { points: 10000, discountFen: 52000 }];
+  function updatePointsTier(index: number, field: keyof PointsTier, nextValue: number) {
+    setSettings({
+      ...settings,
+      points_redeem_tiers: pointsTiers.map((tier, tierIndex) => tierIndex === index ? { ...tier, [field]: nextValue } : tier)
+    });
+  }
   async function saveSettings() { try { await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) }); setMessage("设置已保存"); } catch (error) { setMessage(errorText(error)); } }
   async function togglePrinter(device: PrinterDevice) { try { await api(`/api/print-devices/${encodeURIComponent(device.id)}`, { method: "PATCH", body: JSON.stringify({ active: !device.active }) }); await load(); setMessage(device.active ? "打印设备已停用" : "打印设备已启用并设为当前主机"); } catch (error) { setMessage(errorText(error)); } }
   async function rotatePrinter(device: PrinterDevice) {
@@ -1592,14 +1765,42 @@ function SettingsPage({ setMessage }: { setMessage: (message: string) => void })
   async function toggleEmployee(employee: Employee) { try { await api(`/api/employees/${employee.id}`, { method: "PATCH", body: JSON.stringify({ active: !employee.active }) }); await load(); setMessage(employee.active ? "员工账号已停用" : "员工账号已启用"); } catch (error) { setMessage(errorText(error)); } }
   if (!loaded) return <section className="page-section"><div className="loading">正在读取设置…</div></section>;
   return <section className="page-section"><div className="section-heading"><div><h2>设置</h2><p className="muted">店铺、积分规则、打印设备、桌台和员工账号</p></div></div><div className="settings-layout">
+    <DevicePreferences setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} />
     <AndroidPrinterPanel setMessage={setMessage} />
     <div className="content-card"><h3>店铺与小票</h3><div className="form-grid"><label>店名<input value={value("store_name")} onChange={(event) => setSettings({ ...settings, store_name: event.target.value })} /></label><label>小票尾注<input value={value("receipt_footer")} onChange={(event) => setSettings({ ...settings, receipt_footer: event.target.value })} /></label><label>当前打印设备<input value={value("printer_device_name", "未配置打印设备")} readOnly /></label><label>设备编号<input value={value("printer_device_id", "未配置")} readOnly /></label></div></div>
     <div className="content-card"><h3>打印设备列表</h3><p className="muted">最近 30 秒内上报心跳视为在线；“重新授权”会让旧授权立即失效。</p>{printerDevices.length ? <div className="employee-list">{printerDevices.map((device) => { const lastSeen = device.last_seen_at ? new Date(device.last_seen_at).getTime() : 0; const online = Number.isFinite(lastSeen) && Date.now() - lastSeen < 30_000; return <div className="employee-row printer-device-row" key={device.id}><div><strong>{device.name}</strong><span>{device.id} · {device.active ? "当前打印主机" : "备用设备"} · 最近连接 {device.last_seen_at ? formatTime(device.last_seen_at) : "从未"}</span></div><span className={online ? "status-pill green" : "status-pill gray"}>{online ? "在线" : "离线"}</span><button type="button" className="secondary" onClick={() => void togglePrinter(device)}>{device.active ? "停用" : "启用并设为当前"}</button><button type="button" className="text-button" onClick={() => void rotatePrinter(device)}>重新授权</button></div>; })}</div> : <div className="empty">尚未注册打印设备</div>}</div>
-    <div className="content-card"><h3>积分规则</h3><label className="toggle-row"><input type="checkbox" checked={Boolean(settings.points_enabled)} onChange={(event) => setSettings({ ...settings, points_enabled: event.target.checked })} />启用积分</label><div className="form-grid three"><label>每多少分获得 1 分<small>按实收金额计算，填写分</small><input type="number" min="1" value={value("points_earn_fen", "100")} onChange={(event) => setSettings({ ...settings, points_earn_fen: Number(event.target.value) })} /></label><label>多少积分抵 1 元<input type="number" min="1" value={value("points_redeem_points", "10")} onChange={(event) => setSettings({ ...settings, points_redeem_points: Number(event.target.value) })} /></label><label>每个抵扣单位金额（分）<input type="number" min="1" value={value("points_redeem_fen", "100")} onChange={(event) => setSettings({ ...settings, points_redeem_fen: Number(event.target.value) })} /></label></div></div>
+    <div className="content-card"><h3>积分规则</h3>
+      <label className="toggle-row"><input type="checkbox" checked={Boolean(settings.points_enabled)} onChange={(event) => setSettings({ ...settings, points_enabled: event.target.checked })} />启用积分</label>
+      <div className="points-rule-grid">
+        <label>每实付多少元积 1 分<small>按顾客实际消费金额计算</small><input type="number" min="0.01" step="0.01" value={(Number(settings.points_earn_fen ?? 100) / 100).toFixed(2)} onChange={(event) => setSettings({ ...settings, points_earn_fen: Math.max(1, centsFromYuan(event.target.value)) })} /></label>
+        <label>最低使用积分消费金额（元）<small>默认 240 元</small><input type="number" min="0.01" step="0.01" value={(Number(settings.points_min_spend_fen ?? 24000) / 100).toFixed(2)} onChange={(event) => setSettings({ ...settings, points_min_spend_fen: Math.max(1, centsFromYuan(event.target.value)) })} /></label>
+      </div>
+      <label className="toggle-row"><input type="checkbox" checked={Boolean(settings.points_allow_below_minimum)} onChange={(event) => setSettings({ ...settings, points_allow_below_minimum: event.target.checked })} />消费未达到最低金额也允许使用积分</label>
+      <h4 className="points-tier-title">积分抵扣档位</h4>
+      <div className="points-tier-list">{pointsTiers.map((tier, index) => <div className="points-tier-row" key={`${index}-${tier.points}`}>
+        <label>积分<input type="number" min="1" step="1" value={tier.points} onChange={(event) => updatePointsTier(index, "points", Math.max(1, Number(event.target.value) || 1))} /></label>
+        <span>抵扣</span>
+        <label>金额（元）<input type="number" min="0.01" step="0.01" value={(Number(tier.discountFen) / 100).toFixed(2)} onChange={(event) => updatePointsTier(index, "discountFen", Math.max(1, centsFromYuan(event.target.value)))} /></label>
+        <button type="button" className="text-button danger-text" disabled={pointsTiers.length <= 1} onClick={() => setSettings({ ...settings, points_redeem_tiers: pointsTiers.filter((_, tierIndex) => tierIndex !== index) })}>移除</button>
+      </div>)}</div>
+      <button type="button" className="secondary points-add-tier" disabled={pointsTiers.length >= 20} onClick={() => setSettings({ ...settings, points_redeem_tiers: [...pointsTiers, { points: Math.max(1, (pointsTiers.at(-1)?.points ?? 0) + 1000), discountFen: Math.max(1, (pointsTiers.at(-1)?.discountFen ?? 0) + 10000) }] })}>增加档位</button>
+    </div>
     <div className="content-card"><h3>桌台管理</h3><p className="muted">桌台有历史订单时不能物理删除；空闲桌台可停用或恢复。</p><div className="table-settings">{tables.map((table) => <TableSetting key={table.id} table={table} onSave={saveTable} onSetActive={setTableActive} onDelete={() => setDeleteTarget(table)} />)}</div><AddTableForm onAdd={addTable} /></div>
     <div className="content-card"><h3>员工账号</h3><p className="muted">开通后员工使用自己的账号登录；停用不会删除历史操作记录。</p><form className="employee-form" noValidate onSubmit={addEmployee}><label>登录账号<input value={employeeForm.username} onChange={(event) => setEmployeeForm({ ...employeeForm, username: event.target.value })} /></label><label>员工姓名<input value={employeeForm.name} onChange={(event) => setEmployeeForm({ ...employeeForm, name: event.target.value })} /></label><label>初始密码<small>至少 8 位</small><input type="password" value={employeeForm.password} onChange={(event) => setEmployeeForm({ ...employeeForm, password: event.target.value })} /></label><button className="primary">开通账号</button></form><div className="employee-list">{employees.map((employee) => <div className="employee-row" key={employee.id}><div><strong>{employee.name}</strong><span>{employee.username} · {employee.role === "OWNER" ? "老板" : "收银员"}</span></div><span className={employee.active ? "status-pill green" : "status-pill gray"}>{employee.active ? "启用" : "停用"}</span>{employee.role !== "OWNER" && <button type="button" className="secondary" onClick={() => void toggleEmployee(employee)}>{employee.active ? "停用" : "启用"}</button>}</div>)}</div></div>
     <button className="primary" type="button" onClick={() => void saveSettings()}>保存店铺与积分设置</button>
   </div>{deleteTarget && <ConfirmDialog title="删除桌台" message={`确定删除“${deleteTarget.name}”？只有从未产生订单且当前空闲的桌台可以删除。`} confirmText="确认删除" danger onClose={() => setDeleteTarget(null)} onConfirm={() => void deleteTable()} />}{rotatedPrinterToken && <Dialog title="打印设备新授权码" description="旧授权已立即失效。新授权码仅在此显示，请重新配置打印平板。" onClose={() => setRotatedPrinterToken(null)}><p>{rotatedPrinterToken.name} · {rotatedPrinterToken.id}</p><label>新授权码<input readOnly value={rotatedPrinterToken.token} onFocus={(event) => event.target.select()} /></label><div className="modal-actions"><button type="button" className="secondary" onClick={() => void copyRotatedPrinterToken()}>复制授权码</button><button type="button" className="primary" onClick={() => setRotatedPrinterToken(null)}>关闭</button></div></Dialog>}</section>;
+}
+
+function FontSizeCard({ fontSize, setFontSize }: { fontSize: number; setFontSize: (fontSize: number) => void }) {
+  return <div className="content-card"><h3>字体大小</h3><div className="font-size-setting"><label>界面字号<input className="font-size-range" type="range" min={MIN_FONT_SIZE} max={MAX_FONT_SIZE} step="1" value={fontSize} onChange={(event) => setFontSize(Number(event.target.value))} /></label><output>{fontSize}px</output><button type="button" className="secondary" onClick={() => setFontSize(DEFAULT_FONT_SIZE)}>恢复默认</button></div><p className="muted">此设置保存在当前设备</p></div>;
+}
+
+function DevicePreferences({ setMessage, fontSize, setFontSize }: { setMessage: (message: string) => void; fontSize: number; setFontSize: (fontSize: number) => void }) {
+  return <><FontSizeCard fontSize={fontSize} setFontSize={setFontSize} /><ClientUpdatePanel setMessage={setMessage} /></>;
+}
+
+function DeviceSettingsPage({ setMessage, fontSize, setFontSize }: { setMessage: (message: string) => void; fontSize: number; setFontSize: (fontSize: number) => void }) {
+  return <section className="page-section"><div className="section-heading"><div><h2>设置</h2><p className="muted">调整当前设备字号或检查客户端更新</p></div></div><div className="settings-layout"><DevicePreferences setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} /></div></section>;
 }
 
 function TableSetting({ table, onSave, onSetActive, onDelete }: { table: Table; onSave: (table: Table, values: { name: string; number: number; seats: number }) => Promise<void>; onSetActive: (table: Table, active: boolean) => Promise<void>; onDelete: () => void }) {
@@ -1622,6 +1823,7 @@ function AddTableForm({ onAdd }: { onAdd: (values: { name: string; number: numbe
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [page, setPage] = useState<Page>("tables");
+  const [fontSize, setFontSize] = useState(readFontSizePreference);
   const [selectedOrderId, setSelectedOrderId] = useState("");
   const [tables, setTables] = useState<Table[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -1629,6 +1831,15 @@ export default function App() {
   const [checking, setChecking] = useState(Boolean(getToken()));
   const tableRequestSequence = useRef(0);
   const categoryRequestSequence = useRef(0);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--ui-font-size", `${fontSize}px`);
+    try {
+      window.localStorage.setItem(FONT_SIZE_STORAGE_KEY, String(fontSize));
+    } catch {
+      // The current session still uses the selected size if storage is unavailable.
+    }
+  }, [fontSize]);
 
   const refreshTables = useCallback(async () => {
     const requestSequence = ++tableRequestSequence.current;
@@ -1755,12 +1966,14 @@ export default function App() {
   function logout() { setToken(""); setUser(null); setSelectedOrderId(""); }
   const content = selectedOrderId
     ? <OrderPage orderId={selectedOrderId} user={user} refreshTables={refreshTables} setMessage={setMessage} goBack={() => setSelectedOrderId("")} />
-    : page === "tables" ? <TablesPage tables={tables} refresh={refreshTables} openOrder={setSelectedOrderId} setMessage={setMessage} />
-      : page === "orders" ? <OrderQueryPage openOrder={setSelectedOrderId} setMessage={setMessage} />
+    : page === "tables" ? <TablesPage tables={tables} refresh={refreshTables} openOrder={setSelectedOrderId} openBanquets={() => setPage("banquets")} setMessage={setMessage} />
+      : page === "banquets" ? <BanquetPage onOpenOrder={setSelectedOrderId} setMessage={setMessage} canManageHalls={user.role === "OWNER"} />
+        : page === "orders" ? <OrderQueryPage openOrder={setSelectedOrderId} setMessage={setMessage} />
         : page === "customers" ? <CustomersPage setMessage={setMessage} />
               : page === "dishes" ? <DishesPage categories={categories} user={user} setMessage={setMessage} reloadCategories={refreshCategories} />
                 : page === "stats" ? <StatsPage setMessage={setMessage} />
                   : page === "print" ? <PrintManagementPage setMessage={setMessage} />
-                  : <SettingsPage setMessage={setMessage} />;
+                  : user.role === "OWNER" ? <SettingsPage setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} />
+                    : <DeviceSettingsPage setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} />;
   return <div className="app-shell"><Header user={user} page={page} setPage={(next) => { setSelectedOrderId(""); setPage(next); }} onLogout={logout} selectedOrder={Boolean(selectedOrderId)} />{message && <div className="toast">{message}<button onClick={() => setMessage("")}>×</button></div>}<main>{content}</main></div>;
 }
