@@ -57,7 +57,7 @@ fs.renameSync(stagingDirectory, versionDirectory);
 const manifest = {
   schemaVersion: 1,
   version,
-  notes: "宴席预定、积分兑换档位、字号调节和在线更新。",
+  notes: "支持点菜后换桌并重打备菜单；登录页可修改密码；网页、安卓和 Windows 更新。",
   android: artifacts.android,
   windows: artifacts.windows
 };

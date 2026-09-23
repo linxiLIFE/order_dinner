@@ -526,7 +526,7 @@ public class PrinterService extends Service {
     }
 
     private String money(int fen) {
-        return String.format(Locale.CHINA, "￥%.2f", fen / 100.0);
+        return String.format(Locale.CHINA, "%.2f", fen / 100.0);
     }
 
     private String formatTime(String value) {

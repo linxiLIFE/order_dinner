@@ -250,10 +250,35 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   );
   assert.deepEqual(itemCounts.rows[0], { batch_count: 1, item_count: 1, quantity: 2, print_job_count: 2 });
 
+  const transferKey = randomUUID();
+  const transferPayload = { targetTableId: disabledTableId, copies: 2, idempotencyKey: transferKey };
+  const transferred = await request(`/api/orders/${originalOrderId}/transfer`, {
+    token: ownerToken, body: transferPayload
+  });
+  assert.equal(transferred.status, 200, JSON.stringify(transferred.body));
+  assert.equal(transferred.body.order.tableId, disabledTableId);
+  assert.equal(transferred.body.order.items.length, 1, "换桌后保留已点菜品");
+  const repeatedTransfer = await request(`/api/orders/${originalOrderId}/transfer`, {
+    token: ownerToken, body: transferPayload
+  });
+  assert.equal(repeatedTransfer.status, 200, JSON.stringify(repeatedTransfer.body));
+  const transferTables = await request("/api/tables", { token: ownerToken });
+  assert.equal(transferTables.body.tables.find((table) => table.id === tableId).status, "AVAILABLE");
+  assert.equal(transferTables.body.tables.find((table) => table.id === disabledTableId).status, "OCCUPIED");
+  const transferredJobs = await appPool.query(
+    `SELECT COUNT(*)::int AS count FROM print_jobs WHERE order_id = $1 AND kind = 'KITCHEN'`, [originalOrderId]
+  );
+  assert.equal(transferredJobs.rows[0].count, 4, "重试换桌不能重复生成备菜单");
+  const transferredBack = await request(`/api/orders/${originalOrderId}/transfer`, {
+    token: ownerToken,
+    body: { targetTableId: tableId, copies: 2, idempotencyKey: randomUUID() }
+  });
+  assert.equal(transferredBack.status, 200, JSON.stringify(transferredBack.body));
+
   const printerHeaders = { "x-printer-device-id": printerId, "x-printer-token": printerToken };
   const claim = await request("/api/print-jobs/claim", {
     headers: printerHeaders,
-    body: { sessionStartedAt: new Date(Date.now() - 1_000).toISOString() }
+    body: { sessionStartedAt: new Date(Date.now() - 10 * 60_000).toISOString() }
   });
   assert.equal(claim.status, 200, JSON.stringify(claim.body));
   assert.ok(claim.body.job?.id);
@@ -370,6 +395,26 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   assert.equal(cashierOrder.status, 200);
   assert.equal(Object.hasOwn(cashierOrder.body.order, "grossProfitFen"), false);
   assert.equal(Object.hasOwn(cashierOrder.body.order.totals, "costFen"), false);
+
+  const changedCashierPassword = `${cashierPassword}new`;
+  const badPasswordChange = await request("/api/auth/change-password", {
+    body: { username: cashierUsername, oldPassword: "wrong", newPassword: changedCashierPassword }
+  });
+  assert.equal(badPasswordChange.status, 401);
+  const changedPassword = await request("/api/auth/change-password", {
+    body: { username: cashierUsername, oldPassword: cashierPassword, newPassword: changedCashierPassword }
+  });
+  assert.equal(changedPassword.status, 200, JSON.stringify(changedPassword.body));
+  const staleCashierToken = await request("/api/auth/me", { token: cashierLogin.body.token });
+  assert.equal(staleCashierToken.status, 401);
+  const oldPasswordLogin = await request("/api/auth/login", {
+    body: { username: cashierUsername, password: cashierPassword }
+  });
+  assert.equal(oldPasswordLogin.status, 401);
+  const newPasswordLogin = await request("/api/auth/login", {
+    body: { username: cashierUsername, password: changedCashierPassword }
+  });
+  assert.equal(newPasswordLogin.status, 200);
 
   const menuCount = await appPool.query(
     `SELECT COUNT(*)::int AS count FROM dishes d JOIN categories c ON c.id = d.category_id WHERE c.name = '其他'`

@@ -8,7 +8,7 @@ import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { pool, withReadOnlySnapshot, withTransaction, type DbClient } from "./db.js";
 import { migrateAndSeed, pruneExpiredIdempotencyKeys } from "./migrate.js";
-import { applyBanquetDepositForCheckout, banquetRouter, reverseBanquetDepositForSettlement, runBanquetMigrations } from "./banquets.js";
+import { applyBanquetDepositForCheckout, autoOpenDueBanquets, banquetRouter, reverseBanquetDepositForSettlement, runBanquetMigrations } from "./banquets.js";
 import { createToken, requireAuth, requireRole } from "./auth.js";
 import type { AuthenticatedRequest, AuthUser } from "./types.js";
 import {
@@ -391,6 +391,15 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
      WHERE reservation.order_id = $1`,
     [orderId]
   );
+  const banquetPreorder = await client.query<{ pending_print: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM banquet_reservations reservation
+       WHERE reservation.order_id = $1
+         AND jsonb_array_length(COALESCE(reservation.preorder, '[]'::jsonb)) > 0
+         AND reservation.preorder_printed_at IS NULL
+     ) AS pending_print`,
+    [orderId]
+  );
   const activeSettlement = settlementResult.rows.find((row) => row.status === "ACTIVE") as {
     gross_fen?: number;
     gift_fen?: number;
@@ -431,6 +440,7 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     endReason: order.end_reason,
     orderNote: order.order_note,
     banquetDepositBalanceFen: Number(banquetDeposit.rows[0]?.balance_fen || 0),
+    banquetPreorderPendingPrint: Boolean(banquetPreorder.rows[0]?.pending_print),
     items: items.map((item) => ({
       id: item.id,
       dishId: item.dish_id,
@@ -678,7 +688,7 @@ function printerTime(value: unknown): string {
 
 function printerMoney(value: unknown): string {
   const fen = Number(value || 0);
-  return `￥${(Number.isFinite(fen) ? fen / 100 : 0).toFixed(2)}`;
+  return (Number.isFinite(fen) ? fen / 100 : 0).toFixed(2);
 }
 
 function printerItemNote(value: unknown): string {
@@ -772,7 +782,7 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
   const reprintSuffix = rawTitle.includes("补打") ? "（补打）" : "";
   const title = receipt
     ? rawTitle || "结账小票"
-    : `${tableName}~${kind === "RETURN" ? "退菜单" : "备菜单"}${reprintSuffix}`;
+    : `${tableName}~${kind === "RETURN" ? "退菜单" : rawTitle.includes("换桌") ? "换桌备菜单" : "备菜单"}${reprintSuffix}`;
   push(title, center, large);
   if (receipt) push(tableName, center, large);
   push(`人数：${Number(payload.peopleCount) || 0}    顾客：${stringValue(payload.customer, "散客")}`);
@@ -986,6 +996,39 @@ app.post("/api/auth/login", checkLoginRateLimit, async (req, res) => {
   }
 });
 
+app.post("/api/auth/change-password", checkLoginRateLimit, async (req, res) => {
+  try {
+    const parsed = z.object({
+      username: z.string().trim().min(1).max(120),
+      oldPassword: z.string().min(1).max(200),
+      newPassword: z.string().min(8).max(200)
+    }).strict().safeParse(req.body);
+    if (!parsed.success) fail("请填写账号、旧密码和至少 8 位的新密码");
+    if (parsed.data.oldPassword === parsed.data.newPassword) fail("新密码不能与旧密码相同");
+    const employee = await pool.query<{ id: string; password_hash: string }>(
+      `SELECT id, password_hash FROM employees WHERE username = $1 AND active = true`, [parsed.data.username]
+    );
+    if (!employee.rows[0] || !(await bcrypt.compare(parsed.data.oldPassword, employee.rows[0].password_hash))) {
+      recordLoginFailure(req);
+      fail("账号或旧密码不正确", 401);
+    }
+    const passwordHash = await bcrypt.hash(parsed.data.newPassword, 12);
+    await withTransaction(async (client) => {
+      const updated = await client.query<{ id: string }>(
+        `UPDATE employees SET password_hash = $1, auth_version = auth_version + 1, updated_at = now()
+         WHERE id = $2 AND password_hash = $3 RETURNING id`,
+        [passwordHash, employee.rows[0].id, employee.rows[0].password_hash]
+      );
+      if (!updated.rows[0]) fail("密码已在其他设备修改，请重新验证旧密码", 409);
+      await logOperation(client, employee.rows[0].id, "CHANGE_PASSWORD", "EMPLOYEE", employee.rows[0].id, {});
+    });
+    clearAccountLoginFailures(req);
+    res.json({ ok: true });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
 app.get("/api/auth/me", requireAuth, (req: AuthenticatedRequest, res) => {
   res.json({ user: currentUser(req) });
 });
@@ -1069,7 +1112,7 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
               ,(SELECT COUNT(*)::int FROM banquet_reservations br
                 WHERE br.table_id = t.id AND br.status = 'RESERVED' AND br.ends_at > now()) AS banquet_reservation_count
               ,(SELECT MIN(br.starts_at) FROM banquet_reservations br
-                WHERE br.table_id = t.id AND br.status = 'RESERVED' AND br.ends_at > now()) AS next_banquet_reservation_at
+                WHERE br.table_id = t.id AND br.status = 'RESERVED' AND br.starts_at >= now()) AS next_banquet_reservation_at
        FROM restaurant_tables t
        LEFT JOIN orders o ON o.table_id = t.id AND o.status = 'OPEN'
        LEFT JOIN customers c ON c.id = o.customer_id
@@ -1163,6 +1206,59 @@ app.post("/api/tables/:tableId/open", requireAuth, async (req: AuthenticatedRequ
       tableId
     });
     res.status(201).json({ order: response });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.post("/api/orders/:orderId/transfer", requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const orderId = routeParam(req, "orderId");
+    const requestKey = requiredIdempotencyKey(req.body?.idempotencyKey);
+    const requestPayload = idempotencyPayload(req.body);
+    const targetTableId = text(requestPayload.targetTableId);
+    if (!/^[0-9a-f-]{36}$/i.test(targetTableId)) fail("请选择目标桌台");
+    const copies = requestPayload.copies === undefined ? 2
+      : requirePositiveInteger(requestPayload.copies, "备菜单打印份数必须在1到20份之间", 20);
+    const response = await withTransaction(async (client) => {
+      const previous = await readIdempotent(client, `transfer:${orderId}`, requestKey, user.id, requestPayload, user.role === "OWNER");
+      if (previous) return previous;
+      const order = await currentOrder(client, orderId, true);
+      if (order.status !== "OPEN" || !order.table_id) fail("只有进行中的桌台订单可以换桌", 409);
+      if (order.table_id === targetTableId) fail("请选择其他桌台");
+      const tables = await client.query<{ id: string; number: number; name: string; status: string }>(
+        `SELECT id, number, name, status FROM restaurant_tables WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
+        [[order.table_id, targetTableId]]
+      );
+      const target = tables.rows.find((table) => table.id === targetTableId);
+      if (!target) fail("目标桌台不存在", 404);
+      if (target.status !== "AVAILABLE") fail("目标桌台已被占用或停用，请刷新桌台状态", 409);
+      const reservation = await client.query<{ id: string }>(
+        `SELECT id FROM banquet_reservations WHERE table_id = $1 AND status = 'RESERVED'
+         AND starts_at <= now() AND ends_at > now() LIMIT 1`, [targetTableId]
+      );
+      if (reservation.rows[0]) fail("目标桌台当前有宴席预定，请选择其他桌台", 409);
+      await client.query(
+        `UPDATE orders SET table_id = $1, table_number_snapshot = $2, table_name_snapshot = $3,
+         updated_at = now() WHERE id = $4`,
+        [target.id, target.number, target.name, orderId]
+      );
+      await client.query(`UPDATE restaurant_tables SET status = 'AVAILABLE', updated_at = now() WHERE id = $1`, [order.table_id]);
+      await client.query(`UPDATE restaurant_tables SET status = 'OCCUPIED', updated_at = now() WHERE id = $1`, [target.id]);
+      const details = await orderDetails(client, orderId, user.role === "OWNER");
+      const items = (await orderItems(client, orderId)).filter((item) => item.quantity > item.returned_quantity)
+        .map((item) => ({ name: item.dish_name, quantity: item.quantity - item.returned_quantity,
+          unit: item.unit, priceFen: item.price_fen, note: item.note }));
+      if (items.length) await makePrintJobs(client, orderId, null, "KITCHEN",
+        printOrderPayload(details, items, "换桌备菜单"), copies);
+      await logOperation(client, user.id, "TRANSFER_TABLE", "ORDER", orderId,
+        { fromTableId: order.table_id, toTableId: target.id, copies: items.length ? copies : 0 });
+      await saveIdempotent(client, `transfer:${orderId}`, requestKey, user.id, details, requestPayload);
+      return details;
+    });
+    broadcastUpdate({ type: "order.updated", orderId, tableId: targetTableId });
+    res.json({ order: response });
   } catch (error) {
     publicError(res, error);
   }
@@ -1400,6 +1496,14 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
       if (previous) return previous;
       const order = await currentOrder(client, orderId, true);
       if (order.status !== "OPEN") fail("订单已结账或已撤销，请刷新后操作");
+      const banquetPreorder = await client.query<{ id: string }>(
+        `SELECT id FROM banquet_reservations
+         WHERE order_id = $1
+           AND jsonb_array_length(COALESCE(preorder, '[]'::jsonb)) > 0
+           AND preorder_printed_at IS NULL
+         FOR UPDATE`,
+        [orderId]
+      );
       const batch = await client.query<{ id: string; batch_no: number }>(
         `INSERT INTO order_batches (order_id, batch_no, kind, created_by)
          VALUES ($1, $2, $3, $4) RETURNING id, batch_no`,
@@ -1437,13 +1541,22 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
         inserted.push({ id: item.rows[0].id, name: dish.name, unit: dish.unit, priceFen: dish.price_fen, quantity, note: options.note });
       }
       await client.query(`UPDATE orders SET order_version = order_version + 1, updated_at = now() WHERE id = $1`, [orderId]);
+      const printItems = banquetPreorder.rows[0]
+        ? (await orderItems(client, orderId)).map((item) => ({
+            id: item.id, name: item.dish_name, unit: item.unit, priceFen: item.price_fen,
+            quantity: item.quantity, note: item.note
+          }))
+        : inserted;
+      if (banquetPreorder.rows[0]) {
+        await client.query(`UPDATE banquet_reservations SET preorder_printed_at = now(), updated_at = now() WHERE id = $1`, [banquetPreorder.rows[0].id]);
+      }
       const details = await orderDetails(client, orderId, user.role === "OWNER");
       await makePrintJobs(
         client,
         orderId,
         batch.rows[0].id,
         "KITCHEN",
-        { ...printOrderPayload(details, inserted, "备菜单"), batchNo: batch.rows[0].batch_no },
+        { ...printOrderPayload(details, printItems, "备菜单"), batchNo: batch.rows[0].batch_no },
         printCopies
       );
       await logOperation(client, user.id, "ADD_ITEMS", "ORDER", orderId, { batchNo: batch.rows[0].batch_no, items: inserted });
@@ -1454,6 +1567,57 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
       type: "order.updated",
       orderId,
       tableId: ((response as Record<string, unknown>).tableId as string | null) ?? null
+    });
+    res.status(201).json({ order: response });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.post("/api/orders/:orderId/banquet-preorder/print", requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const orderId = routeParam(req, "orderId");
+    const requestKey = requiredIdempotencyKey(req.body?.idempotencyKey);
+    const requestPayload = idempotencyPayload(req.body);
+    const printCopies = requestPayload.copies === undefined
+      ? 2
+      : requirePositiveInteger(requestPayload.copies, "备菜单打印份数必须在1到20份之间", 20);
+    const response = await withTransaction(async (client) => {
+      const previous = await readIdempotent(client, `banquet-print:${orderId}`, requestKey, user.id, requestPayload, user.role === "OWNER");
+      if (previous) return previous;
+      const order = await currentOrder(client, orderId, true);
+      if (order.status !== "OPEN") fail("订单已结账或已撤销，请刷新后操作");
+      const reservation = await client.query<{ id: string }>(
+        `SELECT id FROM banquet_reservations
+         WHERE order_id = $1
+           AND jsonb_array_length(COALESCE(preorder, '[]'::jsonb)) > 0
+           AND preorder_printed_at IS NULL
+         FOR UPDATE`,
+        [orderId]
+      );
+      if (!reservation.rows[0]) fail("宴席预点菜已经打印或不存在", 409);
+      const batch = await client.query<{ id: string; batch_no: number }>(
+        `SELECT id, batch_no FROM order_batches WHERE order_id = $1 ORDER BY batch_no, id LIMIT 1`, [orderId]
+      );
+      if (!batch.rows[0]) fail("宴席预点菜批次不存在", 409);
+      const printItems = (await orderItems(client, orderId)).map((item) => ({
+        id: item.id, name: item.dish_name, unit: item.unit, priceFen: item.price_fen,
+        quantity: item.quantity, note: item.note
+      }));
+      await client.query(`UPDATE banquet_reservations SET preorder_printed_at = now(), updated_at = now() WHERE id = $1`, [reservation.rows[0].id]);
+      const details = await orderDetails(client, orderId, user.role === "OWNER");
+      await makePrintJobs(
+        client,
+        orderId,
+        batch.rows[0].id,
+        "KITCHEN",
+        { ...printOrderPayload(details, printItems, "备菜单"), batchNo: batch.rows[0].batch_no },
+        printCopies
+      );
+      await logOperation(client, user.id, "PRINT_BANQUET_PREORDER", "ORDER", orderId, { copies: printCopies, itemCount: printItems.length });
+      await saveIdempotent(client, `banquet-print:${orderId}`, requestKey, user.id, details, requestPayload);
+      return details;
     });
     res.status(201).json({ order: response });
   } catch (error) {
@@ -1800,11 +1964,17 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
         [user.id, settlement.id]
       );
       await client.query(`UPDATE orders SET status = 'REVERSED', updated_at = now() WHERE id = $1`, [orderId]);
+      if (original.table_id) {
+        await client.query(`SELECT id FROM restaurant_tables WHERE id = $1 FOR UPDATE`, [original.table_id]);
+      }
       const newOrder = await client.query<{ id: string }>(
         `INSERT INTO orders
          (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, points_earning_enabled, status,
           parent_order_id, created_by, business_date, order_note, order_version)
-         SELECT source.table_id, COALESCE(source.table_number_snapshot, t.number), COALESCE(source.table_name_snapshot, t.name),
+         SELECT CASE WHEN t.status = 'DISABLED' OR EXISTS (
+                  SELECT 1 FROM orders occupied WHERE occupied.table_id = source.table_id AND occupied.status = 'OPEN'
+                ) THEN NULL ELSE source.table_id END,
+                COALESCE(source.table_number_snapshot, t.number), COALESCE(source.table_name_snapshot, t.name),
                 source.customer_id, source.guest_label, source.people_count, source.points_earning_enabled, 'OPEN', $1, $2,
                 source.business_date, source.order_note,
                 COALESCE((SELECT MAX(batch_no) FROM order_batches WHERE order_id = source.id), 0)
@@ -2913,6 +3083,11 @@ async function start(): Promise<void> {
   }, process.env.NODE_ENV === "test" ? 250 : 60 * 1000);
   printClaimCleanup.unref();
   void expireStalePrintClaims().catch((error) => console.error("打印任务超时核对失败", error));
+  const banquetAutoOpen = setInterval(() => {
+    void autoOpenDueBanquets().catch((error) => console.error("宴席自动开台检查失败", error));
+  }, process.env.NODE_ENV === "test" ? 250 : 30 * 1000);
+  banquetAutoOpen.unref();
+  void autoOpenDueBanquets().catch((error) => console.error("宴席自动开台检查失败", error));
   app.listen(port, () => {
     console.log(`餐厅点单系统已启动：http://0.0.0.0:${port}`);
   });

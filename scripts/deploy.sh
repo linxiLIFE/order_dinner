@@ -9,6 +9,11 @@ ssh_host="${SSH_HOST:-20.48.27.179}"
 ssh_interface="${SSH_INTERFACE:-en0}"
 remote_root="/opt/order-dinner"
 public_host="dinner.20-48-27-179.sslip.io"
+release_version="$(node -p 'require("./package.json").version')"
+[[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "版本号格式不正确" >&2; exit 1; }
+[[ -f updates/latest.json && -d "updates/$release_version" ]] || { echo "缺少当前版本更新文件" >&2; exit 1; }
+manifest_version="$(node -p 'require("./updates/latest.json").version')"
+[[ "$manifest_version" == "$release_version" ]] || { echo "更新清单与项目版本不一致" >&2; exit 1; }
 ssh_args=(-B "$ssh_interface" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o IdentitiesOnly=yes -o ConnectTimeout=20 -i "$ssh_key")
 scp_args=(-o BindInterface="$ssh_interface" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o IdentitiesOnly=yes -o ConnectTimeout=20 -i "$ssh_key")
 
@@ -32,9 +37,12 @@ COPYFILE_DISABLE=1 tar \
   --exclude='./ios' \
   --exclude='./data' \
   --exclude='./backups' \
+  --exclude='./updates' \
   --exclude='./.env' \
   --exclude='./.env.*' \
   -czf - . | ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "tar -xzf - -C '$remote_release'"
+ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "mkdir -p '$remote_release/updates'"
+COPYFILE_DISABLE=1 tar -C updates -czf - latest.json "$release_version" | ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "tar -xzf - -C '$remote_release/updates'"
 if ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "test -f '$remote_root/.env'"; then
   echo "远端已有 .env，保留现有数据库与登录凭据"
 else
@@ -96,4 +104,22 @@ ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo chmod 644 /etc/cron.d/order-din
 echo "线上健康检查"
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "curl --fail --silent --show-error --resolve '$public_host:1314:127.0.0.1' 'https://$public_host:1314/healthz'"
 echo
+ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "CURRENT_RELEASE='$remote_release' REMOTE_ROOT='$remote_root' bash -s" <<'REMOTE_CLEANUP'
+set -euo pipefail
+mounted_updates="$(sudo docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' order-dinner-app)"
+printf '%s\n' "$mounted_updates" | grep -Fxq "$CURRENT_RELEASE/updates"
+grep -Fq "$CURRENT_RELEASE/scripts/backup.sh" /etc/cron.d/order-dinner-backup
+trash_root="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
+mkdir -p "$trash_root/files" "$trash_root/info"
+chmod 700 "$trash_root" "$trash_root/files" "$trash_root/info"
+for old_release in "$REMOTE_ROOT/.deploy/releases"/*; do
+  [[ -d "$old_release" && "$old_release" != "$CURRENT_RELEASE" ]] || continue
+  trash_name="order-dinner-release-$(basename "$old_release")"
+  if [[ -e "$trash_root/files/$trash_name" ]]; then
+    trash_name="$trash_name-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  fi
+  mv "$old_release" "$trash_root/files/$trash_name"
+  printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' "$old_release" "$(date +%Y-%m-%dT%H:%M:%S)" > "$trash_root/info/$trash_name.trashinfo"
+done
+REMOTE_CLEANUP
 echo "部署完成：https://$public_host:1314"

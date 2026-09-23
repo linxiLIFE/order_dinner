@@ -1,6 +1,6 @@
 {
   "name": "order-dinner",
-  "version": "1.0.10",
+  "version": "1.0.12",
   "private": true,
   "description": "餐厅员工点单系统",
   "type": "module",
