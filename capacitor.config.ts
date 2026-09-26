@@ -5,7 +5,7 @@ const config: CapacitorConfig = {
   appName: "餐厅点单台",
   webDir: "web/dist",
   server: {
-    url: process.env.ORDER_DINNER_URL || "https://dinner.20-48-27-179.sslip.io:1314",
+    url: process.env.ORDER_DINNER_URL || "https://43.142.138.108:1316",
     cleartext: false
   }
 };

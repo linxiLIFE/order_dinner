@@ -203,6 +203,8 @@ type ItemRow = {
   unit: string;
   price_fen: number;
   cost_fen: number;
+  points_earning_enabled: boolean;
+  current_category_points_earning_enabled?: boolean | null;
   quantity: number;
   gifted_quantity: number;
   returned_quantity: number;
@@ -329,9 +331,11 @@ async function replaceDishOptionGroups(client: DbClient, dishId: string, rawGrou
 
 async function orderItems(client: DbClient, orderId: string): Promise<ItemRow[]> {
   const result = await client.query<ItemRow>(
-    `SELECT oi.*, ob.batch_no, ob.kind AS batch_kind
+    `SELECT oi.*, ob.batch_no, ob.kind AS batch_kind, c.points_earning_enabled AS current_category_points_earning_enabled
      FROM order_items oi
      JOIN order_batches ob ON ob.id = oi.batch_id
+     LEFT JOIN dishes d ON d.id = oi.dish_id
+     LEFT JOIN categories c ON c.id = d.category_id
      WHERE oi.order_id = $1
      ORDER BY ob.batch_no, oi.created_at, oi.id`,
     [orderId]
@@ -552,7 +556,7 @@ async function logOperation(
 
 async function makePrintJobs(
   client: DbClient,
-  orderId: string,
+  orderId: string | null,
   batchId: string | null,
   kind: "KITCHEN" | "RETURN" | "RECEIPT",
   payload: unknown,
@@ -566,6 +570,162 @@ async function makePrintJobs(
       [orderId, batchId, kind, copyNo, JSON.stringify(printPayload)]
     );
   }
+}
+
+async function permanentlyDeleteOrderAndBanquetRecords(
+  client: DbClient,
+  requestedOrderIds: string[],
+  requestedReservationIds: string[],
+  employeeId: string
+): Promise<{ orderIds: string[]; reservationIds: string[]; tableIds: string[] }> {
+  const orderIds = Array.from(new Set(requestedOrderIds));
+  const reservationIds = Array.from(new Set(requestedReservationIds));
+  const orderResult = orderIds.length
+    ? await client.query<{ id: string; table_id: string | null }>(
+        `SELECT id, table_id FROM orders WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`, [orderIds]
+      )
+    : { rows: [] as Array<{ id: string; table_id: string | null }> };
+  if (orderResult.rows.length !== orderIds.length) fail("订单不存在或已被删除", 404);
+
+  const reservationResult = await client.query<{ id: string; order_id: string | null; table_id: string | null }>(
+    `SELECT id, order_id, table_id FROM banquet_reservations
+     WHERE id = ANY($1::uuid[]) OR order_id = ANY($2::uuid[])
+     ORDER BY id FOR UPDATE`,
+    [reservationIds, orderIds]
+  );
+  if (reservationResult.rows.filter((row) => reservationIds.includes(row.id)).length !== reservationIds.length) {
+    fail("宴席预定不存在或已被删除", 404);
+  }
+  for (const row of reservationResult.rows) {
+    if (row.order_id && !orderIds.includes(row.order_id)) orderIds.push(row.order_id);
+    if (!reservationIds.includes(row.id)) reservationIds.push(row.id);
+  }
+  if (orderIds.length !== orderResult.rows.length) {
+    const linkedOrderResult = await client.query<{ id: string; table_id: string | null }>(
+      `SELECT id, table_id FROM orders WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`, [orderIds]
+    );
+    if (linkedOrderResult.rows.length !== orderIds.length) fail("宴席关联订单不存在，请先核对数据", 409);
+    orderResult.rows.push(...linkedOrderResult.rows.filter((row) => !orderResult.rows.some((current) => current.id === row.id)));
+  }
+
+  const settlementResult = orderIds.length
+    ? await client.query<{ id: string }>(`SELECT id FROM settlements WHERE order_id = ANY($1::uuid[])`, [orderIds])
+    : { rows: [] as Array<{ id: string }> };
+  const settlementIds = settlementResult.rows.map((row) => row.id);
+  const relatedPrintJobs = await client.query<{ id: string; status: string }>(
+    `SELECT id, status FROM print_jobs
+     WHERE order_id = ANY($1::uuid[])
+        OR batch_id IN (SELECT id FROM order_batches WHERE order_id = ANY($1::uuid[]))
+        OR payload->>'reservationId' = ANY($2::text[])
+     ORDER BY id FOR UPDATE`,
+    [orderIds, reservationIds]
+  );
+  if (relatedPrintJobs.rows.some((job) => job.status === "CLAIMED")) fail("有打印任务正在发送，请稍后再永久删除", 409);
+
+  const customerResult = await client.query<{ customer_id: string }>(
+    `SELECT DISTINCT customer_id FROM (
+       SELECT customer_id FROM orders WHERE id = ANY($1::uuid[]) AND customer_id IS NOT NULL
+       UNION
+       SELECT customer_id FROM points_ledger
+        WHERE (order_id = ANY($1::uuid[]) OR settlement_id = ANY($2::uuid[])) AND customer_id IS NOT NULL
+     ) affected`,
+    [orderIds, settlementIds]
+  );
+  const customerIds = customerResult.rows.map((row) => row.customer_id);
+  if (customerIds.length) {
+    await client.query(`SELECT id FROM customers WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`, [customerIds]);
+    const wouldGoNegative = await client.query(
+      `WITH remaining AS (
+         SELECT SUM(delta) OVER (PARTITION BY customer_id ORDER BY created_at, id) AS running_balance
+         FROM points_ledger
+         WHERE customer_id = ANY($1::uuid[])
+           AND (order_id IS NULL OR NOT (order_id = ANY($2::uuid[])))
+           AND (settlement_id IS NULL OR NOT (settlement_id = ANY($3::uuid[])))
+       )
+       SELECT 1 FROM remaining WHERE running_balance < 0 LIMIT 1`,
+      [customerIds, orderIds, settlementIds]
+    );
+    if (wouldGoNegative.rows[0]) fail("删除后会使后续积分流水余额为负，无法安全删除", 409);
+  }
+
+  const relatedIds = [...orderIds, ...reservationIds];
+  const idPatterns = relatedIds.map((id) => `%${id}%`);
+  const reservationTableIds = reservationResult.rows.map((row) => row.table_id).filter((id): id is string => Boolean(id));
+  await client.query(
+    `DELETE FROM idempotency_keys WHERE scope LIKE ANY($1::text[]) OR response::text LIKE ANY($1::text[])`,
+    [idPatterns]
+  );
+  await client.query(
+    `DELETE FROM operation_logs
+     WHERE entity_id = ANY($1::uuid[])
+        OR entity_id IN (SELECT id FROM order_items WHERE order_id = ANY($2::uuid[]))
+        OR detail->>'orderId' = ANY($3::text[])
+        OR detail->>'reservationId' = ANY($4::text[])`,
+    [relatedIds, orderIds, orderIds, reservationIds]
+  );
+  if (reservationIds.length) {
+    await client.query(
+      `UPDATE banquet_deposit_ledger SET reverses_ledger_id = NULL
+       WHERE reverses_ledger_id IN (SELECT id FROM banquet_deposit_ledger WHERE reservation_id = ANY($1::uuid[]))`,
+      [reservationIds]
+    );
+    await client.query(`DELETE FROM banquet_deposit_ledger WHERE reservation_id = ANY($1::uuid[])`, [reservationIds]);
+    await client.query(`DELETE FROM banquet_reservations WHERE id = ANY($1::uuid[])`, [reservationIds]);
+  }
+  if (orderIds.length || settlementIds.length) {
+    await client.query(
+      `DELETE FROM points_ledger WHERE order_id = ANY($1::uuid[]) OR settlement_id = ANY($2::uuid[])`,
+      [orderIds, settlementIds]
+    );
+  }
+  await client.query(
+    `DELETE FROM print_jobs
+     WHERE order_id = ANY($1::uuid[])
+        OR batch_id IN (SELECT id FROM order_batches WHERE order_id = ANY($1::uuid[]))
+        OR payload->>'reservationId' = ANY($2::text[])`,
+    [orderIds, reservationIds]
+  );
+  if (orderIds.length) {
+    await client.query(`DELETE FROM order_items WHERE order_id = ANY($1::uuid[])`, [orderIds]);
+    await client.query(`DELETE FROM order_batches WHERE order_id = ANY($1::uuid[])`, [orderIds]);
+    if (settlementIds.length) await client.query(`DELETE FROM settlements WHERE id = ANY($1::uuid[])`, [settlementIds]);
+    await client.query(`UPDATE orders SET parent_order_id = NULL WHERE parent_order_id = ANY($1::uuid[])`, [orderIds]);
+    await client.query(`DELETE FROM orders WHERE id = ANY($1::uuid[])`, [orderIds]);
+  }
+  if (customerIds.length) {
+    await client.query(
+      `WITH balances AS (
+         SELECT id, SUM(delta) OVER (PARTITION BY customer_id ORDER BY created_at, id) AS balance_after
+         FROM points_ledger WHERE customer_id = ANY($1::uuid[])
+       )
+       UPDATE points_ledger ledger SET balance_after = balances.balance_after
+       FROM balances WHERE ledger.id = balances.id`,
+      [customerIds]
+    );
+    await client.query(
+      `UPDATE customers customer SET points_balance = COALESCE((
+         SELECT balance_after FROM points_ledger
+         WHERE customer_id = customer.id ORDER BY created_at DESC, id DESC LIMIT 1
+       ), 0), updated_at = now()
+       WHERE id = ANY($1::uuid[])`,
+      [customerIds]
+    );
+  }
+  const tableIds = Array.from(new Set([
+    ...orderResult.rows.map((row) => row.table_id).filter((id): id is string => Boolean(id)),
+    ...reservationTableIds
+  ]));
+  if (tableIds.length) {
+    await client.query(
+      `UPDATE restaurant_tables table_row SET status = 'AVAILABLE', updated_at = now()
+       WHERE id = ANY($1::uuid[]) AND status <> 'DISABLED'
+         AND NOT EXISTS (SELECT 1 FROM orders WHERE table_id = table_row.id AND status = 'OPEN')`,
+      [tableIds]
+    );
+  }
+  for (const id of orderIds) await logOperation(client, employeeId, "PERMANENT_DELETE_ORDER", "ORDER", id, { reservationCount: reservationIds.length });
+  for (const id of reservationIds) await logOperation(client, employeeId, "PERMANENT_DELETE_BANQUET", "BANQUET", id, { orderCount: orderIds.length });
+  return { orderIds, reservationIds, tableIds };
 }
 
 async function expireStalePrintClaims(client: DbClient = pool): Promise<void> {
@@ -893,6 +1053,7 @@ const settingsSchema = z.object({
   points_allow_below_minimum: z.boolean().optional(),
   points_redeem_points: z.number().int().min(1).max(1_000_000_000).optional(),
   points_redeem_fen: z.number().int().min(1).max(1_000_000_000).optional(),
+  banquet_preorder_reminder_minutes: z.number().int().min(1).max(1440).optional(),
   printer_device_id: z.string().trim().max(120).optional(),
   printer_device_name: z.string().trim().max(120).optional()
 }).strict();
@@ -1220,7 +1381,7 @@ app.post("/api/orders/:orderId/transfer", requireAuth, async (req: Authenticated
     const targetTableId = text(requestPayload.targetTableId);
     if (!/^[0-9a-f-]{36}$/i.test(targetTableId)) fail("请选择目标桌台");
     const copies = requestPayload.copies === undefined ? 2
-      : requirePositiveInteger(requestPayload.copies, "备菜单打印份数必须在1到20份之间", 20);
+      : requireNonNegativeInteger(requestPayload.copies, "备菜单打印份数必须在0到20份之间", 20);
     const response = await withTransaction(async (client) => {
       const previous = await readIdempotent(client, `transfer:${orderId}`, requestKey, user.id, requestPayload, user.role === "OWNER");
       if (previous) return previous;
@@ -1250,7 +1411,7 @@ app.post("/api/orders/:orderId/transfer", requireAuth, async (req: Authenticated
       const items = (await orderItems(client, orderId)).filter((item) => item.quantity > item.returned_quantity)
         .map((item) => ({ name: item.dish_name, quantity: item.quantity - item.returned_quantity,
           unit: item.unit, priceFen: item.price_fen, note: item.note }));
-      if (items.length) await makePrintJobs(client, orderId, null, "KITCHEN",
+      if (items.length && copies > 0) await makePrintJobs(client, orderId, null, "KITCHEN",
         printOrderPayload(details, items, "换桌备菜单"), copies);
       await logOperation(client, user.id, "TRANSFER_TABLE", "ORDER", orderId,
         { fromTableId: order.table_id, toTableId: target.id, copies: items.length ? copies : 0 });
@@ -1425,6 +1586,23 @@ app.get("/api/orders/:orderId", requireAuth, async (req, res) => {
   }
 });
 
+app.delete("/api/orders/:orderId", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const orderId = routeParam(req, "orderId");
+    const removed = await withTransaction((client) =>
+      permanentlyDeleteOrderAndBanquetRecords(client, [orderId], [], user.id)
+    );
+    for (const removedOrderId of removed.orderIds) {
+      broadcastUpdate({ type: "order.updated", orderId: removedOrderId, tableId: null });
+    }
+    for (const tableId of removed.tableIds) broadcastUpdate({ type: "table.updated", tableId });
+    res.json({ ok: true, deletedOrderCount: removed.orderIds.length, deletedBanquetCount: removed.reservationIds.length });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
 app.patch("/api/orders/:orderId/note", requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const user = currentUser(req);
@@ -1488,7 +1666,7 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
     const requestPayload = idempotencyPayload(req.body);
     const printCopies = requestPayload.copies === undefined
       ? 2
-      : requirePositiveInteger(requestPayload.copies, "备菜单打印份数必须在1到20份之间", 20);
+      : requireNonNegativeInteger(requestPayload.copies, "备菜单打印份数必须在0到20份之间", 20);
     const rawItems = Array.isArray(requestPayload.items) ? requestPayload.items : [];
     if (!rawItems.length) fail("请选择至少一道菜品");
     const response = await withTransaction(async (client) => {
@@ -1522,8 +1700,10 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
           price_fen: number;
           cost_fen: number;
           category_name: string | null;
+          points_earning_enabled: boolean | null;
         }>(
-          `SELECT d.id, d.name, d.pinyin, d.unit, d.price_fen, d.cost_fen, c.name AS category_name
+          `SELECT d.id, d.name, d.pinyin, d.unit, d.price_fen, d.cost_fen, c.name AS category_name,
+                  c.points_earning_enabled
            FROM dishes d LEFT JOIN categories c ON c.id = d.category_id
            WHERE d.id = $1 AND d.on_sale = true`,
           [dishId]
@@ -1534,9 +1714,10 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
         const options = optionSelections(groups, raw?.options, raw?.note);
         const item = await client.query<{ id: string }>(
           `INSERT INTO order_items
-           (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, quantity, note, option_snapshot)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb) RETURNING id`,
-          [batch.rows[0].id, orderId, dish.id, dish.name, dish.category_name || "未分类", dish.unit, dish.price_fen, dish.cost_fen, quantity, options.note, JSON.stringify(options.snapshot)]
+           (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, points_earning_enabled, quantity, note, option_snapshot)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb) RETURNING id`,
+          [batch.rows[0].id, orderId, dish.id, dish.name, dish.category_name || "未分类", dish.unit, dish.price_fen, dish.cost_fen,
+            dish.points_earning_enabled !== false, quantity, options.note, JSON.stringify(options.snapshot)]
         );
         inserted.push({ id: item.rows[0].id, name: dish.name, unit: dish.unit, priceFen: dish.price_fen, quantity, note: options.note });
       }
@@ -1547,19 +1728,21 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
             quantity: item.quantity, note: item.note
           }))
         : inserted;
-      if (banquetPreorder.rows[0]) {
+      if (banquetPreorder.rows[0] && printCopies > 0) {
         await client.query(`UPDATE banquet_reservations SET preorder_printed_at = now(), updated_at = now() WHERE id = $1`, [banquetPreorder.rows[0].id]);
       }
       const details = await orderDetails(client, orderId, user.role === "OWNER");
-      await makePrintJobs(
-        client,
-        orderId,
-        batch.rows[0].id,
-        "KITCHEN",
-        { ...printOrderPayload(details, printItems, "备菜单"), batchNo: batch.rows[0].batch_no },
-        printCopies
-      );
-      await logOperation(client, user.id, "ADD_ITEMS", "ORDER", orderId, { batchNo: batch.rows[0].batch_no, items: inserted });
+      if (printCopies > 0) {
+        await makePrintJobs(
+          client,
+          orderId,
+          batch.rows[0].id,
+          "KITCHEN",
+          { ...printOrderPayload(details, printItems, "备菜单"), batchNo: batch.rows[0].batch_no },
+          printCopies
+        );
+      }
+      await logOperation(client, user.id, "ADD_ITEMS", "ORDER", orderId, { batchNo: batch.rows[0].batch_no, copies: printCopies, items: inserted });
       await saveIdempotent(client, `items:${orderId}`, requestKey, user.id, details, requestPayload);
       return details;
     });
@@ -1574,6 +1757,106 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
   }
 });
 
+app.post("/api/banquets/reservations/:reservationId/preorder/print", requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const reservationId = routeParam(req, "reservationId");
+    const requestKey = requiredIdempotencyKey(req.body?.idempotencyKey);
+    const requestPayload = idempotencyPayload(req.body);
+    const copies = requestPayload.copies === undefined
+      ? 2
+      : requireNonNegativeInteger(requestPayload.copies, "备菜单打印份数必须在0到20份之间", 20);
+    const result = await withTransaction(async (client) => {
+      const scope = `banquet-preorder-print:${reservationId}`;
+      const previous = await readIdempotent(client, scope, requestKey, user.id, requestPayload, user.role === "OWNER");
+      if (previous) return previous;
+      const reservationResult = await client.query<{
+        id: string; status: string; starts_at: string; customer_name: string; customer_phone: string | null;
+        people_count: number; table_name: string; table_number: number | null; note: string; preorder: Array<Record<string, unknown>>;
+      }>(
+        `SELECT r.id, r.status, r.starts_at, r.customer_name, r.customer_phone, r.people_count,
+                r.note, COALESCE(t.name, h.name, '未指定桌台') AS table_name, t.number AS table_number, r.preorder
+         FROM banquet_reservations r
+         LEFT JOIN restaurant_tables t ON t.id = r.table_id
+         LEFT JOIN banquet_halls h ON h.id = r.hall_id
+         WHERE r.id = $1 FOR UPDATE OF r`,
+        [reservationId]
+      );
+      const reservation = reservationResult.rows[0];
+      if (!reservation) fail("宴席预定不存在", 404);
+      if (reservation.status !== "RESERVED") fail("只有未开台的宴席可以提前打印预点菜单", 409);
+      const items = Array.isArray(reservation.preorder) ? reservation.preorder : [];
+      if (!items.length) fail("请先保留预点菜，再打印备菜单", 409);
+      if (copies > 0) {
+        const details = {
+          id: reservation.id,
+          tableNumber: reservation.table_number,
+          tableName: reservation.table_name,
+          peopleCount: reservation.people_count,
+          customer: { name: reservation.customer_name || "宴席客人", phone: reservation.customer_phone },
+          orderNote: reservation.note,
+          openedAt: reservation.starts_at,
+          settledAt: null
+        };
+        const printItems = items.map((item) => ({
+          name: text(item.name, "未命名菜品"),
+          quantity: Number(item.quantity || 0),
+          unit: text(item.unit, "份"),
+          priceFen: Number(item.priceFen || 0),
+          note: text(item.note)
+        }));
+        await makePrintJobs(
+          client,
+          null,
+          null,
+          "KITCHEN",
+          { ...printOrderPayload(details, printItems, "宴席预点菜备菜单"), reservationId },
+          copies
+        );
+        await client.query(`UPDATE banquet_reservations SET preorder_printed_at = now(), updated_at = now() WHERE id = $1`, [reservationId]);
+        await logOperation(client, user.id, "PRINT_BANQUET_PREORDER", "BANQUET", reservationId, { copies, itemCount: items.length });
+      }
+      const response = { ok: true, copies };
+      await saveIdempotent(client, scope, requestKey, user.id, response, requestPayload);
+      return response;
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.delete("/api/banquets/reservations/:reservationId", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const reservationId = routeParam(req, "reservationId");
+    const removed = await withTransaction(async (client) => {
+      const before = await client.query<{ order_id: string | null }>(
+        `SELECT order_id FROM banquet_reservations WHERE id = $1`, [reservationId]
+      );
+      if (!before.rows[0]) fail("宴席预定不存在或已被删除", 404);
+      const orderId = before.rows[0].order_id;
+      if (orderId) {
+        const order = await client.query(`SELECT id FROM orders WHERE id = $1 FOR UPDATE`, [orderId]);
+        if (!order.rows[0]) fail("宴席关联订单不存在或已被删除", 409);
+      }
+      const reservation = await client.query<{ order_id: string | null }>(
+        `SELECT order_id FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
+      );
+      if (!reservation.rows[0]) fail("宴席预定不存在或已被删除", 404);
+      if (reservation.rows[0].order_id !== orderId) fail("宴席状态刚刚发生变化，请刷新后重试", 409);
+      return permanentlyDeleteOrderAndBanquetRecords(client, orderId ? [orderId] : [], [reservationId], user.id);
+    });
+    for (const orderId of removed.orderIds) {
+      broadcastUpdate({ type: "order.updated", orderId, tableId: null });
+    }
+    for (const tableId of removed.tableIds) broadcastUpdate({ type: "table.updated", tableId });
+    res.json({ ok: true, deletedOrderCount: removed.orderIds.length, deletedBanquetCount: removed.reservationIds.length });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
 app.post("/api/orders/:orderId/banquet-preorder/print", requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const user = currentUser(req);
@@ -1582,7 +1865,7 @@ app.post("/api/orders/:orderId/banquet-preorder/print", requireAuth, async (req:
     const requestPayload = idempotencyPayload(req.body);
     const printCopies = requestPayload.copies === undefined
       ? 2
-      : requirePositiveInteger(requestPayload.copies, "备菜单打印份数必须在1到20份之间", 20);
+      : requireNonNegativeInteger(requestPayload.copies, "备菜单打印份数必须在0到20份之间", 20);
     const response = await withTransaction(async (client) => {
       const previous = await readIdempotent(client, `banquet-print:${orderId}`, requestKey, user.id, requestPayload, user.role === "OWNER");
       if (previous) return previous;
@@ -1605,16 +1888,18 @@ app.post("/api/orders/:orderId/banquet-preorder/print", requireAuth, async (req:
         id: item.id, name: item.dish_name, unit: item.unit, priceFen: item.price_fen,
         quantity: item.quantity, note: item.note
       }));
-      await client.query(`UPDATE banquet_reservations SET preorder_printed_at = now(), updated_at = now() WHERE id = $1`, [reservation.rows[0].id]);
       const details = await orderDetails(client, orderId, user.role === "OWNER");
-      await makePrintJobs(
-        client,
-        orderId,
-        batch.rows[0].id,
-        "KITCHEN",
-        { ...printOrderPayload(details, printItems, "备菜单"), batchNo: batch.rows[0].batch_no },
-        printCopies
-      );
+      if (printCopies > 0) {
+        await client.query(`UPDATE banquet_reservations SET preorder_printed_at = now(), updated_at = now() WHERE id = $1`, [reservation.rows[0].id]);
+        await makePrintJobs(
+          client,
+          orderId,
+          batch.rows[0].id,
+          "KITCHEN",
+          { ...printOrderPayload(details, printItems, "备菜单"), batchNo: batch.rows[0].batch_no },
+          printCopies
+        );
+      }
       await logOperation(client, user.id, "PRINT_BANQUET_PREORDER", "ORDER", orderId, { copies: printCopies, itemCount: printItems.length });
       await saveIdempotent(client, `banquet-print:${orderId}`, requestKey, user.id, details, requestPayload);
       return details;
@@ -1802,8 +2087,18 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
         : requireNonNegativeInteger(req.body.receivedFen, "实收金额格式不正确");
       const paymentMethod = text(req.body?.paymentMethod) || "现金";
       if (!["现金", "微信", "支付宝", "银行卡", "其他"].includes(paymentMethod)) fail("收款方式不正确");
+      const pointsEligibleFen = items.reduce((sum, item) => {
+        const categoryRuleEnabled = item.current_category_points_earning_enabled ?? item.points_earning_enabled;
+        if (categoryRuleEnabled === false) return sum;
+        const returned = Math.min(item.quantity, item.returned_quantity);
+        const gifted = Math.min(Math.max(0, item.quantity - returned), item.gifted_quantity);
+        return sum + Math.max(0, (item.quantity - returned - gifted) * item.price_fen);
+      }, 0);
+      const eligibleDueFen = totals.subtotalFen > 0
+        ? Math.floor(pointsEligibleFen * dueBeforeDepositFen / totals.subtotalFen)
+        : 0;
       const earnedPoints = enabled && order.points_earning_enabled && order.customer_id
-        ? Math.floor(dueBeforeDepositFen / earnFen)
+        ? Math.floor(eligibleDueFen / earnFen)
         : 0;
       const settlement = await client.query<{ id: string }>(
         `INSERT INTO settlements
@@ -2010,11 +2305,12 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
         if (!copiedBatchId) continue;
         await client.query(
           `INSERT INTO order_items
-           (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, quantity,
+           (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, points_earning_enabled, quantity,
             gifted_quantity, returned_quantity, returned_made_quantity, note, option_snapshot)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb)`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb)`,
           [copiedBatchId, newOrderId, item.dish_id, item.dish_name, item.category_name, item.unit, item.price_fen, item.cost_fen,
-            item.quantity, item.gifted_quantity, item.returned_quantity, item.returned_made_quantity, item.note, JSON.stringify(item.option_snapshot || [])]
+            item.points_earning_enabled !== false, item.quantity, item.gifted_quantity, item.returned_quantity,
+            item.returned_made_quantity, item.note, JSON.stringify(item.option_snapshot || [])]
         );
       }
       await logOperation(client, user.id, "REOPEN_ORDER", "ORDER", orderId, { newOrderId, settlementId: settlement.id });
@@ -2039,7 +2335,7 @@ app.get("/api/categories", requireAuth, async (req, res) => {
     const includeInactive = text(req.query.includeInactive) === "true"
       && (req as AuthenticatedRequest).user?.role === "OWNER";
     const result = await pool.query(
-      `SELECT id, name, sort_order, active FROM categories
+      `SELECT id, name, sort_order, active, points_earning_enabled FROM categories
        ${includeInactive ? "" : "WHERE active = true"}
        ORDER BY active DESC, sort_order, name`
     );
@@ -2094,7 +2390,7 @@ app.put("/api/categories/order", requireAuth, requireRole("OWNER"), async (req: 
       }
       await logOperation(client, user.id, "REORDER_CATEGORIES", "CATEGORY", null, { ids });
       return (await client.query(
-        `SELECT id, name, sort_order, active FROM categories WHERE active = true ORDER BY sort_order, name`
+        `SELECT id, name, sort_order, active, points_earning_enabled FROM categories WHERE active = true ORDER BY sort_order, name`
       )).rows;
     });
     broadcastUpdate({ type: "menu.updated" });
@@ -2121,6 +2417,11 @@ app.patch("/api/categories/:categoryId", requireAuth, requireRole("OWNER"), asyn
       values.push(req.body.active);
       updates.push(`active = $${values.length}`);
     }
+    if (req.body?.pointsEarningEnabled !== undefined) {
+      if (typeof req.body.pointsEarningEnabled !== "boolean") fail("分类积分设置不正确");
+      values.push(req.body.pointsEarningEnabled);
+      updates.push(`points_earning_enabled = $${values.length}`);
+    }
     if (req.body?.sortOrder !== undefined) {
       const sortOrder = requireNonNegativeInteger(req.body.sortOrder, "分类顺序必须是非负整数");
       values.push(sortOrder);
@@ -2130,9 +2431,9 @@ app.patch("/api/categories/:categoryId", requireAuth, requireRole("OWNER"), asyn
     values.push(categoryId);
     const category = await withTransaction(async (client) => {
       await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-category-order'))`);
-      const result = await client.query<{ id: string; name: string; active: boolean }>(
+      const result = await client.query<{ id: string; name: string; active: boolean; points_earning_enabled: boolean }>(
         `UPDATE categories SET ${updates.join(", ")}, updated_at = now()
-         WHERE id = $${values.length} RETURNING id, name, active`,
+         WHERE id = $${values.length} RETURNING id, name, active, points_earning_enabled`,
         values
       );
       if (!result.rows[0]) fail("分类不存在", 404);
@@ -2598,6 +2899,31 @@ app.get("/api/stats/export.csv", requireAuth, requireRole("OWNER"), async (req, 
 app.get("/api/settings", requireAuth, async (_req, res) => {
   try {
     res.json({ settings: await getSettings(pool) });
+  } catch (error) {
+    publicError(res, error);
+  }
+});
+
+app.get("/api/notifications/banquet-preorders", requireAuth, async (_req, res) => {
+  try {
+    const settings = await getSettings(pool);
+    const reminderMinutes = settingNumber(settings, "banquet_preorder_reminder_minutes", 120);
+    const reminders = await pool.query(
+      `SELECT r.id, r.starts_at, r.customer_name, r.people_count, r.status,
+              COALESCE(t.name, h.name, '未指定桌台') AS table_name,
+              t.number AS table_number,
+              jsonb_array_length(r.preorder) AS preorder_count
+       FROM banquet_reservations r
+       LEFT JOIN restaurant_tables t ON t.id = r.table_id
+       LEFT JOIN banquet_halls h ON h.id = r.hall_id
+       WHERE r.status IN ('RESERVED', 'CONVERTED')
+         AND r.preorder_printed_at IS NULL
+         AND jsonb_array_length(r.preorder) > 0
+         AND r.starts_at <= now() + ($1::int * interval '1 minute')
+       ORDER BY r.starts_at, r.created_at, r.id`,
+      [reminderMinutes]
+    );
+    res.json({ reminderMinutes, reminders: reminders.rows });
   } catch (error) {
     publicError(res, error);
   }

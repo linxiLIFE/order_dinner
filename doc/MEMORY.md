@@ -1,10 +1,11 @@
 # 项目记忆
 
-更新时间：2026-09-18
+更新时间：2026-09-25
 
-## 2026-09-18 线上状态
+## 2026-09-25 线上状态
 
-- 已部署到 `/opt/order-dinner`，容器 `order-dinner-app` 与 `order-dinner-db` 正常运行，Caddy 已签发 `dinner.20-48-27-179.sslip.io` 证书。
+- 已迁移到 `43.142.138.108`，SSH 用户为 `ubuntu`；Order Dinner 公网地址为 `https://43.142.138.108:1316`。Caddy 将 1316 转发到 `order-dinner-app:3000`，2026-09-25 的 HTTPS `/healthz` 检查返回 200。
+- SSH 私钥路径为 `/Users/linxi/Downloads/edge/tencloud.pem`；不要把私钥内容写入仓库或记忆。
 - 不写入营业数据的冒烟检查通过：管理员登录、`/healthz`、12 张默认桌台和设置接口均正常；生产库当前订单数为 0。
 - 首次部署曾因 Dockerfile 排除 Rollup Linux 可选依赖、递归修改 PostgreSQL 数据目录属主而失败；现已分别改为 `npm ci --include=optional`，并让部署脚本跳过 `data`、`backups` 的递归属主修改。
 - 该服务器的 Caddy 单文件只读挂载在编辑宿主机后需要重启 `love-caddy` 才会刷新；部署脚本已在 Caddy 配置校验后重启它，重启会短暂影响现有入口。
@@ -12,7 +13,7 @@
 
 ## 当前目标
 
-这是单店餐厅员工点单系统。网页、Windows Electron 安装包和安卓 Capacitor 安装包共用一个 Node.js 服务与 PostgreSQL；线上地址为 `https://dinner.20-48-27-179.sslip.io:1314`，部署目录为 `/opt/order-dinner`。
+这是单店餐厅员工点单系统。网页、Windows Electron 安装包和安卓 Capacitor 安装包共用一个 Node.js 服务与 PostgreSQL；当前线上地址为 `https://43.142.138.108:1316`，旧服务器 `20.48.27.179` 已被新服务器替代，部署目录为 `/opt/order-dinner`。
 
 ## 重要决策
 

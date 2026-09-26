@@ -30,7 +30,7 @@ umask 077
   echo "BOOTSTRAP_ADMIN_USERNAME=admin"
   echo "BOOTSTRAP_ADMIN_PASSWORD=$admin_password"
   echo "PRINT_DEVICE_NAME=未配置打印设备"
-  echo "PUBLIC_APP_URL=https://dinner.20-48-27-179.sslip.io:1314"
+  echo "PUBLIC_APP_URL=https://43.142.138.108:1316"
   echo "SEED_DEMO_DATA=false"
 } > "$env_file"
 echo "已生成 $env_file"

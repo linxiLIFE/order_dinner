@@ -461,11 +461,14 @@ banquetRouter.patch("/reservations/:reservationId", async (req: AuthenticatedReq
     const reservationId = routeId(req, "reservationId");
     const startsAt = req.body?.startsAt === undefined ? undefined : validDate(req.body.startsAt, "开始时间");
     const endsAt = req.body?.endsAt === undefined ? undefined : validDate(req.body.endsAt, "结束时间");
+    const hasNote = req.body?.note !== undefined;
+    if (hasNote && (typeof req.body.note !== "string" || req.body.note.length > 500)) reject("备注不能超过500字");
+    const note = hasNote ? text(req.body.note) : undefined;
     if ((startsAt === undefined) !== (endsAt === undefined)) reject("改期时请同时填写开始和结束时间");
     if (startsAt && endsAt && Date.parse(endsAt) <= Date.parse(startsAt)) reject("结束时间必须晚于开始时间");
     const cancel = req.body?.status === "CANCELLED";
     if (req.body?.status !== undefined && !cancel) reject("预定状态不正确");
-    if (!cancel && !startsAt) reject("请填写改期时间或取消预定");
+    if (!cancel && !startsAt && !hasNote) reject("请填写改期时间、宴席备注或取消预定");
     const response = await withTransaction(async (client) => {
       const current = await client.query<{ id: string; hall_id: string | null; table_id: string | null; status: BanquetState }>(
         `SELECT id, hall_id, table_id, status FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
@@ -477,7 +480,7 @@ banquetRouter.patch("/reservations/:reservationId", async (req: AuthenticatedReq
         await client.query(`UPDATE banquet_reservations SET status = 'CANCELLED', updated_by = $1, updated_at = now() WHERE id = $2`, [user.id, reservationId]);
         await logOperation(client, user.id, "CANCEL_BANQUET_RESERVATION", reservationId, { note: text(req.body?.note) });
       } else {
-        if (reservation.table_id) {
+        if (startsAt && reservation.table_id) {
           await client.query(`SELECT id FROM restaurant_tables WHERE id = $1 FOR UPDATE`, [reservation.table_id]);
           const overlap = await client.query(
             `SELECT id FROM banquet_reservations
@@ -486,7 +489,7 @@ banquetRouter.patch("/reservations/:reservationId", async (req: AuthenticatedReq
              LIMIT 1`, [reservation.table_id, reservationId, startsAt, endsAt]
           );
           if (overlap.rows[0]) reject("该桌台在此时间段已有宴席预定", 409);
-        } else if (reservation.hall_id) {
+        } else if (startsAt && reservation.hall_id) {
           await client.query(`SELECT id FROM banquet_halls WHERE id = $1 FOR UPDATE`, [reservation.hall_id]);
           const overlap = await client.query(
             `SELECT id FROM banquet_reservations
@@ -495,14 +498,22 @@ banquetRouter.patch("/reservations/:reservationId", async (req: AuthenticatedReq
              LIMIT 1`, [reservation.hall_id, reservationId, startsAt, endsAt]
           );
           if (overlap.rows[0]) reject("该厅在此时间段已有预定", 409);
-        } else {
+        } else if (startsAt) {
           reject("该宴席没有绑定桌台，无法改期", 409);
         }
-        await client.query(
-          `UPDATE banquet_reservations SET starts_at = $1, ends_at = $2, updated_by = $3, updated_at = now() WHERE id = $4`,
-          [startsAt, endsAt, user.id, reservationId]
-        );
-        await logOperation(client, user.id, "RESCHEDULE_BANQUET_RESERVATION", reservationId, { startsAt, endsAt });
+        if (startsAt) {
+          await client.query(
+            `UPDATE banquet_reservations SET starts_at = $1, ends_at = $2, note = COALESCE($3, note), updated_by = $4, updated_at = now() WHERE id = $5`,
+            [startsAt, endsAt, note ?? null, user.id, reservationId]
+          );
+        } else {
+          await client.query(
+            `UPDATE banquet_reservations SET note = $1, updated_by = $2, updated_at = now() WHERE id = $3`,
+            [note, user.id, reservationId]
+          );
+        }
+        const action = startsAt && hasNote ? "UPDATE_BANQUET_RESERVATION" : startsAt ? "RESCHEDULE_BANQUET_RESERVATION" : "UPDATE_BANQUET_NOTE";
+        await logOperation(client, user.id, action, reservationId, { ...(startsAt ? { startsAt, endsAt } : {}), ...(hasNote ? { note } : {}) });
       }
       return { reservation: await reservationDetails(client, reservationId) };
     });
@@ -525,9 +536,9 @@ banquetRouter.put("/reservations/:reservationId/preorder", async (req: Authentic
         const dishId = text(raw?.dishId);
         const quantity = positiveInt(raw?.quantity, "菜品数量", 100_000);
         const dishResult = await client.query<{
-          id: string; name: string; category_name: string | null; unit: string; price_fen: number; cost_fen: number;
+          id: string; name: string; category_name: string | null; unit: string; price_fen: number; cost_fen: number; points_earning_enabled: boolean | null;
         }>(
-          `SELECT d.id, d.name, c.name AS category_name, d.unit, d.price_fen, d.cost_fen
+          `SELECT d.id, d.name, c.name AS category_name, d.unit, d.price_fen, d.cost_fen, c.points_earning_enabled
            FROM dishes d LEFT JOIN categories c ON c.id = d.category_id WHERE d.id = $1 AND d.on_sale = true`, [dishId]
         );
         const dish = dishResult.rows[0];
@@ -535,10 +546,11 @@ banquetRouter.put("/reservations/:reservationId/preorder", async (req: Authentic
         const options = await snapshotOptions(client, dish.id, raw?.options, raw?.note);
         snapshot.push({
           dishId: dish.id, name: dish.name, categoryName: dish.category_name || "未分类", unit: dish.unit,
-          priceFen: dish.price_fen, costFen: dish.cost_fen, quantity, note: options.note, optionSnapshot: options.snapshot
+          priceFen: dish.price_fen, costFen: dish.cost_fen, pointsEarningEnabled: dish.points_earning_enabled !== false,
+          quantity, note: options.note, optionSnapshot: options.snapshot
         });
       }
-      await client.query(`UPDATE banquet_reservations SET preorder = $1::jsonb, updated_by = $2, updated_at = now() WHERE id = $3`, [JSON.stringify(snapshot), user.id, reservationId]);
+      await client.query(`UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_printed_at = NULL, updated_by = $2, updated_at = now() WHERE id = $3`, [JSON.stringify(snapshot), user.id, reservationId]);
       await logOperation(client, user.id, "SAVE_BANQUET_PREORDER", reservationId, { itemCount: snapshot.length });
       return reservationDetails(client, reservationId);
     });
@@ -566,9 +578,9 @@ banquetRouter.post("/reservations/:reservationId/preorder/items", async (req: Au
         const dishId = text(raw?.dishId);
         const quantity = positiveInt(raw?.quantity, "菜品数量", 100_000);
         const dishResult = await client.query<{
-          id: string; name: string; category_name: string | null; unit: string; price_fen: number; cost_fen: number;
+          id: string; name: string; category_name: string | null; unit: string; price_fen: number; cost_fen: number; points_earning_enabled: boolean | null;
         }>(
-          `SELECT d.id, d.name, c.name AS category_name, d.unit, d.price_fen, d.cost_fen
+          `SELECT d.id, d.name, c.name AS category_name, d.unit, d.price_fen, d.cost_fen, c.points_earning_enabled
            FROM dishes d LEFT JOIN categories c ON c.id = d.category_id WHERE d.id = $1 AND d.on_sale = true`, [dishId]
         );
         const dish = dishResult.rows[0];
@@ -576,11 +588,12 @@ banquetRouter.post("/reservations/:reservationId/preorder/items", async (req: Au
         const options = await snapshotOptions(client, dish.id, raw?.options, raw?.note);
         snapshot.push({
           dishId: dish.id, name: dish.name, categoryName: dish.category_name || "未分类", unit: dish.unit,
-          priceFen: dish.price_fen, costFen: dish.cost_fen, quantity, note: options.note, optionSnapshot: options.snapshot
+          priceFen: dish.price_fen, costFen: dish.cost_fen, pointsEarningEnabled: dish.points_earning_enabled !== false,
+          quantity, note: options.note, optionSnapshot: options.snapshot
         });
       }
       await client.query(
-        `UPDATE banquet_reservations SET preorder = $1::jsonb, updated_by = $2, updated_at = now() WHERE id = $3`,
+        `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_printed_at = NULL, updated_by = $2, updated_at = now() WHERE id = $3`,
         [JSON.stringify(snapshot), user.id, reservationId]
       );
       await logOperation(client, user.id, "ADD_BANQUET_PREORDER_ITEMS", reservationId, { itemCount: rawItems.length });
@@ -691,9 +704,10 @@ async function convertReservationToOrder(client: DbClient, reservationId: string
         for (const item of preorder) {
           await client.query(
             `INSERT INTO order_items
-             (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, quantity, note, option_snapshot)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)`,
-            [batch.rows[0].id, orderId, item.dishId, item.name, item.categoryName || "未分类", item.unit || "份", item.priceFen, item.costFen || 0, item.quantity, item.note || "", JSON.stringify(item.optionSnapshot || [])]
+             (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, points_earning_enabled, quantity, note, option_snapshot)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)`,
+            [batch.rows[0].id, orderId, item.dishId, item.name, item.categoryName || "未分类", item.unit || "份", item.priceFen,
+              item.costFen || 0, item.pointsEarningEnabled !== false, item.quantity, item.note || "", JSON.stringify(item.optionSnapshot || [])]
           );
         }
         await client.query(`UPDATE orders SET order_version = 1, updated_at = now() WHERE id = $1`, [orderId]);

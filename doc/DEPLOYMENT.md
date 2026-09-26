@@ -2,17 +2,16 @@
 
 ## 地址与连接
 
-线上后台：`https://dinner.20-48-27-179.sslip.io:1314`
+线上后台：`https://43.142.138.108:1316`
 
 SSH 连接使用：
 
 ```bash
-ssh -B en0 \
-  -o ServerAliveInterval=30 \
+ssh -o ServerAliveInterval=30 \
   -o ServerAliveCountMax=3 \
   -o IdentitiesOnly=yes \
-  -i /Users/linxi/Downloads/google/astro-vm_key.pem \
-  azureuser@20.48.27.179
+  -i /Users/linxi/Downloads/edge/tencloud.pem \
+  ubuntu@43.142.138.108
 ```
 
 ## 首次部署
@@ -28,8 +27,8 @@ npm run build
 ## 验证
 
 ```bash
-curl -fsS https://dinner.20-48-27-179.sslip.io:1314/healthz
-ssh -B en0 -o IdentitiesOnly=yes -i /Users/linxi/Downloads/google/astro-vm_key.pem azureuser@20.48.27.179 \
+curl -fsS https://43.142.138.108:1316/healthz
+ssh -o IdentitiesOnly=yes -i /Users/linxi/Downloads/edge/tencloud.pem ubuntu@43.142.138.108 \
   'cd /opt/order-dinner && sudo docker compose ps && sudo docker compose logs --tail=100 app'
 ```
 

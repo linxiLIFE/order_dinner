@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS categories (
   name text NOT NULL UNIQUE,
   sort_order integer NOT NULL DEFAULT 0,
   active boolean NOT NULL DEFAULT true,
+  points_earning_enabled boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS order_items (
   unit text NOT NULL DEFAULT '份',
   price_fen integer NOT NULL CHECK (price_fen >= 0),
   cost_fen integer NOT NULL DEFAULT 0 CHECK (cost_fen >= 0),
+  points_earning_enabled boolean NOT NULL DEFAULT true,
   quantity integer NOT NULL CHECK (quantity > 0),
   gifted_quantity integer NOT NULL DEFAULT 0 CHECK (gifted_quantity >= 0),
   returned_quantity integer NOT NULL DEFAULT 0 CHECK (returned_quantity >= 0),
@@ -312,6 +314,8 @@ export async function migrateAndSeed(): Promise<void> {
        AND (o.table_number_snapshot IS NULL OR o.table_name_snapshot IS NULL)`
   );
   await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS option_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE categories ADD COLUMN IF NOT EXISTS points_earning_enabled boolean NOT NULL DEFAULT true`);
+  await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS points_earning_enabled boolean NOT NULL DEFAULT true`);
   await pool.query(`ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS manual_requested_at timestamptz`);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS auth_version integer NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS payload_hash text`);

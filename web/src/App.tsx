@@ -28,7 +28,7 @@ type Table = {
   nextReservationAt?: string | null;
   order: { id: string; peopleCount: number; currentFen: number; openedAt: string; customer: { name: string; phone: string | null } } | null;
 };
-type Category = { id: string; name: string; sort_order?: number; active?: boolean };
+type Category = { id: string; name: string; sort_order?: number; active?: boolean; points_earning_enabled?: boolean };
 type Dish = {
   id: string;
   category_id: string | null;
@@ -348,9 +348,10 @@ function ConfirmDialog({ title, message, confirmText = "确认", danger = false,
   return <Dialog title={title} onClose={onClose} className="confirm-modal"><p className="dialog-message">{message}</p><div className="modal-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>返回</button><button type="button" className={danger ? "primary danger-button" : "primary"} onClick={onConfirm} disabled={busy}>{busy ? "处理中…" : confirmText}</button></div></Dialog>;
 }
 
-function PrintCopiesDialog({ title, defaultCopies, confirmText = "确认打印", busy = false, onClose, onConfirm }: {
+function PrintCopiesDialog({ title, defaultCopies, minCopies = 1, confirmText = "确认打印", busy = false, onClose, onConfirm }: {
   title: string;
   defaultCopies: number;
+  minCopies?: number;
   confirmText?: string;
   busy?: boolean;
   onClose: () => void;
@@ -361,14 +362,14 @@ function PrintCopiesDialog({ title, defaultCopies, confirmText = "确认打印",
   function submit(event: FormEvent) {
     event.preventDefault();
     const copies = Number(value);
-    if (!Number.isInteger(copies) || copies < 1 || copies > 20) {
-      setError("请输入 1 到 20 之间的整数");
+    if (!Number.isInteger(copies) || copies < minCopies || copies > 20) {
+      setError(`请输入 ${minCopies} 到 20 之间的整数`);
       return;
     }
     setError("");
     onConfirm(copies);
   }
-  return <Dialog title="打印份数" description={title} onClose={onClose} closeDisabled={busy} className="confirm-modal"><form noValidate onSubmit={submit}><label>本次打印份数<input type="number" min="1" max="20" step="1" value={value} onChange={(event) => setValue(event.target.value)} autoFocus disabled={busy} /></label>{error && <div className="message error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="primary" disabled={busy}>{busy ? "提交中…" : confirmText}</button></div></form></Dialog>;
+  return <Dialog title="打印份数" description={title} onClose={onClose} closeDisabled={busy} className="confirm-modal"><form noValidate onSubmit={submit}><label>本次打印份数<input type="number" min={minCopies} max="20" step="1" value={value} onChange={(event) => setValue(event.target.value)} autoFocus disabled={busy} /></label>{error && <div className="message error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="primary" disabled={busy}>{busy ? "提交中…" : confirmText}</button></div></form></Dialog>;
 }
 
 function Login({ onLogin }: { onLogin: (user: User) => void }) {
@@ -439,27 +440,72 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
   );
 }
 
-function Header({ user, page, setPage, onLogout, selectedOrder }: {
+type BanquetPreorderReminder = {
+  id: string;
+  starts_at: string;
+  customer_name: string;
+  people_count: number;
+  status: string;
+  table_name: string;
+  table_number: number | null;
+  preorder_count: number;
+};
+
+function Header({ user, page, setPage, onLogout, selectedOrder, onOpenBanquetReminder }: {
   user: User;
   page: Page;
   setPage: (page: Page) => void;
   onLogout: () => void;
   selectedOrder: boolean;
+  onOpenBanquetReminder: (reservationId: string) => void;
 }) {
   const activeLinkRef = useRef<HTMLButtonElement | null>(null);
+  const [reminders, setReminders] = useState<BanquetPreorderReminder[]>([]);
+  const [reminderMinutes, setReminderMinutes] = useState(120);
+  const [reminderError, setReminderError] = useState("");
+  const [reminderCenterOpen, setReminderCenterOpen] = useState(false);
   const links: Array<[Page, string]> = [["tables", "桌台"], ["banquets", "宴席预定"], ["orders", "订单查询"], ["customers", "顾客"], ["dishes", "菜品"], ["print", "打印管理"]];
   if (user.role === "OWNER") links.push(["stats", "营业统计"]);
   links.push(["settings", "设置"]);
   useEffect(() => {
     activeLinkRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [page]);
+  const refreshBanquetReminders = useCallback(async () => {
+    try {
+      const result = await api<{ reminderMinutes: number; reminders: BanquetPreorderReminder[] }>("/api/notifications/banquet-preorders");
+      setReminders(result.reminders);
+      setReminderMinutes(result.reminderMinutes);
+      setReminderError("");
+    } catch (error) {
+      setReminderError(errorText(error));
+    }
+  }, []);
+  useEffect(() => {
+    void refreshBanquetReminders();
+    const timer = window.setInterval(() => void refreshBanquetReminders(), 60_000);
+    const onVisibilityChange = () => { if (document.visibilityState === "visible") void refreshBanquetReminders(); };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisibilityChange); };
+  }, [refreshBanquetReminders]);
   return (
     <header className="topbar">
       <button className="wordmark" onClick={() => setPage("tables")}>餐厅点单台</button>
       <nav className="main-nav">
         {links.map(([key, label]) => <button key={key} ref={page === key && !selectedOrder ? activeLinkRef : undefined} className={page === key && !selectedOrder ? "nav-link active" : "nav-link"} onClick={() => setPage(key)}>{label}</button>)}
       </nav>
-      <div className="user-area"><span>{user.name}</span><span className="role-tag">{user.role === "OWNER" ? "老板" : "收银员"}</span><button className="text-button" onClick={onLogout}>退出</button></div>
+      <div className="user-area"><button type="button" className="notification-center-button" onClick={() => { setReminderCenterOpen(true); void refreshBanquetReminders(); }} aria-label={`通知中心，${reminders.length} 条待打印宴席提醒`}><span>通知中心</span>{reminders.length > 0 && <strong>{reminders.length > 99 ? "99+" : reminders.length}</strong>}</button><span>{user.name}</span><span className="role-tag">{user.role === "OWNER" ? "老板" : "收银员"}</span><button className="text-button" onClick={onLogout}>退出</button></div>
+      {reminderCenterOpen && <Dialog title="通知中心" description={`宴席预定前 ${reminderMinutes} 分钟提醒打印备菜单；已到预定时间但未打印的宴席也会显示。`} onClose={() => setReminderCenterOpen(false)} className="notification-center-modal">
+        {reminderError && <div className="message error">{reminderError}</div>}
+        {reminders.length ? <div className="notification-reminder-list">{reminders.map((reminder) => {
+          const started = new Date(reminder.starts_at).getTime() <= Date.now();
+          const table = reminder.table_number ? `${reminder.table_name} · ${reminder.table_number}号桌` : reminder.table_name;
+          return <button type="button" className="notification-reminder" key={reminder.id} onClick={() => { setReminderCenterOpen(false); onOpenBanquetReminder(reminder.id); }}>
+            <span className={started ? "notification-reminder-state overdue" : "notification-reminder-state"}>{started ? "待打印" : "即将开席"}</span>
+            <strong>{table} · {reminder.customer_name || "未填写姓名"}</strong>
+            <span>{formatTime(reminder.starts_at)} · {reminder.people_count}人 · {reminder.preorder_count}项预点菜</span>
+          </button>;
+        })}</div> : !reminderError ? <div className="empty notification-empty">当前没有待打印的宴席备菜单</div> : null}
+      </Dialog>}
     </header>
   );
 }
@@ -816,7 +862,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack, onReopene
     if (pending) {
       setPendingSubmission(pending);
       const storedCopies = Number(pending.payload.copies);
-      void submitItems(Number.isInteger(storedCopies) && storedCopies >= 1 && storedCopies <= 20 ? storedCopies : 2);
+      void submitItems(Number.isInteger(storedCopies) && storedCopies >= 0 && storedCopies <= 20 ? storedCopies : 2);
       return;
     }
     const items = Object.values(cart).map((line) => ({ dishId: line.dish.id, quantity: line.quantity, note: line.customNote, options: line.selections }));
@@ -828,6 +874,10 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack, onReopene
     setKitchenCopiesOpen(false);
     const items = Object.values(cart).map((line) => ({ dishId: line.dish.id, quantity: line.quantity, note: line.customNote, options: line.selections }));
     if (!items.length && order?.banquetPreorderPendingPrint) {
+      if (copies === 0) {
+        setMessage("宴席预点菜已保留，本次不打印备菜单");
+        return;
+      }
       setBusy(true);
       try {
         const result = await idempotentApi<{ order: Order }>(
@@ -850,7 +900,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack, onReopene
       const request = prepareIdempotentRequest(`items:${orderId}`, { items, copies });
       const exactItems = Array.isArray(request.payload.items) ? request.payload.items : items;
       const storedCopies = Number(request.payload.copies);
-      const exactCopies = Number.isInteger(storedCopies) && storedCopies >= 1 && storedCopies <= 20 ? storedCopies : 2;
+      const exactCopies = Number.isInteger(storedCopies) && storedCopies >= 0 && storedCopies <= 20 ? storedCopies : 2;
       setPendingSubmission(request);
       localStorage.setItem(`order-draft:${encodeURIComponent(user.id)}:${encodeURIComponent(orderId)}`, JSON.stringify({
         version: 2,
@@ -862,9 +912,11 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack, onReopene
       setCart({});
       setPendingSubmission(null);
       localStorage.removeItem(`order-draft:${encodeURIComponent(user.id)}:${encodeURIComponent(orderId)}`);
-      setMessage(order?.banquetPreorderPendingPrint
-        ? `已合并预点菜和新增菜品，生成 ${exactCopies} 份备菜单打印任务`
-        : `已提交，已生成 ${exactCopies} 份备菜单打印任务`);
+      setMessage(exactCopies === 0
+        ? (order?.banquetPreorderPendingPrint ? "预点菜和新增菜品已保存，本次不打印备菜单" : "点菜已保存，本次不打印备菜单")
+        : order?.banquetPreorderPendingPrint
+          ? `已合并预点菜和新增菜品，生成 ${exactCopies} 份备菜单打印任务`
+          : `已提交，已生成 ${exactCopies} 份备菜单打印任务`);
       await refreshTables();
     } catch (error) {
       setPendingSubmission(getPendingIdempotentRequest(`items:${orderId}`));
@@ -939,7 +991,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack, onReopene
   const previewTotalFen = open ? displayRevenue : activeSettlement?.received_fen ?? order.totals.subtotalFen;
   const previewTotalLabel = open ? "当前应收" : activeSettlement ? "实收" : "账单金额";
   const nativePreviewAction = Capacitor.isNativePlatform();
-  return <section className="page-section order-page">
+  return <section className={`page-section order-page${Capacitor.isNativePlatform() ? "" : " web-fixed-order-page"}`}>
     <div className="section-heading order-heading"><div><button className="back-button" onClick={goBack}>‹ 桌台</button><h2>{order.tableName || (order.tableNumber ? `${order.tableNumber}号桌` : "账单")} <span className={`status-pill ${open ? "green" : "gray"}`}>{statusText(order.status)}</span></h2><p className="muted">{order.customer.name} · {order.peopleCount} 人 · 开台 {formatTime(order.openedAt)}{order.customer.phone ? ` · ${order.customer.phone}` : " · 未填写手机号"}</p>{order.orderNote && <p className="order-note"><span>本单备注：</span>{order.orderNote}</p>}</div><div className="heading-actions"><button className={`secondary preview-full-order-button${nativePreviewAction ? " native-preview-full-order-button" : ""}`} onClick={() => setPreviewOpen(true)}>预览全单</button>{open && <button className="secondary" onClick={() => setOrderNoteOpen(true)} disabled={busy}>本单备注</button>}{open && order.tableId && <button className="secondary" onClick={() => setTransferOpen(true)} disabled={busy || Boolean(pendingSubmission)}>换桌台</button>}{order.status === "SETTLED" && user.role === "OWNER" && <button className="secondary" onClick={() => setConfirmAction("reopen")} disabled={busy}>撤销重结</button>}{open && <><button className="secondary danger-outline" onClick={() => setConfirmAction("end")} disabled={busy}>直接结束</button><button className="primary" onClick={() => setCheckoutOpen(true)} disabled={busy || !order.items.length}>结账 {money(order.totals.subtotalFen)}</button></>}</div></div>
     <div className={`order-layout${orderPreviewSide === "left" && !Capacitor.isNativePlatform() ? " preview-left" : ""}`}>
       <div className="catalog-panel">
@@ -950,22 +1002,25 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack, onReopene
       </div>
       <aside className="current-order">
         <div className="order-card-heading"><h3>订单总览</h3><span>{order.items.length} 项已提交</span></div>
-        <div className="order-lines">{order.items.map((item) => <div className="order-line" key={item.id}><div className="line-main"><strong>{item.name}</strong><span>{money(item.priceFen)} × {item.quantity}</span>{item.note && <small>{formatItemNote(item.note)}</small>}{(item.giftedQuantity > 0 || item.returnedQuantity > 0) && <small className="line-flags">{item.giftedQuantity ? `赠${item.giftedQuantity}` : ""}{item.returnedQuantity ? ` 退${item.returnedQuantity}` : ""}</small>}</div>{open && <div className="line-actions"><button onClick={() => openItemAction(item, "gift")} disabled={!item.availableQuantity || busy || Boolean(pendingSubmission)}>赠送</button><button onClick={() => openItemAction(item, "return")} disabled={!item.availableQuantity || busy || Boolean(pendingSubmission)}>退菜</button></div>}</div>)}</div>
-        {open && order.banquetPreorderPendingPrint && !Object.keys(cart).length && !pendingSubmission && <div className="banquet-print-pending"><strong>宴席预点菜尚未打印</strong><span>核对菜品；如需加菜可先选择，加完后一起打印。</span><button className="primary wide" onClick={requestItemsSubmit} disabled={busy}>打印备菜单</button></div>}
-        {(Object.keys(cart).length > 0 || pendingSubmission) && <div className="cart-box"><div className="order-card-heading"><h3>{pendingSubmission ? "待确认提交" : "待提交"}</h3><span>{money(cartTotal)}</span></div>{Object.values(cart).map((line) => { const note = cartLineNote(line); return <div className="cart-line" key={line.key}><div><strong>{line.dish.name}</strong><small className={note ? "line-note" : "line-note placeholder"}>{note || "点击备注填写口味"}</small></div><button onClick={() => editNote(line.key)} disabled={Boolean(pendingSubmission) || busy}>备注</button><div className="quantity"><button onClick={() => changeCart(line.key, -1)} disabled={Boolean(pendingSubmission) || busy}>−</button><span>{line.quantity}</span><button onClick={() => changeCart(line.key, 1)} disabled={Boolean(pendingSubmission) || busy}>＋</button></div></div>; })}<button className="primary wide" onClick={requestItemsSubmit} disabled={busy || !open}>{pendingSubmission ? "重试上次提交" : "提交并打印"}</button>{pendingSubmission && <small>上次提交结果尚未确认；重试会沿用同一请求编号、菜品内容和份数。</small>}</div>}
-        <div className="order-total"><span>当前应收</span><strong>{money(displayRevenue)}</strong><small>原价 {money(order.totals.grossFen + cartTotal)} · 赠送 {money(order.totals.giftFen)} · 退菜 {money(order.totals.returnFen)}</small>{user.role === "OWNER" && <div className="order-margin">本单毛利率 <strong>{displayMargin}%</strong></div>}</div>
+        <div className="current-order-scroll">
+          <div className="order-lines">{order.items.map((item) => <div className="order-line" key={item.id}><div className="line-main"><strong>{item.name}</strong><span>单价 {money(item.priceFen)} × {item.quantity}</span>{item.note && <small>{formatItemNote(item.note)}</small>}{(item.giftedQuantity > 0 || item.returnedQuantity > 0) && <small className="line-flags">{item.giftedQuantity ? `赠${item.giftedQuantity}` : ""}{item.returnedQuantity ? ` 退${item.returnedQuantity}` : ""}</small>}</div>{open && <div className="line-actions"><button onClick={() => openItemAction(item, "gift")} disabled={!item.availableQuantity || busy || Boolean(pendingSubmission)}>赠送</button><button onClick={() => openItemAction(item, "return")} disabled={!item.availableQuantity || busy || Boolean(pendingSubmission)}>退菜</button></div>}</div>)}</div>
+          {open && order.banquetPreorderPendingPrint && !Object.keys(cart).length && !pendingSubmission && <div className="banquet-print-pending"><strong>宴席预点菜尚未打印</strong><span>核对菜品；如需加菜可先选择，加完后一起打印。</span></div>}
+          {(Object.keys(cart).length > 0 || pendingSubmission) && <div className="cart-box"><div className="order-card-heading"><h3>{pendingSubmission ? "待确认提交" : "待提交"}</h3><span>{money(cartTotal)}</span></div>{Object.values(cart).map((line) => { const note = cartLineNote(line); return <div className="cart-line" key={line.key}><div><strong>{line.dish.name}</strong><small className="cart-price">单价 {money(line.dish.price_fen)} × {line.quantity} = {money(line.dish.price_fen * line.quantity)}</small><small className={note ? "line-note" : "line-note placeholder"}>{note || "点击备注填写口味"}</small></div><button onClick={() => editNote(line.key)} disabled={Boolean(pendingSubmission) || busy}>备注</button><div className="quantity"><button onClick={() => changeCart(line.key, -1)} disabled={Boolean(pendingSubmission) || busy}>−</button><span>{line.quantity}</span><button onClick={() => changeCart(line.key, 1)} disabled={Boolean(pendingSubmission) || busy}>＋</button></div></div>; })}{pendingSubmission && <small className="pending-submission-hint">上次提交结果尚未确认；重试会沿用同一请求编号、菜品内容和份数。</small>}</div>}
+        </div>
+        <div className="current-order-footer"><div className="order-total"><span>当前应收</span><strong>{money(displayRevenue)}</strong><small>原价 {money(order.totals.grossFen + cartTotal)} · 赠送 {money(order.totals.giftFen)} · 退菜 {money(order.totals.returnFen)}</small>{user.role === "OWNER" && <div className="order-margin">本单毛利率 <strong>{displayMargin}%</strong></div>}</div>{open && (Object.keys(cart).length > 0 || pendingSubmission || order.banquetPreorderPendingPrint) && <button className="primary wide current-order-action" onClick={requestItemsSubmit} disabled={busy}>{pendingSubmission ? "重试上次提交" : order.banquetPreorderPendingPrint && !Object.keys(cart).length ? "打印备菜单" : "提交并打印"}</button>}</div>
       </aside>
     </div>
+    {Capacitor.isNativePlatform() && <div className="mobile-order-quickbar"><div className="mobile-order-total"><small>当前应收</small><strong>{money(displayRevenue)}</strong></div><div className="mobile-order-actions">{open && (Object.keys(cart).length > 0 || pendingSubmission || order.banquetPreorderPendingPrint) && <button type="button" className="primary" onClick={requestItemsSubmit} disabled={busy || Boolean(pendingSubmission) && !open}>{pendingSubmission ? "重试提交" : order.banquetPreorderPendingPrint && !Object.keys(cart).length ? "打印备菜单" : "提交点菜"}</button>}{open && order.items.length > 0 && <button type="button" className="secondary" onClick={() => setCheckoutOpen(true)} disabled={busy || Boolean(pendingSubmission) || Object.keys(cart).length > 0}>结账</button>}</div></div>}
     {previewOpen && <OrderPreviewDialog order={order} cartLines={Object.values(cart)} totalFen={previewTotalFen} totalLabel={previewTotalLabel} onClose={() => setPreviewOpen(false)} />}
     {checkoutOpen && <CheckoutPanel order={order} role={user.role} onClose={() => setCheckoutOpen(false)} onDone={async (nextOrder, message) => { setCurrentOrder(nextOrder); setCheckoutOpen(false); setMessage(message); await refreshTables(); }} />}
     {optionTarget && <DishOptionsDialog dish={optionTarget} onClose={() => setOptionTarget(null)} onSubmit={(selections, note) => { addConfiguredDish(optionTarget, selections, note); setOptionTarget(null); }} />}
     {noteTarget && <NoteDialog note={noteTarget.note} title="填写自定义备注" onClose={() => setNoteTarget(null)} onSubmit={saveNote} />}
     {orderNoteOpen && <NoteDialog note={order.orderNote} title="本单备注" onClose={() => setOrderNoteOpen(false)} onSubmit={(note) => void saveOrderNote(note)} />}
-    {transferOpen && <TransferTableDialog order={order} onClose={() => setTransferOpen(false)} onDone={async (nextOrder, copies) => { setCurrentOrder(nextOrder); setTransferOpen(false); await refreshTables(); setMessage(nextOrder.items.length ? `已换桌并生成 ${copies} 份备菜单打印任务` : "已换桌，原桌台已释放"); }} />}
+    {transferOpen && <TransferTableDialog order={order} onClose={() => setTransferOpen(false)} onDone={async (nextOrder, copies) => { setCurrentOrder(nextOrder); setTransferOpen(false); await refreshTables(); setMessage(nextOrder.items.length ? copies > 0 ? `已换桌并生成 ${copies} 份备菜单打印任务` : "已换桌，本次不打印备菜单" : "已换桌，原桌台已释放"); }} />}
     {actionTarget && <ItemActionDialog item={actionTarget.item} action={actionTarget.action} busy={busy} pendingRequest={pendingItemAction?.scope === `item-action:${orderId}:${actionTarget.item.id}:${actionTarget.action}` ? pendingItemAction.request : getPendingIdempotentRequest(`item-action:${orderId}:${actionTarget.item.id}:${actionTarget.action}`)} onClose={() => { setActionTarget(null); setPendingItemAction(null); }} onSubmit={itemAction} />}
     {confirmAction === "reopen" && <ConfirmDialog title="撤销并重新开账" message="原账单、积分冲销和新账单都会保留，是否继续？" confirmText="确认撤销重结" busy={busy} onClose={() => setConfirmAction(null)} onConfirm={() => void reopen()} />}
     {confirmAction === "end" && <ConfirmDialog title="直接结束本单" message="本单将释放桌台，不生成结账或收款记录；订单仍会保留在订单查询中。" confirmText="直接结束" danger busy={busy} onClose={() => setConfirmAction(null)} onConfirm={() => void endWithoutPayment()} />}
-    {kitchenCopiesOpen && <PrintCopiesDialog title="备菜单打印份数（默认 2 份）" defaultCopies={2} onClose={() => setKitchenCopiesOpen(false)} onConfirm={(copies) => void submitItems(copies)} />}
+    {kitchenCopiesOpen && <PrintCopiesDialog title="备菜单打印份数（默认 2 份；填 0 表示只保存点菜）" defaultCopies={2} minCopies={0} confirmText="确认" onClose={() => setKitchenCopiesOpen(false)} onConfirm={(copies) => void submitItems(copies)} />}
   </section>;
 }
 
@@ -986,7 +1041,7 @@ function TransferTableDialog({ order, onClose, onDone }: {
   }, []);
   const available = tables.filter((table) => table.id !== order.tableId && table.status === "AVAILABLE" && !table.order);
   const chosenId = pending ? String(pending.payload.targetTableId || "") : targetTableId;
-  const chosenCopies = pending ? Number(pending.payload.copies || 2) : copies;
+  const chosenCopies = pending ? Number(pending.payload.copies ?? 2) : copies;
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (!chosenId) return setMessage("请选择空闲桌台");
@@ -1010,9 +1065,9 @@ function TransferTableDialog({ order, onClose, onDone }: {
         </label>;
       })}</div>
       {!available.length && <p className="muted">当前没有可换的空闲桌台</p>}
-      <label>备菜单份数<input type="number" min="1" max="20" step="1" value={chosenCopies} disabled={busy || Boolean(pending)} onChange={(event) => setCopies(Number(event.target.value))} /></label>
+      <label>备菜单份数<small>填 0 只换桌，不打印</small><input type="number" min="0" max="20" step="1" value={chosenCopies} disabled={busy || Boolean(pending)} onChange={(event) => setCopies(Number(event.target.value))} /></label>
       {message && <div className="message error">{message}</div>}
-      <div className="modal-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="primary" disabled={busy || !chosenId || !Number.isInteger(chosenCopies) || chosenCopies < 1 || chosenCopies > 20}>{busy ? "换桌中…" : pending ? "重试上次换桌" : "确认换桌并打印"}</button></div>
+      <div className="modal-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="primary" disabled={busy || !chosenId || !Number.isInteger(chosenCopies) || chosenCopies < 0 || chosenCopies > 20}>{busy ? "换桌中…" : pending ? "重试上次换桌" : chosenCopies > 0 ? "确认换桌并打印" : "确认换桌"}</button></div>
     </form>
   </Dialog>;
 }
@@ -1137,7 +1192,7 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
   const savedTotal = reservation.preorder.reduce((sum, line) => sum + Number(line.priceFen || 0) * Number(line.quantity || 0), 0);
   const cartTotal = Object.values(cart).reduce((sum, line) => sum + line.dish.price_fen * line.quantity, 0);
   const canEdit = reservation.status === "RESERVED";
-  return <section className="page-section order-page">
+  return <section className={`page-section order-page${Capacitor.isNativePlatform() ? "" : " web-fixed-order-page"}`}>
     <div className="section-heading order-heading"><div><button className="back-button" onClick={goBack}>‹ 宴席预定</button><h2>{reservation.table_name || (reservation.table_number ? `${reservation.table_number}号桌` : "宴席")} · 预点菜</h2><p className="muted">{reservation.customer_name || "未填写姓名"} · {reservation.people_count} 人 · {formatTime(reservation.starts_at)}</p></div></div>
     {!canEdit && <div className="message error">这笔宴席已经开台或取消，不能继续预点菜。</div>}
     <div className={`order-layout${orderPreviewSide === "left" && !Capacitor.isNativePlatform() ? " preview-left" : ""}`}>
@@ -1149,12 +1204,14 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
       </div>
       <aside className="current-order">
         <div className="order-card-heading"><h3>已保留预点菜</h3><span>{reservation.preorder.length} 项</span></div>
-        <div className="order-lines">{reservation.preorder.map((item, index) => <div className="order-line" key={`${item.dishId}-${index}`}><div className="line-main"><strong>{item.name}</strong><span>{money(item.priceFen)} × {item.quantity}</span>{item.note && <small>{formatItemNote(item.note)}</small>}</div></div>)}</div>
-        {(Object.keys(cart).length > 0 || pendingSubmission) && <div className="cart-box"><div className="order-card-heading"><h3>{pendingSubmission ? "待确认保留" : "本次新增"}</h3><span>{money(cartTotal)}</span></div>{Object.values(cart).map((line) => { const note = cartLineNote(line); return <div className="cart-line" key={line.key}><div><strong>{line.dish.name}</strong><small className={note ? "line-note" : "line-note placeholder"}>{note || "点击备注填写口味"}</small></div><button onClick={() => setNoteTarget({ key: line.key, note: line.customNote })} disabled={Boolean(pendingSubmission) || busy}>备注</button><div className="quantity"><button onClick={() => changeCart(line.key, -1)} disabled={Boolean(pendingSubmission) || busy}>−</button><span>{line.quantity}</span><button onClick={() => changeCart(line.key, 1)} disabled={Boolean(pendingSubmission) || busy}>＋</button></div></div>; })}</div>}
-        <div className="preorder-save"><button className="primary wide" onClick={() => void savePreorder()} disabled={!canEdit || busy || (!Object.keys(cart).length && !pendingSubmission)}>{busy ? "保留中…" : pendingSubmission ? "重试保留点菜" : "保留点菜"}</button>{pendingSubmission && <small>上次保留结果尚未确认，重试会沿用原菜品。</small>}</div>
-        <div className="order-total"><span>预点合计</span><strong>{money(savedTotal + cartTotal)}</strong><small>预点阶段不打印，开台后由员工核对并打印</small></div>
+        <div className="current-order-scroll">
+          <div className="order-lines">{reservation.preorder.map((item, index) => <div className="order-line" key={`${item.dishId}-${index}`}><div className="line-main"><strong>{item.name}</strong><span>单价 {money(item.priceFen)} × {item.quantity}</span>{item.note && <small>{formatItemNote(item.note)}</small>}</div></div>)}</div>
+          {(Object.keys(cart).length > 0 || pendingSubmission) && <div className="cart-box"><div className="order-card-heading"><h3>{pendingSubmission ? "待确认保留" : "本次新增"}</h3><span>{money(cartTotal)}</span></div>{Object.values(cart).map((line) => { const note = cartLineNote(line); return <div className="cart-line" key={line.key}><div><strong>{line.dish.name}</strong><small className="cart-price">单价 {money(line.dish.price_fen)} × {line.quantity} = {money(line.dish.price_fen * line.quantity)}</small><small className={note ? "line-note" : "line-note placeholder"}>{note || "点击备注填写口味"}</small></div><button onClick={() => setNoteTarget({ key: line.key, note: line.customNote })} disabled={Boolean(pendingSubmission) || busy}>备注</button><div className="quantity"><button onClick={() => changeCart(line.key, -1)} disabled={Boolean(pendingSubmission) || busy}>−</button><span>{line.quantity}</span><button onClick={() => changeCart(line.key, 1)} disabled={Boolean(pendingSubmission) || busy}>＋</button></div></div>; })}{pendingSubmission && <small className="pending-submission-hint">上次保留结果尚未确认，重试会沿用原菜品。</small>}</div>}
+        </div>
+        <div className="current-order-footer"><div className="order-total"><span>预点合计</span><strong>{money(savedTotal + cartTotal)}</strong><small>预点阶段不打印，开台后由员工核对并打印</small></div><div className="preorder-save"><button className="primary wide current-order-action" onClick={() => void savePreorder()} disabled={!canEdit || busy || (!Object.keys(cart).length && !pendingSubmission)}>{busy ? "保留中…" : pendingSubmission ? "重试保留点菜" : "保留点菜"}</button></div></div>
       </aside>
     </div>
+    {Capacitor.isNativePlatform() && <div className="mobile-order-quickbar"><div className="mobile-order-total"><small>预点合计</small><strong>{money(savedTotal + cartTotal)}</strong></div><button type="button" className="primary" onClick={() => void savePreorder()} disabled={!canEdit || busy || (!Object.keys(cart).length && !pendingSubmission)}>{busy ? "保留中…" : pendingSubmission ? "重试保留点菜" : "保留点菜"}</button></div>}
     {optionTarget && <DishOptionsDialog dish={optionTarget} onClose={() => setOptionTarget(null)} onSubmit={(selections, note) => { addConfiguredDish(optionTarget, selections, note); setOptionTarget(null); }} />}
     {noteTarget && <NoteDialog note={noteTarget.note} title="填写自定义备注" onClose={() => setNoteTarget(null)} onSubmit={saveNote} />}
   </section>;
@@ -1352,12 +1409,13 @@ function CheckoutPanel({ order, role, onClose, onDone }: { order: Order; role: U
   </>;
 }
 
-function OrderQueryPage({ openOrder, setMessage }: { openOrder: (orderId: string) => void; setMessage: (message: string) => void }) {
+function OrderQueryPage({ openOrder, setMessage, isOwner }: { openOrder: (orderId: string) => void; setMessage: (message: string) => void; isOwner: boolean }) {
   const [filters, setFilters] = useState({ from: "", to: "", minAmount: "", maxAmount: "", q: "", status: "", paymentMethod: "" });
   const [orders, setOrders] = useState<OrderSearchRow[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [nextOffset, setNextOffset] = useState(0);
   const [selected, setSelected] = useState<Order | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   async function load(reset = true) {
@@ -1393,14 +1451,33 @@ function OrderQueryPage({ openOrder, setMessage }: { openOrder: (orderId: string
     }
   }
 
+  async function permanentlyDeleteOrder() {
+    if (!deleteTarget) return;
+    const orderId = deleteTarget;
+    setBusy(true);
+    try {
+      const result = await api<{ deletedOrderCount: number; deletedBanquetCount: number }>(`/api/orders/${orderId}`, { method: "DELETE" });
+      setDeleteTarget(null);
+      setSelected((current) => current?.id === orderId ? null : current);
+      await load(true);
+      setMessage(result.deletedBanquetCount
+        ? "订单及其关联宴席预定、定金和打印记录已永久删除，顾客积分已重算"
+        : "订单、结账和打印记录已永久删除，顾客积分已重算");
+    } catch (error) {
+      setMessage(errorText(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   useEffect(() => { void load(true); }, []);
   function setFilter(key: keyof typeof filters, value: string) { setFilters((current) => ({ ...current, [key]: value })); }
 
-  return <section className="page-section"><div className="section-heading"><div><h2>订单查询</h2><p className="muted">按时间、金额、状态、桌台、顾客或收款方式查询，未填写手机号的订单也会保留。</p></div><button className="secondary" onClick={() => void load(true)} disabled={busy}>刷新</button></div><div className="content-card order-query-card"><div className="filter-grid"><label>开始日期<input type="date" value={filters.from} onChange={(event) => setFilter("from", event.target.value)} /></label><label>结束日期<input type="date" value={filters.to} onChange={(event) => setFilter("to", event.target.value)} /></label><label>最低金额（元）<input type="number" min="0" step="0.01" value={filters.minAmount} onChange={(event) => setFilter("minAmount", event.target.value)} /></label><label>最高金额（元）<input type="number" min="0" step="0.01" value={filters.maxAmount} onChange={(event) => setFilter("maxAmount", event.target.value)} /></label><label className="filter-wide">关键字<input placeholder="订单号、桌台、顾客称呼或手机号" value={filters.q} onChange={(event) => setFilter("q", event.target.value)} /></label><label>订单状态<select value={filters.status} onChange={(event) => setFilter("status", event.target.value)}><option value="">全部状态</option><option value="OPEN">进行中</option><option value="SETTLED">已结账</option><option value="VOID">未结账结束</option><option value="REVERSED">已撤销</option></select></label><label>收款方式<select value={filters.paymentMethod} onChange={(event) => setFilter("paymentMethod", event.target.value)}><option value="">全部方式</option><option>现金</option><option>微信</option><option>支付宝</option><option>银行卡</option><option>其他</option></select></label></div><div className="filter-actions"><button className="primary" onClick={() => void load(true)} disabled={busy}>{busy ? "查询中…" : "查询订单"}</button><button className="secondary" onClick={() => { setFilters({ from: "", to: "", minAmount: "", maxAmount: "", q: "", status: "", paymentMethod: "" }); }}>清空条件</button></div></div><div className="content-card"><table><thead><tr><th>时间</th><th>桌台</th><th>顾客</th><th>手机号</th><th>状态</th><th>菜品数量</th><th>金额</th><th>毛利率</th><th>收款方式</th><th></th></tr></thead><tbody>{orders.map((order) => <tr key={order.id}><td>{formatTime(order.opened_at)}</td><td>{order.table_name || (order.table_number ? `${order.table_number}号桌` : "无桌台")}</td><td>{order.customer_name || "散客"}</td><td>{order.customer_phone || "未填写"}</td><td><span className={`status-pill ${order.status === "OPEN" ? "green" : "gray"}`}>{statusText(order.status)}</span></td><td>{order.item_count}</td><td>{money(order.amount_fen)}</td><td>{order.gross_margin_percent === null || order.gross_margin_percent === undefined ? "—" : `${order.gross_margin_percent}%`}</td><td>{order.payment_method || "—"}</td><td><button className="text-button" onClick={() => void showDetail(order.id)}>查看详情</button></td></tr>)}</tbody></table>{!orders.length && <div className="empty">没有符合条件的订单</div>}{hasMore && <div className="filter-actions"><button className="secondary" onClick={() => void load(false)} disabled={busy}>{busy ? "读取中…" : "加载更早订单"}</button></div>}</div>{selected && <OrderDetailDialog order={selected} onClose={() => setSelected(null)} onOpenOrder={() => { setSelected(null); openOrder(selected.id); }} />}</section>;
+  return <section className="page-section"><div className="section-heading"><div><h2>订单查询</h2><p className="muted">按时间、金额、状态、桌台、顾客或收款方式查询，未填写手机号的订单也会保留。</p></div><button className="secondary" onClick={() => void load(true)} disabled={busy}>刷新</button></div><div className="content-card order-query-card"><div className="filter-grid"><label>开始日期<input type="date" value={filters.from} onChange={(event) => setFilter("from", event.target.value)} /></label><label>结束日期<input type="date" value={filters.to} onChange={(event) => setFilter("to", event.target.value)} /></label><label>最低金额（元）<input type="number" min="0" step="0.01" value={filters.minAmount} onChange={(event) => setFilter("minAmount", event.target.value)} /></label><label>最高金额（元）<input type="number" min="0" step="0.01" value={filters.maxAmount} onChange={(event) => setFilter("maxAmount", event.target.value)} /></label><label className="filter-wide">关键字<input placeholder="订单号、桌台、顾客称呼或手机号" value={filters.q} onChange={(event) => setFilter("q", event.target.value)} /></label><label>订单状态<select value={filters.status} onChange={(event) => setFilter("status", event.target.value)}><option value="">全部状态</option><option value="OPEN">进行中</option><option value="SETTLED">已结账</option><option value="VOID">未结账结束</option><option value="REVERSED">已撤销</option></select></label><label>收款方式<select value={filters.paymentMethod} onChange={(event) => setFilter("paymentMethod", event.target.value)}><option value="">全部方式</option><option>现金</option><option>微信</option><option>支付宝</option><option>银行卡</option><option>其他</option></select></label></div><div className="filter-actions"><button className="primary" onClick={() => void load(true)} disabled={busy}>{busy ? "查询中…" : "查询订单"}</button><button className="secondary" onClick={() => { setFilters({ from: "", to: "", minAmount: "", maxAmount: "", q: "", status: "", paymentMethod: "" }); }}>清空条件</button></div></div><div className="content-card"><table><thead><tr><th>时间</th><th>桌台</th><th>顾客</th><th>手机号</th><th>状态</th><th>菜品数量</th><th>金额</th><th>毛利率</th><th>收款方式</th><th></th></tr></thead><tbody>{orders.map((order) => <tr key={order.id}><td>{formatTime(order.opened_at)}</td><td>{order.table_name || (order.table_number ? `${order.table_number}号桌` : "无桌台")}</td><td>{order.customer_name || "散客"}</td><td>{order.customer_phone || "未填写"}</td><td><span className={`status-pill ${order.status === "OPEN" ? "green" : "gray"}`}>{statusText(order.status)}</span></td><td>{order.item_count}</td><td>{money(order.amount_fen)}</td><td>{order.gross_margin_percent === null || order.gross_margin_percent === undefined ? "—" : `${order.gross_margin_percent}%`}</td><td>{order.payment_method || "—"}</td><td><div className="table-row-actions"><button type="button" className="text-button" onClick={() => void showDetail(order.id)}>查看详情</button>{isOwner && <button type="button" className="text-button danger-text" onClick={() => setDeleteTarget(order.id)}>永久删除</button>}</div></td></tr>)}</tbody></table>{!orders.length && <div className="empty">没有符合条件的订单</div>}{hasMore && <div className="filter-actions"><button className="secondary" onClick={() => void load(false)} disabled={busy}>{busy ? "读取中…" : "加载更早订单"}</button></div>}</div>{selected && <OrderDetailDialog order={selected} onClose={() => setSelected(null)} onOpenOrder={() => { setSelected(null); openOrder(selected.id); }} canDelete={isOwner} onDelete={() => setDeleteTarget(selected.id)} />}{deleteTarget && <ConfirmDialog title="永久删除订单" message="删除后无法恢复。系统会同时删除关联宴席预定、定金账本、结账、积分流水、打印任务和操作记录，并释放桌台；若有打印任务正在发送，或重算后积分会为负，系统会拒绝删除。" confirmText="永久删除" danger busy={busy} onClose={() => setDeleteTarget(null)} onConfirm={() => void permanentlyDeleteOrder()} />}</section>;
 }
 
-function OrderDetailDialog({ order, onClose, onOpenOrder }: { order: Order; onClose: () => void; onOpenOrder: () => void }) {
-  return <Dialog title="订单详情" description={`${order.tableName || (order.tableNumber ? `${order.tableNumber}号桌` : "无桌台")} · ${statusText(order.status)}`} onClose={onClose} className="detail-modal large-modal"><div className="detail-summary"><div><span>顾客</span><strong>{order.customer.name || "散客"}</strong></div><div><span>手机号</span><strong>{order.customer.phone || "未填写"}</strong></div><div><span>人数</span><strong>{order.peopleCount} 人</strong></div><div><span>开台时间</span><strong>{formatTime(order.openedAt)}</strong></div><div><span>结束时间</span><strong>{formatTime(order.endedAt || order.settledAt)}</strong></div><div><span>本单毛利率</span><strong>{order.grossMarginPercent === null ? "—" : `${order.grossMarginPercent}%`}</strong></div></div>{order.orderNote && <p className="order-note"><span>本单备注：</span>{order.orderNote}</p>}<h3>菜品明细</h3><div className="mini-list order-detail-items">{order.items.map((item) => <div key={item.id}><span>{item.name} × {item.quantity}{item.note ? `（${item.note}）` : ""}</span><strong>{money(item.priceFen * item.quantity)}</strong><small>{item.giftedQuantity ? `赠送 ${item.giftedQuantity}` : ""}{item.returnedQuantity ? ` 退菜 ${item.returnedQuantity}` : ""}</small></div>)}</div><div className="checkout-summary detail-checkout-summary"><div><span>原价</span><strong>{money(order.totals.grossFen)}</strong></div><div><span>赠送</span><strong>-{money(order.totals.giftFen)}</strong></div><div><span>退菜</span><strong>-{money(order.totals.returnFen)}</strong></div><div className="emphasis"><span>有效收入</span><strong>{money(order.revenueFen ?? order.totals.subtotalFen)}</strong></div></div>{order.endReason && <p className="muted">结束说明：{order.endReason}</p>}{order.settlements.length > 0 && <><h3>结账记录</h3><div className="mini-list">{order.settlements.map((settlement) => <div key={settlement.id}><span>第 {settlement.version} 次 · {settlement.payment_method} · {settlement.status === "ACTIVE" ? "有效" : "已撤销"}</span><strong>{money(settlement.received_fen)}</strong><small>{formatTime(settlement.settled_at)} · {settlement.operator_name || "未知操作员"} · 积分抵扣 {settlement.redeemed_points} 分 · 定金抵扣 {money(settlement.deposit_applied_fen || 0)} · 人工减免 {money(settlement.manual_discount_fen)}</small></div>)}</div></>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>关闭</button><button type="button" className="primary" onClick={onOpenOrder}>打开桌台页面</button></div></Dialog>;
+function OrderDetailDialog({ order, onClose, onOpenOrder, canDelete = false, onDelete }: { order: Order; onClose: () => void; onOpenOrder: () => void; canDelete?: boolean; onDelete?: () => void }) {
+  return <Dialog title="订单详情" description={`${order.tableName || (order.tableNumber ? `${order.tableNumber}号桌` : "无桌台")} · ${statusText(order.status)}`} onClose={onClose} className="detail-modal large-modal"><div className="detail-summary"><div><span>顾客</span><strong>{order.customer.name || "散客"}</strong></div><div><span>手机号</span><strong>{order.customer.phone || "未填写"}</strong></div><div><span>人数</span><strong>{order.peopleCount} 人</strong></div><div><span>开台时间</span><strong>{formatTime(order.openedAt)}</strong></div><div><span>结束时间</span><strong>{formatTime(order.endedAt || order.settledAt)}</strong></div><div><span>本单毛利率</span><strong>{order.grossMarginPercent === null ? "—" : `${order.grossMarginPercent}%`}</strong></div></div>{order.orderNote && <p className="order-note"><span>本单备注：</span>{order.orderNote}</p>}<h3>菜品明细</h3><div className="mini-list order-detail-items">{order.items.map((item) => <div key={item.id}><span>{item.name} × {item.quantity}{item.note ? `（${item.note}）` : ""}</span><strong>{money(item.priceFen * item.quantity)}</strong><small>{item.giftedQuantity ? `赠送 ${item.giftedQuantity}` : ""}{item.returnedQuantity ? ` 退菜 ${item.returnedQuantity}` : ""}</small></div>)}</div><div className="checkout-summary detail-checkout-summary"><div><span>原价</span><strong>{money(order.totals.grossFen)}</strong></div><div><span>赠送</span><strong>-{money(order.totals.giftFen)}</strong></div><div><span>退菜</span><strong>-{money(order.totals.returnFen)}</strong></div><div className="emphasis"><span>有效收入</span><strong>{money(order.revenueFen ?? order.totals.subtotalFen)}</strong></div></div>{order.endReason && <p className="muted">结束说明：{order.endReason}</p>}{order.settlements.length > 0 && <><h3>结账记录</h3><div className="mini-list">{order.settlements.map((settlement) => <div key={settlement.id}><span>第 {settlement.version} 次 · {settlement.payment_method} · {settlement.status === "ACTIVE" ? "有效" : "已撤销"}</span><strong>{money(settlement.received_fen)}</strong><small>{formatTime(settlement.settled_at)} · {settlement.operator_name || "未知操作员"} · 积分抵扣 {settlement.redeemed_points} 分 · 定金抵扣 {money(settlement.deposit_applied_fen || 0)} · 人工减免 {money(settlement.manual_discount_fen)}</small></div>)}</div></>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>关闭</button>{canDelete && <button type="button" className="danger-button" onClick={onDelete}>永久删除</button>}<button type="button" className="primary" onClick={onOpenOrder}>打开桌台页面</button></div></Dialog>;
 }
 
 function CustomersPage({ setMessage }: { setMessage: (message: string) => void }) {
@@ -1574,6 +1651,7 @@ function CategoryManagerDialog({ categories, onClose, onChanged, setMessage }: {
   async function add() { if (!name.trim()) return setMessage("分类名称不能为空"); try { await api("/api/categories", { method: "POST", body: JSON.stringify({ name: name.trim() }) }); setName(""); await Promise.all([onChanged(), loadAll()]); setMessage("分类已新增"); } catch (error) { setMessage(errorText(error)); } }
   async function update(id: string) { try { await api(`/api/categories/${id}`, { method: "PATCH", body: JSON.stringify({ name: names[id] }) }); await Promise.all([onChanged(), loadAll()]); setMessage("分类已修改"); } catch (error) { setMessage(errorText(error)); } }
   async function setActive(category: Category, active: boolean) { try { await api(`/api/categories/${category.id}`, { method: "PATCH", body: JSON.stringify({ active }) }); await Promise.all([onChanged(), loadAll()]); setMessage(active ? "分类已恢复" : "分类已停用"); } catch (error) { setMessage(errorText(error)); } }
+  async function setPointsEarning(category: Category, enabled: boolean) { try { await api(`/api/categories/${category.id}`, { method: "PATCH", body: JSON.stringify({ pointsEarningEnabled: enabled }) }); await Promise.all([onChanged(), loadAll()]); setMessage(enabled ? `“${category.name}”分类菜品将累计积分` : `“${category.name}”分类菜品不再累计积分`); } catch (error) { setMessage(errorText(error)); } }
   async function archive() { const category = rows.find((row) => row.id === deleteId); if (!category) return; await setActive(category, false); setDeleteId(""); }
   async function moveCategory(index: number, direction: -1 | 1) {
     const ids = rows.filter((row) => row.active !== false).map((row) => row.id);
@@ -1592,7 +1670,7 @@ function CategoryManagerDialog({ categories, onClose, onChanged, setMessage }: {
     }
   }
   let activeIndex = 0;
-  return <Dialog title="分类管理" description="使用上下按钮调整分类顺序；停用分类可在此恢复。" onClose={onClose} className="large-modal"><div className="category-manager-list">{rows.map((category) => { const isActive = category.active !== false; const index = isActive ? activeIndex++ : -1; return <div className="category-manager-row" key={category.id}><input value={names[category.id] || ""} onChange={(event) => setNames((current) => ({ ...current, [category.id]: event.target.value }))} disabled={!isActive} /><div className="category-order-controls">{isActive && <><button type="button" className="secondary" aria-label={`${category.name}上移`} title="上移" disabled={orderBusy || index === 0} onClick={() => void moveCategory(index, -1)}>↑</button><button type="button" className="secondary" aria-label={`${category.name}下移`} title="下移" disabled={orderBusy || index === rows.filter((row) => row.active !== false).length - 1} onClick={() => void moveCategory(index, 1)}>↓</button></>}</div><button type="button" className="secondary" onClick={() => void update(category.id)} disabled={!isActive}>保存</button>{!isActive ? <button type="button" className="text-button" onClick={() => void setActive(category, true)}>恢复</button> : <button type="button" className="text-button danger-text" onClick={() => setDeleteId(category.id)}>停用</button>}</div>; })}</div><div className="category-add-row"><input placeholder="新增分类名称" value={name} onChange={(event) => setName(event.target.value)} /><button type="button" className="primary" onClick={() => void add()}>新增分类</button></div><div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button></div>{deleteId && <ConfirmDialog title="停用分类" message="停用后不能再给新菜品选择，但历史订单仍会保留。" confirmText="确认停用" danger onClose={() => setDeleteId("")} onConfirm={() => void archive()} />}</Dialog>;
+  return <Dialog title="分类管理" description="使用上下按钮调整顺序；可以设置分类积分规则，停用分类可在此恢复。" onClose={onClose} className="large-modal"><div className="category-manager-list">{rows.map((category) => { const isActive = category.active !== false; const index = isActive ? activeIndex++ : -1; return <div className="category-manager-row" key={category.id}><input value={names[category.id] || ""} onChange={(event) => setNames((current) => ({ ...current, [category.id]: event.target.value }))} disabled={!isActive} /><label className="checkbox-row category-points-toggle"><input type="checkbox" checked={category.points_earning_enabled !== false} onChange={(event) => void setPointsEarning(category, event.target.checked)} disabled={!isActive} />累计积分</label><div className="category-order-controls">{isActive && <><button type="button" className="secondary" aria-label={`${category.name}上移`} title="上移" disabled={orderBusy || index === 0} onClick={() => void moveCategory(index, -1)}>↑</button><button type="button" className="secondary" aria-label={`${category.name}下移`} title="下移" disabled={orderBusy || index === rows.filter((row) => row.active !== false).length - 1} onClick={() => void moveCategory(index, 1)}>↓</button></>}</div><button type="button" className="secondary" onClick={() => void update(category.id)} disabled={!isActive}>保存</button>{!isActive ? <button type="button" className="text-button" onClick={() => void setActive(category, true)}>恢复</button> : <button type="button" className="text-button danger-text" onClick={() => setDeleteId(category.id)}>停用</button>}</div>; })}</div><div className="category-add-row"><input placeholder="新增分类名称" value={name} onChange={(event) => setName(event.target.value)} /><button type="button" className="primary" onClick={() => void add()}>新增分类</button></div><div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button></div>{deleteId && <ConfirmDialog title="停用分类" message="停用后不能再给新菜品选择，但历史订单仍会保留。" confirmText="确认停用" danger onClose={() => setDeleteId("")} onConfirm={() => void archive()} />}</Dialog>;
 }
 
 function printKindText(kind: string): string {
@@ -2051,6 +2129,7 @@ function SettingsPage({ setMessage, fontSize, setFontSize, orderPreviewSide, set
     <DevicePreferences setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} orderPreviewSide={orderPreviewSide} setOrderPreviewSide={setOrderPreviewSide} />
     <AndroidPrinterPanel setMessage={setMessage} />
     <div className="content-card"><h3>店铺与小票</h3><div className="form-grid"><label>店名<input value={value("store_name")} onChange={(event) => setSettings({ ...settings, store_name: event.target.value })} /></label><label>小票尾注<input value={value("receipt_footer")} onChange={(event) => setSettings({ ...settings, receipt_footer: event.target.value })} /></label><label>当前打印设备<input value={value("printer_device_name", "未配置打印设备")} readOnly /></label><label>设备编号<input value={value("printer_device_id", "未配置")} readOnly /></label></div></div>
+    <div className="content-card"><h3>宴席备菜单提醒</h3><div className="form-grid"><label>提前提醒时间（分钟）<small>默认 120 分钟；宴席到点仍未打印时也会保留在通知中心</small><input type="number" min="1" max="1440" step="1" value={Number(settings.banquet_preorder_reminder_minutes ?? 120)} onChange={(event) => setSettings({ ...settings, banquet_preorder_reminder_minutes: Math.max(1, Math.min(1440, Number(event.target.value) || 1)) })} /></label></div></div>
     <div className="content-card"><h3>打印设备列表</h3><p className="muted">最近 30 秒内上报心跳视为在线；“重新授权”会让旧授权立即失效。</p>{printerDevices.length ? <div className="employee-list">{printerDevices.map((device) => { const lastSeen = device.last_seen_at ? new Date(device.last_seen_at).getTime() : 0; const online = Number.isFinite(lastSeen) && Date.now() - lastSeen < 30_000; return <div className="employee-row printer-device-row" key={device.id}><div><strong>{device.name}</strong><span>{device.id} · {device.active ? "当前打印主机" : "备用设备"} · 最近连接 {device.last_seen_at ? formatTime(device.last_seen_at) : "从未"}</span></div><span className={online ? "status-pill green" : "status-pill gray"}>{online ? "在线" : "离线"}</span><button type="button" className="secondary" onClick={() => void togglePrinter(device)}>{device.active ? "停用" : "启用并设为当前"}</button><button type="button" className="text-button" onClick={() => void rotatePrinter(device)}>重新授权</button></div>; })}</div> : <div className="empty">尚未注册打印设备</div>}</div>
     <div className="content-card"><h3>积分规则</h3>
       <label className="toggle-row"><input type="checkbox" checked={Boolean(settings.points_enabled)} onChange={(event) => setSettings({ ...settings, points_enabled: event.target.checked })} />启用积分</label>
@@ -2269,13 +2348,14 @@ export default function App() {
     : selectedOrderId
     ? <OrderPage orderId={selectedOrderId} user={user} refreshTables={refreshTables} setMessage={setMessage} goBack={() => setSelectedOrderId("")} onReopened={setSelectedOrderId} orderPreviewSide={orderPreviewSide} />
     : page === "tables" ? <TablesPage tables={tables} refresh={refreshTables} openOrder={setSelectedOrderId} openBanquets={(tableId) => { setBanquetFocusTableId(tableId || ""); setBanquetFocusReservationId(""); setPage("banquets"); }} setMessage={setMessage} />
-      : page === "banquets" ? <BanquetPage onOpenOrder={setSelectedOrderId} onPreorder={(reservationId) => { setBanquetFocusReservationId(reservationId); setSelectedBanquetPreorderId(reservationId); }} setMessage={setMessage} canManageHalls={user.role === "OWNER"} focusTableId={banquetFocusTableId} focusReservationId={banquetFocusReservationId} />
-        : page === "orders" ? <OrderQueryPage openOrder={(orderId) => { setPage("tables"); setSelectedOrderId(orderId); }} setMessage={setMessage} />
+      : page === "banquets" ? <BanquetPage onOpenOrder={setSelectedOrderId} onPreorder={(reservationId) => { setBanquetFocusReservationId(reservationId); setSelectedBanquetPreorderId(reservationId); }} setMessage={setMessage} canManageHalls={user.role === "OWNER"} canDeleteRecords={user.role === "OWNER"} focusTableId={banquetFocusTableId} focusReservationId={banquetFocusReservationId} />
+        : page === "orders" ? <OrderQueryPage openOrder={(orderId) => { setPage("tables"); setSelectedOrderId(orderId); }} setMessage={setMessage} isOwner={user.role === "OWNER"} />
         : page === "customers" ? <CustomersPage setMessage={setMessage} />
               : page === "dishes" ? <DishesPage categories={categories} user={user} setMessage={setMessage} reloadCategories={refreshCategories} />
                 : page === "stats" ? <StatsPage setMessage={setMessage} />
                   : page === "print" ? <PrintManagementPage setMessage={setMessage} />
                   : user.role === "OWNER" ? <SettingsPage setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} orderPreviewSide={orderPreviewSide} setOrderPreviewSide={setOrderPreviewSide} />
                     : <DeviceSettingsPage setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} orderPreviewSide={orderPreviewSide} setOrderPreviewSide={setOrderPreviewSide} />;
-  return <div className="app-shell"><Header user={user} page={page} setPage={(next) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); if (next !== "banquets") { setBanquetFocusTableId(""); setBanquetFocusReservationId(""); } setPage(next); }} onLogout={logout} selectedOrder={Boolean(selectedOrderId || selectedBanquetPreorderId)} />{message && <div className="toast">{message}<button onClick={() => setMessage("")}>×</button></div>}<main>{content}</main></div>;
+  const selectedOrderingPage = Boolean(selectedOrderId || selectedBanquetPreorderId);
+  return <div className={`app-shell${selectedOrderingPage && !Capacitor.isNativePlatform() ? " app-shell-ordering" : ""}`}><Header user={user} page={page} setPage={(next) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); if (next !== "banquets") { setBanquetFocusTableId(""); setBanquetFocusReservationId(""); } setPage(next); }} onOpenBanquetReminder={(reservationId) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); setBanquetFocusTableId(""); setBanquetFocusReservationId(reservationId); setPage("banquets"); }} onLogout={logout} selectedOrder={selectedOrderingPage} />{message && <div className="toast">{message}<button onClick={() => setMessage("")}>×</button></div>}<main>{content}</main></div>;
 }

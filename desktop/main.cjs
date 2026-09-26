@@ -5,7 +5,7 @@ const path = require("node:path");
 const { Readable, Transform } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 
-const dashboardUrl = process.env.ORDER_DINNER_URL || "https://dinner.20-48-27-179.sslip.io:1314";
+const dashboardUrl = process.env.ORDER_DINNER_URL || "https://43.142.138.108:1316";
 const updateManifestUrl = process.env.ORDER_DINNER_UPDATE_MANIFEST_URL || new URL("/updates/latest.json", dashboardUrl).toString();
 const updateChannel = "order-dinner:update";
 const manifestLimit = 256 * 1024;

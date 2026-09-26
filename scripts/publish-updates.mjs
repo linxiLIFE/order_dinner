@@ -32,7 +32,7 @@ const windowsPackage = oneFile(
 );
 
 const updatesRoot = path.join(root, "updates");
-const baseUrl = new URL(process.env.UPDATE_BASE_URL || "https://dinner.20-48-27-179.sslip.io:1314");
+const baseUrl = new URL(process.env.UPDATE_BASE_URL || "https://43.142.138.108:1316");
 if (baseUrl.protocol !== "https:") throw new Error("更新服务地址必须使用 HTTPS。");
 const versionDirectory = path.join(updatesRoot, version);
 if (fs.existsSync(versionDirectory)) {
@@ -57,7 +57,7 @@ fs.renameSync(stagingDirectory, versionDirectory);
 const manifest = {
   schemaVersion: 1,
   version,
-  notes: "支持点菜后换桌并重打备菜单；登录页可修改密码；网页、安卓和 Windows 更新。",
+  notes: "点菜界面可独立滚动并固定合计；增加宴席备菜单提醒和备注编辑；网页、安卓和 Windows 更新。",
   android: artifacts.android,
   windows: artifacts.windows
 };

@@ -3,19 +3,19 @@ set -euo pipefail
 
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
-ssh_key="${SSH_KEY:-/Users/linxi/Downloads/google/astro-vm_key.pem}"
-ssh_user="${SSH_USER:-azureuser}"
-ssh_host="${SSH_HOST:-20.48.27.179}"
-ssh_interface="${SSH_INTERFACE:-en0}"
+ssh_key="${SSH_KEY:-/Users/linxi/Downloads/edge/tencloud.pem}"
+ssh_user="${SSH_USER:-ubuntu}"
+ssh_host="${SSH_HOST:-43.142.138.108}"
 remote_root="/opt/order-dinner"
-public_host="dinner.20-48-27-179.sslip.io"
+public_host="43.142.138.108"
+public_port="1316"
 release_version="$(node -p 'require("./package.json").version')"
 [[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "版本号格式不正确" >&2; exit 1; }
 [[ -f updates/latest.json && -d "updates/$release_version" ]] || { echo "缺少当前版本更新文件" >&2; exit 1; }
 manifest_version="$(node -p 'require("./updates/latest.json").version')"
 [[ "$manifest_version" == "$release_version" ]] || { echo "更新清单与项目版本不一致" >&2; exit 1; }
-ssh_args=(-B "$ssh_interface" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o IdentitiesOnly=yes -o ConnectTimeout=20 -i "$ssh_key")
-scp_args=(-o BindInterface="$ssh_interface" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o IdentitiesOnly=yes -o ConnectTimeout=20 -i "$ssh_key")
+ssh_args=(-o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o IdentitiesOnly=yes -o ConnectTimeout=20 -i "$ssh_key")
+scp_args=(-o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o IdentitiesOnly=yes -o ConnectTimeout=20 -i "$ssh_key")
 
 ./scripts/generate-live-env.sh
 source .deploy/order-dinner.env
@@ -76,10 +76,10 @@ caddyfile=/opt/love-web/Caddyfile
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup="/opt/love-web/Caddyfile.before-order-dinner-$stamp"
 sudo cp -a "$caddyfile" "$backup"
-if ! sudo grep -q 'dinner\.20-48-27-179\.sslip\.io:1314' "$caddyfile"; then
+if ! sudo grep -q 'https://43\.142\.138\.108:1316' "$caddyfile"; then
   sudo tee -a "$caddyfile" >/dev/null <<'CADDY_BLOCK'
 
-https://dinner.20-48-27-179.sslip.io:1314 {
+https://43.142.138.108:1316 {
   import common_security
   reverse_proxy order-dinner-app:3000
 }
@@ -102,7 +102,7 @@ CRON
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo chmod 644 /etc/cron.d/order-dinner-backup && sudo touch '$remote_root/backups/backup.log' && sudo chown '$ssh_user':'$remote_group' '$remote_root' '$remote_root/backups' '$remote_root/backups/backup.log' && sudo chmod 600 '$remote_root/backups/backup.log'"
 
 echo "线上健康检查"
-ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "curl --fail --silent --show-error --resolve '$public_host:1314:127.0.0.1' 'https://$public_host:1314/healthz'"
+ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "curl --fail --silent --show-error --resolve '$public_host:$public_port:127.0.0.1' 'https://$public_host:$public_port/healthz'"
 echo
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "CURRENT_RELEASE='$remote_release' REMOTE_ROOT='$remote_root' bash -s" <<'REMOTE_CLEANUP'
 set -euo pipefail
@@ -122,4 +122,4 @@ for old_release in "$REMOTE_ROOT/.deploy/releases"/*; do
   printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' "$old_release" "$(date +%Y-%m-%dT%H:%M:%S)" > "$trash_root/info/$trash_name.trashinfo"
 done
 REMOTE_CLEANUP
-echo "部署完成：https://$public_host:1314"
+echo "部署完成：https://$public_host:$public_port"
