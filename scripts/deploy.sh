@@ -24,7 +24,7 @@ echo "上传项目到 $ssh_user@$ssh_host:$remote_root"
 release_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 remote_release="$remote_root/.deploy/releases/$release_id"
 remote_group="$(ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "id -gn '$ssh_user'")"
-ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo install -d -m 0750 -o '$ssh_user' -g '$remote_group' '$remote_root' '$remote_root/.deploy' '$remote_root/.deploy/releases' '$remote_release' '$remote_root/backups' && sudo chown '$ssh_user':'$remote_group' '$remote_root'"
+ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo chmod o+x /opt && sudo install -d -m 0750 -o '$ssh_user' -g '$remote_group' '$remote_root' '$remote_root/.deploy' '$remote_root/.deploy/releases' '$remote_release' '$remote_root/backups' && sudo chown '$ssh_user':'$remote_group' '$remote_root'"
 COPYFILE_DISABLE=1 tar \
   --exclude='./.git' \
   --exclude='./node_modules' \
@@ -67,7 +67,18 @@ else
 fi
 
 echo "启动数据库与应用容器"
-ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo docker network inspect love-web_love-network >/dev/null && sudo env ORDER_DINNER_BUILD_CONTEXT='$remote_release' docker compose --project-directory '$remote_root' --env-file '$remote_root/.env' -f '$remote_release/docker-compose.yml' up -d --build"
+ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "CURRENT_RELEASE='$remote_release' REMOTE_ROOT='$remote_root' bash -s" <<'REMOTE_BUILD'
+set -euo pipefail
+sudo docker network inspect love-web_love-network >/dev/null
+if sudo docker image inspect order-dinner:local >/dev/null 2>&1; then
+  if ! sudo env ORDER_DINNER_BUILD_CONTEXT="$CURRENT_RELEASE" ORDER_DINNER_DOCKERFILE=Dockerfile.cached docker compose --project-directory "$REMOTE_ROOT" --env-file "$REMOTE_ROOT/.env" -f "$CURRENT_RELEASE/docker-compose.yml" up -d --build; then
+    echo "缓存镜像构建失败，回退到标准 Dockerfile" >&2
+    sudo env ORDER_DINNER_BUILD_CONTEXT="$CURRENT_RELEASE" docker compose --project-directory "$REMOTE_ROOT" --env-file "$REMOTE_ROOT/.env" -f "$CURRENT_RELEASE/docker-compose.yml" up -d --build
+  fi
+else
+  sudo env ORDER_DINNER_BUILD_CONTEXT="$CURRENT_RELEASE" docker compose --project-directory "$REMOTE_ROOT" --env-file "$REMOTE_ROOT/.env" -f "$CURRENT_RELEASE/docker-compose.yml" up -d --build
+fi
+REMOTE_BUILD
 
 echo "备份并增加 Caddy 路由"
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" 'bash -s' <<'REMOTE_SCRIPT'
@@ -85,11 +96,18 @@ https://43.142.138.108:1316 {
 }
 CADDY_BLOCK
 fi
-sudo docker restart love-caddy
 if ! sudo docker exec love-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null; then
   sudo cp -a "$backup" "$caddyfile"
-  sudo docker restart love-caddy
-  echo "Caddy 配置校验失败，已恢复备份并重启：$backup" >&2
+  echo "Caddy 配置校验失败，已恢复备份；线上配置未重启：$backup" >&2
+  exit 1
+fi
+if ! sudo docker restart love-caddy; then
+  sudo cp -a "$backup" "$caddyfile"
+  if ! sudo docker restart love-caddy; then
+    echo "Caddy 重启失败，已恢复配置备份但恢复重启也失败，请检查 love-caddy；备份：$backup" >&2
+  else
+    echo "Caddy 重启失败，已恢复备份并重新启动：$backup" >&2
+  fi
   exit 1
 fi
 echo "Caddy 备份：$backup"
@@ -110,16 +128,15 @@ mounted_updates="$(sudo docker inspect -f '{{range .Mounts}}{{println .Source}}{
 printf '%s\n' "$mounted_updates" | grep -Fxq "$CURRENT_RELEASE/updates"
 grep -Fq "$CURRENT_RELEASE/scripts/backup.sh" /etc/cron.d/order-dinner-backup
 trash_root="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
-mkdir -p "$trash_root/files" "$trash_root/info"
-chmod 700 "$trash_root" "$trash_root/files" "$trash_root/info"
+sudo install -d -m 700 "$trash_root" "$trash_root/files" "$trash_root/info"
 for old_release in "$REMOTE_ROOT/.deploy/releases"/*; do
   [[ -d "$old_release" && "$old_release" != "$CURRENT_RELEASE" ]] || continue
   trash_name="order-dinner-release-$(basename "$old_release")"
-  if [[ -e "$trash_root/files/$trash_name" ]]; then
+  if sudo test -e "$trash_root/files/$trash_name"; then
     trash_name="$trash_name-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   fi
-  mv "$old_release" "$trash_root/files/$trash_name"
-  printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' "$old_release" "$(date +%Y-%m-%dT%H:%M:%S)" > "$trash_root/info/$trash_name.trashinfo"
+  sudo mv "$old_release" "$trash_root/files/$trash_name"
+  printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' "$old_release" "$(date +%Y-%m-%dT%H:%M:%S)" | sudo tee "$trash_root/info/$trash_name.trashinfo" >/dev/null
 done
 REMOTE_CLEANUP
 echo "部署完成：https://$public_host:$public_port"

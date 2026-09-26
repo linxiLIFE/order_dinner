@@ -55,6 +55,14 @@ function requestStorageKey(scope: string): string {
   return `order-dinner-pending-request:${encodeURIComponent(currentEmployeeId())}:${encodeURIComponent(scope)}`;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
 export function getPendingIdempotentRequest(scope: string): PendingIdempotentRequest | null {
   const serialized = localStorage.getItem(requestStorageKey(scope));
   if (!serialized) return null;
@@ -69,7 +77,12 @@ export function getPendingIdempotentRequest(scope: string): PendingIdempotentReq
 
 export function prepareIdempotentRequest(scope: string, payload: Record<string, unknown>): PendingIdempotentRequest {
   const previous = getPendingIdempotentRequest(scope);
-  if (previous) return previous;
+  if (previous) {
+    if (canonicalJson(previous.payload) !== canonicalJson(payload)) {
+      throw new ApiError("上一笔操作结果尚未确认，当前内容与上次不同；请先核对业务状态后再继续", 409);
+    }
+    return previous;
+  }
   const request = { idempotencyKey: crypto.randomUUID(), payload };
   try {
     localStorage.setItem(requestStorageKey(scope), JSON.stringify(request));

@@ -21,6 +21,7 @@ services:
   app:
     build:
       context: ${ORDER_DINNER_BUILD_CONTEXT:-.}
+      dockerfile: ${ORDER_DINNER_DOCKERFILE:-Dockerfile}
     image: order-dinner:local
     container_name: order-dinner-app
     restart: unless-stopped

@@ -204,7 +204,6 @@ type ItemRow = {
   price_fen: number;
   cost_fen: number;
   points_earning_enabled: boolean;
-  current_category_points_earning_enabled?: boolean | null;
   quantity: number;
   gifted_quantity: number;
   returned_quantity: number;
@@ -226,7 +225,7 @@ type Totals = {
 };
 
 function calculateTotals(items: ItemRow[]): Totals {
-  return items.reduce(
+  const totals = items.reduce(
     (total, item) => {
       const returned = Math.min(item.quantity, item.returned_quantity);
       const gifted = Math.min(Math.max(0, item.quantity - returned), item.gifted_quantity);
@@ -245,6 +244,11 @@ function calculateTotals(items: ItemRow[]): Totals {
     },
     { grossFen: 0, giftFen: 0, returnFen: 0, subtotalFen: 0, costFen: 0, lossFen: 0 }
   );
+  const postgresIntegerMax = 2_147_483_647;
+  if (Object.values(totals).some((value) => !Number.isSafeInteger(value) || value > postgresIntegerMax)) {
+    fail("订单金额或数量超过系统支持范围，请调整菜品数量或拆分账单", 409);
+  }
+  return totals;
 }
 
 function marginPercent(revenueFen: number, costFen: number): number {
@@ -286,10 +290,10 @@ function optionSelections(
   for (const group of groups) {
     const row = requested.find((value) => text((value as { groupId?: unknown })?.groupId) === group.id) as { optionIds?: unknown } | undefined;
     const optionIds = Array.from(new Set(Array.isArray(row?.optionIds) ? row.optionIds.map((id) => text(id)).filter(Boolean) : []));
-    if (group.required && !optionIds.length) fail(`请选择${group.name}`);
-    if (!group.allow_multiple && optionIds.length > 1) fail(`${group.name}只能选择一项`);
+    if (group.required && !optionIds.length) fail(`菜品备注选项已更新，请重新选择${group.name}`, 409);
+    if (!group.allow_multiple && optionIds.length > 1) fail(`菜品备注选项已更新，请重新选择${group.name}`, 409);
     const selected = optionIds.map((id) => group.options.find((option) => option.id === id)).filter(Boolean) as Array<{ id: string; label: string }>;
-    if (selected.length !== optionIds.length) fail(`${group.name}包含无效选项`);
+    if (selected.length !== optionIds.length) fail(`菜品备注选项已更新，请重新选择${group.name}`, 409);
     if (selected.length) {
       noteParts.push(`${group.name}：${selected.map((option) => option.label).join("、")}`);
       snapshot.push({ groupId: group.id, groupName: group.name, optionIds, labels: selected.map((option) => option.label) });
@@ -298,6 +302,21 @@ function optionSelections(
   const note = text(customNote).slice(0, 300);
   if (note) noteParts.push(snapshot.length ? `备注：${note}` : note);
   return { note: noteParts.join("，").slice(0, 500), snapshot };
+}
+
+function assertExpectedDishSnapshot(dish: { name: string; unit: string; price_fen: number; cost_fen: number }, raw: unknown): void {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+  const expected = raw as Record<string, unknown>;
+  if (expected.expectedDishName !== undefined && expected.expectedDishName !== dish.name) fail("菜单已更新，请重新确认待提交菜品", 409);
+  if (expected.expectedUnit !== undefined && expected.expectedUnit !== dish.unit) fail("菜单已更新，请重新确认待提交菜品", 409);
+  if (expected.expectedPriceFen !== undefined
+    && (!Number.isSafeInteger(expected.expectedPriceFen) || expected.expectedPriceFen !== dish.price_fen)) {
+    fail("菜单已更新，请重新确认待提交菜品", 409);
+  }
+  if (expected.expectedCostFen !== undefined
+    && (!Number.isSafeInteger(expected.expectedCostFen) || Number(expected.expectedCostFen) !== Number(dish.cost_fen))) {
+    fail("菜单已更新，请重新确认待提交菜品", 409);
+  }
 }
 
 async function replaceDishOptionGroups(client: DbClient, dishId: string, rawGroups: unknown): Promise<void> {
@@ -331,11 +350,9 @@ async function replaceDishOptionGroups(client: DbClient, dishId: string, rawGrou
 
 async function orderItems(client: DbClient, orderId: string): Promise<ItemRow[]> {
   const result = await client.query<ItemRow>(
-    `SELECT oi.*, ob.batch_no, ob.kind AS batch_kind, c.points_earning_enabled AS current_category_points_earning_enabled
+    `SELECT oi.*, ob.batch_no, ob.kind AS batch_kind
      FROM order_items oi
      JOIN order_batches ob ON ob.id = oi.batch_id
-     LEFT JOIN dishes d ON d.id = oi.dish_id
-     LEFT JOIN categories c ON c.id = d.category_id
      WHERE oi.order_id = $1
      ORDER BY ob.batch_no, oi.created_at, oi.id`,
     [orderId]
@@ -1048,7 +1065,9 @@ const settingsSchema = z.object({
   points_redeem_tiers: z.array(z.object({
     points: z.number().int().min(1).max(1_000_000_000),
     discountFen: z.number().int().min(1).max(1_000_000_000)
-  }).strict()).min(1).max(20).refine((tiers) => new Set(tiers.map((tier) => tier.points)).size === tiers.length, "积分档位不能重复").optional(),
+  }).strict()).min(1).max(20).refine((tiers) => tiers.every((tier, index) =>
+    index === 0 || (tier.points > tiers[index - 1].points && tier.discountFen > tiers[index - 1].discountFen)
+  ), "积分档位的积分数和抵扣金额都必须严格递增").optional(),
   points_min_spend_fen: z.number().int().min(1).max(1_000_000_000).optional(),
   points_allow_below_minimum: z.boolean().optional(),
   points_redeem_points: z.number().int().min(1).max(1_000_000_000).optional(),
@@ -1062,10 +1081,11 @@ type LoginBucket = { failures: number; resetAt: number; blockedUntil: number; to
 const loginBuckets = new Map<string, LoginBucket>();
 const loginWindowMs = 15 * 60 * 1000;
 
-function loginBucketKey(req: Request, kind: "ip" | "account"): string {
+function loginBucketKey(req: Request, kind: "ip" | "account" | "username"): string {
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   const username = typeof req.body?.username === "string" ? req.body.username.trim().toLowerCase().slice(0, 120) : "";
-  return kind === "ip" ? `ip:${ip}` : `account:${ip}:${username}`;
+  if (kind === "ip") return `ip:${ip}`;
+  return kind === "account" ? `account:${ip}:${username}` : `username:${username || "<empty>"}`;
 }
 
 function checkLoginRateLimit(req: Request, res: Response, next: NextFunction): void {
@@ -1073,7 +1093,7 @@ function checkLoginRateLimit(req: Request, res: Response, next: NextFunction): v
   for (const [key, bucket] of loginBuckets) {
     if (bucket.blockedUntil <= now && bucket.resetAt <= now) loginBuckets.delete(key);
   }
-  for (const key of [loginBucketKey(req, "ip"), loginBucketKey(req, "account")]) {
+  for (const key of [loginBucketKey(req, "ip"), loginBucketKey(req, "account"), loginBucketKey(req, "username")]) {
     const bucket = loginBuckets.get(key);
     if (bucket && bucket.blockedUntil > now) {
       res.setHeader("Retry-After", String(Math.ceil((bucket.blockedUntil - now) / 1000)));
@@ -1088,7 +1108,8 @@ function recordLoginFailure(req: Request): void {
   const now = Date.now();
   const limits: Array<[string, number]> = [
     [loginBucketKey(req, "ip"), 20],
-    [loginBucketKey(req, "account"), 5]
+    [loginBucketKey(req, "account"), 5],
+    [loginBucketKey(req, "username"), 20]
   ];
   for (const [key, limit] of limits) {
     const old = loginBuckets.get(key);
@@ -1108,6 +1129,7 @@ function recordLoginFailure(req: Request): void {
 
 function clearAccountLoginFailures(req: Request): void {
   loginBuckets.delete(loginBucketKey(req, "account"));
+  loginBuckets.delete(loginBucketKey(req, "username"));
 }
 
 app.get("/healthz", async (_req, res) => {
@@ -1271,9 +1293,11 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
               COALESCE((SELECT SUM((quantity - returned_quantity) * price_fen - gifted_quantity * price_fen)
                         FROM order_items WHERE order_id = o.id), 0) AS current_fen
               ,(SELECT COUNT(*)::int FROM banquet_reservations br
-                WHERE br.table_id = t.id AND br.status = 'RESERVED' AND br.ends_at > now()) AS banquet_reservation_count
+                WHERE br.table_id = t.id AND br.status = 'RESERVED'
+                  AND br.starts_at <= now() + interval '2 hours' AND br.ends_at > now()) AS banquet_reservation_count
               ,(SELECT MIN(br.starts_at) FROM banquet_reservations br
-                WHERE br.table_id = t.id AND br.status = 'RESERVED' AND br.starts_at >= now()) AS next_banquet_reservation_at
+                WHERE br.table_id = t.id AND br.status = 'RESERVED'
+                  AND br.starts_at >= now() AND br.starts_at <= now() + interval '2 hours' AND br.ends_at > now()) AS next_banquet_reservation_at
        FROM restaurant_tables t
        LEFT JOIN orders o ON o.table_id = t.id AND o.status = 'OPEN'
        LEFT JOIN customers c ON c.id = o.customer_id
@@ -1345,6 +1369,12 @@ app.post("/api/tables/:tableId/open", requireAuth, async (req: AuthenticatedRequ
       const table = tableResult.rows[0];
       if (!table) fail("桌台不存在", 404);
       if (table.status !== "AVAILABLE") fail("桌台已被占用或停用，请刷新桌台状态", 409);
+      const activeBanquet = await client.query(
+        `SELECT id FROM banquet_reservations
+         WHERE table_id = $1 AND status = 'RESERVED' AND starts_at <= now() AND ends_at > now()
+         LIMIT 1`, [tableId]
+      );
+      if (activeBanquet.rows[0]) fail("该桌台当前有宴席预定，请从宴席详情开台或查看宴席安排", 409);
       let customerId: string | null = null;
       if (phone) {
         customerId = await findOrCreateCustomer(client, phone, customerName);
@@ -1436,6 +1466,8 @@ app.delete("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req
       );
       if (!table.rows[0]) fail("桌台不存在", 404);
       if (table.rows[0].status === "OCCUPIED") fail("使用中的桌台不能删除，请先结束当前账单");
+      const banquetHistory = await client.query(`SELECT 1 FROM banquet_reservations WHERE table_id = $1 LIMIT 1`, [tableId]);
+      if (banquetHistory.rows[0]) fail("已有宴席记录的桌台不能删除，可改名或停用", 409);
       const history = await client.query<{ count: string }>(
         `SELECT COUNT(*)::text AS count FROM orders WHERE table_id = $1`,
         [tableId]
@@ -1705,11 +1737,13 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
           `SELECT d.id, d.name, d.pinyin, d.unit, d.price_fen, d.cost_fen, c.name AS category_name,
                   c.points_earning_enabled
            FROM dishes d LEFT JOIN categories c ON c.id = d.category_id
-           WHERE d.id = $1 AND d.on_sale = true`,
+           WHERE d.id = $1 AND d.on_sale = true
+           FOR SHARE OF d`,
           [dishId]
         );
         const dish = dishResult.rows[0];
         if (!dish) fail("菜品不存在或已停售");
+        assertExpectedDishSnapshot(dish, raw);
         const groups = await dishOptionGroups(client, dish.id);
         const options = optionSelections(groups, raw?.options, raw?.note);
         const item = await client.query<{ id: string }>(
@@ -2039,10 +2073,13 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       const configuredTiers = Array.isArray(settings.points_redeem_tiers)
         ? settings.points_redeem_tiers as Array<{ points: number; discountFen: number }>
         : [{ points: settingNumber(settings, "points_redeem_points", 10), discountFen: settingNumber(settings, "points_redeem_fen", 100) }];
-      const redeemTiers = configuredTiers
+      const sortedRedeemTiers = configuredTiers
         .filter((tier) => Number.isSafeInteger(Number(tier?.points)) && Number(tier.points) > 0 && Number.isSafeInteger(Number(tier?.discountFen)) && Number(tier.discountFen) > 0)
         .map((tier) => ({ points: Number(tier.points), discountFen: Number(tier.discountFen) }))
         .sort((a, b) => a.points - b.points);
+      const redeemTiers = sortedRedeemTiers.every((tier, index) => index === 0 || tier.discountFen > sortedRedeemTiers[index - 1].discountFen)
+        ? sortedRedeemTiers
+        : [];
       const minimumSpendFen = settingNumber(settings, "points_min_spend_fen", redeemTiers[0]?.discountFen || 24000);
       const allowBelowMinimum = settingBoolean(settings, "points_allow_below_minimum", false);
       const manualInput = req.body?.manualDiscountFen === undefined
@@ -2077,7 +2114,7 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       const affordableTiers = redeemTiers.filter((tier) => tier.points <= customerBalance);
       const fittingTiers = affordableTiers.filter((tier) => tier.discountFen <= remainingBeforePoints);
       const selectedTier = usePoints && pointsEligible && remainingBeforePoints > 0
-        ? (fittingTiers.at(-1) || affordableTiers[0])
+        ? fittingTiers.at(-1)
         : undefined;
       const requestedPoints = selectedTier?.points ?? 0;
       const pointsDiscountFen = Math.min(totals.subtotalFen - manualDiscountFen, selectedTier?.discountFen ?? 0);
@@ -2088,8 +2125,7 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       const paymentMethod = text(req.body?.paymentMethod) || "现金";
       if (!["现金", "微信", "支付宝", "银行卡", "其他"].includes(paymentMethod)) fail("收款方式不正确");
       const pointsEligibleFen = items.reduce((sum, item) => {
-        const categoryRuleEnabled = item.current_category_points_earning_enabled ?? item.points_earning_enabled;
-        if (categoryRuleEnabled === false) return sum;
+        if (item.points_earning_enabled === false) return sum;
         const returned = Math.min(item.quantity, item.returned_quantity);
         const gifted = Math.min(Math.max(0, item.quantity - returned), item.gifted_quantity);
         return sum + Math.max(0, (item.quantity - returned - gifted) * item.price_fen);
@@ -2684,6 +2720,14 @@ app.patch("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req:
       if (!table.rows[0]) fail("桌台不存在", 404);
       const openOrder = await client.query(`SELECT 1 FROM orders WHERE table_id = $1 AND status = 'OPEN' LIMIT 1`, [tableId]);
       if (openOrder.rows[0] || table.rows[0].status === "OCCUPIED") fail("使用中的桌台不能修改，请先处理当前账单");
+      if (text(req.body?.status) === "DISABLED") {
+        const reservation = await client.query(
+          `SELECT 1 FROM banquet_reservations
+           WHERE table_id = $1 AND status = 'RESERVED' AND ends_at > now()
+           LIMIT 1`, [tableId]
+        );
+        if (reservation.rows[0]) fail("该桌台还有未结束的宴席预定，请先改桌或取消宴席", 409);
+      }
       values.push(tableId);
       const result = await client.query(
         `UPDATE restaurant_tables SET ${fields.join(", ")}, updated_at = now() WHERE id = $${values.length} RETURNING id`,
@@ -2784,7 +2828,10 @@ async function statsData(client: DbClient, from: string, to: string) {
     [from, to]
   );
   const sales = await client.query(
-    `SELECT oi.dish_name,
+    `SELECT oi.dish_id,
+            CASE WHEN oi.dish_id IS NULL THEN oi.dish_name
+                 ELSE (ARRAY_AGG(oi.dish_name ORDER BY o.business_date DESC, oi.created_at DESC))[1]
+            END AS dish_name,
             SUM(GREATEST(0, oi.quantity - oi.returned_quantity - LEAST(oi.gifted_quantity, oi.quantity - oi.returned_quantity)))::int AS sold_quantity,
             SUM(oi.gifted_quantity)::int AS gifted_quantity,
             SUM(oi.returned_quantity)::int AS returned_quantity,
@@ -2792,7 +2839,8 @@ async function statsData(client: DbClient, from: string, to: string) {
      FROM order_items oi JOIN orders o ON o.id = oi.order_id
      JOIN settlements s ON s.order_id = o.id AND s.status = 'ACTIVE'
      WHERE o.business_date BETWEEN $1::date AND $2::date
-     GROUP BY oi.dish_name ORDER BY sold_quantity DESC, oi.dish_name`,
+     GROUP BY oi.dish_id, CASE WHEN oi.dish_id IS NULL THEN oi.dish_name END
+     ORDER BY sold_quantity DESC, dish_name`,
     [from, to]
   );
   const customers = await client.query(
@@ -2916,10 +2964,11 @@ app.get("/api/notifications/banquet-preorders", requireAuth, async (_req, res) =
        FROM banquet_reservations r
        LEFT JOIN restaurant_tables t ON t.id = r.table_id
        LEFT JOIN banquet_halls h ON h.id = r.hall_id
-       WHERE r.status IN ('RESERVED', 'CONVERTED')
+       WHERE r.status = 'RESERVED'
          AND r.preorder_printed_at IS NULL
          AND jsonb_array_length(r.preorder) > 0
          AND r.starts_at <= now() + ($1::int * interval '1 minute')
+         AND r.ends_at > now()
        ORDER BY r.starts_at, r.created_at, r.id`,
       [reminderMinutes]
     );
@@ -2929,12 +2978,34 @@ app.get("/api/notifications/banquet-preorders", requireAuth, async (_req, res) =
   }
 });
 
+async function ensureNoClaimedPrinterJobs(client: DbClient, deviceIds: string[]): Promise<void> {
+  const ids = [...new Set(deviceIds.filter(Boolean))];
+  if (!ids.length) return;
+  const claimed = await client.query<{ id: string }>(
+    `SELECT id FROM print_jobs
+     WHERE status = 'CLAIMED' AND device_id = ANY($1::text[])
+     LIMIT 1 FOR UPDATE`,
+    [ids]
+  );
+  if (claimed.rows[0]) fail("打印设备正在处理任务，请等任务完成后再切换或重新授权", 409);
+}
+
 app.put("/api/settings", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
   try {
     const user = currentUser(req);
     const parsed = settingsSchema.safeParse(req.body);
     if (!parsed.success || !Object.keys(parsed.data || {}).length) fail("设置内容不正确，请检查后重试");
     await withTransaction(async (client) => {
+      if (Object.prototype.hasOwnProperty.call(parsed.data, "printer_device_id")) {
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-printer-selection'))`);
+        const selected = await client.query<{ device_id: string | null }>(
+          `SELECT value #>> '{}' AS device_id FROM store_settings WHERE key = 'printer_device_id' FOR UPDATE`
+        );
+        const previousDeviceId = selected.rows[0]?.device_id || "";
+        if (previousDeviceId !== parsed.data.printer_device_id) {
+          await ensureNoClaimedPrinterJobs(client, [previousDeviceId, parsed.data.printer_device_id || ""]);
+        }
+      }
       if (parsed.data.printer_device_id) {
         const activeDevice = await client.query(
           `SELECT 1 FROM printer_devices WHERE id = $1 AND active = true`,
@@ -3107,6 +3178,11 @@ app.post("/api/print-devices/register", requireAuth, requireRole("OWNER"), async
     const printerToken = crypto.randomBytes(32).toString("hex");
     await withTransaction(async (client) => {
       await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-printer-selection'))`);
+      const affected = await client.query<{ id: string }>(
+        `SELECT id FROM printer_devices WHERE active = true OR id = $1 FOR UPDATE`,
+        [deviceId]
+      );
+      await ensureNoClaimedPrinterJobs(client, affected.rows.map((row) => row.id));
       await client.query(
         `UPDATE printer_devices SET active = false, updated_at = now() WHERE active = true AND id <> $1`,
         [deviceId]
@@ -3159,6 +3235,7 @@ app.post("/api/print-devices/:deviceId/rotate-token", requireAuth, requireRole("
         [deviceId]
       );
       if (!found.rows[0]) fail("打印设备不存在", 404);
+      await ensureNoClaimedPrinterJobs(client, [deviceId]);
       await client.query(
         `UPDATE printer_devices SET token_hash = $1, last_seen_at = NULL, updated_at = now() WHERE id = $2`,
         [printerTokenHash(printerToken), deviceId]
@@ -3185,6 +3262,10 @@ app.patch("/api/print-devices/:deviceId", requireAuth, requireRole("OWNER"), asy
         [deviceId]
       );
       if (!device.rows[0]) fail("打印设备不存在", 404);
+      const affected = req.body.active
+        ? await client.query<{ id: string }>(`SELECT id FROM printer_devices WHERE active = true AND id <> $1`, [deviceId])
+        : { rows: [] as Array<{ id: string }> };
+      await ensureNoClaimedPrinterJobs(client, [deviceId, ...affected.rows.map((row) => row.id)]);
       if (req.body.active) {
         await client.query(`UPDATE printer_devices SET active = false, updated_at = now() WHERE active = true AND id <> $1`, [deviceId]);
       }
@@ -3225,6 +3306,13 @@ app.post("/api/print-jobs/claim", requirePrinterDevice, async (req, res) => {
     const sessionDate = new Date(sessionStartedAt);
     if (!sessionStartedAt || Number.isNaN(sessionDate.getTime())) fail("打印连接时间不正确");
     const result = await withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-printer-selection'))`);
+      const token = text(req.header("x-printer-token"));
+      const authenticated = await client.query<{ id: string }>(
+        `SELECT id FROM printer_devices WHERE id = $1 AND token_hash = $2 AND active = true`,
+        [deviceId, printerTokenHash(token)]
+      );
+      if (!authenticated.rows[0]) fail("打印设备认证已失效，请重新配置", 401);
       const selected = await client.query<{ device_id: string | null }>(
         `SELECT value #>> '{}' AS device_id FROM store_settings WHERE key = 'printer_device_id'`
       );

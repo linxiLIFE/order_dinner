@@ -29,6 +29,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.time.Instant;
@@ -58,6 +59,7 @@ public class PrinterService extends Service {
     private static final int RECEIPT_QUANTITY_COLUMNS = 6;
     private static final int RECEIPT_UNIT_PRICE_COLUMNS = 8;
     private static final int RECEIPT_SUBTOTAL_COLUMNS = 8;
+    private static final String TRUSTED_SERVER_ORIGIN = "https://43.142.138.108:1316";
     private static final UUID SERIAL_PORT_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final Charset PRINTER_CHARSET = Charset.forName("GB18030");
     private static volatile boolean connected = false;
@@ -218,13 +220,17 @@ public class PrinterService extends Service {
     }
 
     private JSONObject post(String path, JSONObject body) throws Exception {
-        String base = preferences.getString(KEY_SERVER_URL, "").replaceAll("/+$", "");
+        String base = trustedServerBase(preferences.getString(KEY_SERVER_URL, ""));
         String deviceId = preferences.getString(KEY_DEVICE_ID, "");
         String deviceToken = preferences.getString(KEY_DEVICE_TOKEN, "");
         if (base.isEmpty() || deviceId.isEmpty() || deviceToken.isEmpty()) {
             throw new IllegalStateException("打印服务认证未配置");
         }
+        if (path == null || !path.startsWith("/api/")) {
+            throw new IllegalArgumentException("打印服务请求地址不正确");
+        }
         HttpURLConnection connection = (HttpURLConnection) new URL(base + path).openConnection();
+        connection.setInstanceFollowRedirects(false);
         connection.setConnectTimeout(10000);
         connection.setReadTimeout(15000);
         connection.setRequestMethod("POST");
@@ -247,6 +253,22 @@ public class PrinterService extends Service {
             throw new IllegalStateException("服务器返回 " + status + "：" + message);
         }
         return response.isEmpty() ? new JSONObject() : new JSONObject(response);
+    }
+
+    private static String trustedServerBase(String configured) throws Exception {
+        String value = configured == null ? "" : configured.trim().replaceAll("/+$", "");
+        if (value.isEmpty()) throw new IllegalStateException("打印服务认证未配置");
+        URI uri = new URI(value);
+        if (!"https".equalsIgnoreCase(uri.getScheme())
+                || !"43.142.138.108".equalsIgnoreCase(uri.getHost())
+                || uri.getPort() != 1316
+                || (uri.getRawPath() != null && !uri.getRawPath().isEmpty())
+                || uri.getRawQuery() != null
+                || uri.getRawFragment() != null
+                || uri.getRawUserInfo() != null) {
+            throw new IllegalArgumentException("打印服务地址必须是已授权的 HTTPS 服务器");
+        }
+        return TRUSTED_SERVER_ORIGIN;
     }
 
     private String readAll(InputStream input) throws Exception {

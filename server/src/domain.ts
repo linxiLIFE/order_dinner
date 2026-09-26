@@ -104,16 +104,22 @@ export function publicErrorResponse(error: unknown): { status: number; message: 
   const declaredStatus = errorRecord
     ? Number(errorRecord.status)
     : NaN;
-  const status = errorRecord?.code === "23505"
+  const status = errorRecord?.code === "23505" || errorRecord?.code === "23503"
     ? 409
+    : errorRecord?.code === "22003"
+    ? 400
     : Number.isInteger(declaredStatus) && declaredStatus >= 400 && declaredStatus < 600
-    ? declaredStatus
-    : 500;
+      ? declaredStatus
+      : 500;
   if (status >= 500) return { status, message: "服务器暂时无法处理请求，请稍后重试" };
   return {
     status,
     message: errorRecord?.code === "23505"
       ? "记录已存在，请刷新后重试"
-      : error instanceof Error ? error.message : "请求内容不正确"
+      : errorRecord?.code === "23503"
+        ? "记录仍被其他业务数据引用，不能删除"
+        : errorRecord?.code === "22003"
+          ? "金额或数量超过系统支持范围"
+          : error instanceof Error ? error.message : "请求内容不正确"
   };
 }
