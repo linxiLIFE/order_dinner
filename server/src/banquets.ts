@@ -5,11 +5,16 @@ import { requireAuth } from "./auth.js";
 import type { AuthenticatedRequest } from "./types.js";
 import { normalizeCustomerPhone, requirePositiveInteger } from "./domain.js";
 import { publicError } from "./utils.js";
+import { changeDraft, prepareDraftPayload, publicDraftLines } from "./draft.js";
 
 type BanquetState = "RESERVED" | "CANCELLED" | "CONVERTED" | "EXPIRED";
 // A converted reservation keeps its slot only while the linked order is still open.
 // Once the early-opened banquet is checked out (or otherwise ended), the table time is free again.
 const slotBlockingReservationCondition = `(status = 'RESERVED' OR (status = 'CONVERTED' AND ends_at > now() AND EXISTS (SELECT 1 FROM orders linked_order WHERE linked_order.id = banquet_reservations.order_id AND linked_order.status = 'OPEN'))) `;
+let draftBroadcaster: ((reservationId: string) => void) | undefined;
+export function setBanquetDraftBroadcaster(callback: (reservationId: string) => void): void {
+  draftBroadcaster = callback;
+}
 type Reservation = {
   id: string;
   hall_id: string | null;
@@ -26,6 +31,8 @@ type Reservation = {
   points_earning_enabled: boolean;
   status: BanquetState;
   preorder: Array<Record<string, unknown>>;
+  draft_lines: Array<Record<string, unknown>>;
+  draft_revision: number;
   order_id: string | null;
   order_status?: string | null;
   note: string;
@@ -186,7 +193,47 @@ async function reservationDetails(client: DbClient, reservationId: string): Prom
      FROM banquet_deposit_ledger WHERE reservation_id = $1 ORDER BY created_at DESC, id DESC`,
     [reservationId]
   );
-  return { ...row, deposit_balance_fen: Number(row.deposit_balance_fen || 0), deposit_ledger: ledger.rows };
+  return { ...row, draft_lines: publicDraftLines(row.draft_lines, false),
+    deposit_balance_fen: Number(row.deposit_balance_fen || 0), deposit_ledger: ledger.rows };
+}
+
+export async function commitBanquetDraft(client: DbClient, reservationId: string, employeeId: string): Promise<boolean> {
+  const current = await client.query<{ status: BanquetState; preorder: Array<Record<string, unknown>>; draft_lines: Array<Record<string, unknown>> }>(
+    `SELECT status, preorder, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
+  );
+  if (!current.rows[0]) reject("宴席预定不存在", 404);
+  if (current.rows[0].status !== "RESERVED") reject("该宴席已开台或取消，不能保留预点菜", 409);
+  const rawItems = current.rows[0].draft_lines;
+  if (!Array.isArray(rawItems) || !rawItems.length) return false;
+  const snapshot = Array.isArray(current.rows[0].preorder) ? [...current.rows[0].preorder] : [];
+  for (const raw of rawItems) {
+    const dishId = text(raw?.dishId);
+    const quantity = positiveInt(raw?.quantity, "菜品数量", 100_000);
+    const dishResult = await client.query<{
+      id: string; name: string; category_name: string | null; unit: string; price_fen: number; cost_fen: number; points_earning_enabled: boolean | null;
+    }>(
+      `SELECT d.id, d.name, c.name AS category_name, d.unit, d.price_fen, d.cost_fen, c.points_earning_enabled
+       FROM dishes d LEFT JOIN categories c ON c.id = d.category_id WHERE d.id = $1 AND d.on_sale = true
+       FOR SHARE OF d`, [dishId]
+    );
+    const dish = dishResult.rows[0];
+    if (!dish) reject("菜品不存在或已停售", 409);
+    assertExpectedDishSnapshot(dish, raw);
+    const options = await snapshotOptions(client, dish.id, raw?.options, raw?.note);
+    snapshot.push({
+      dishId: dish.id, name: dish.name, categoryName: dish.category_name || "未分类", unit: dish.unit,
+      priceFen: dish.price_fen, costFen: dish.cost_fen, pointsEarningEnabled: dish.points_earning_enabled !== false,
+      quantity, note: options.note, optionSnapshot: options.snapshot
+    });
+    assertPreorderFitsPostgresInteger(snapshot);
+  }
+  await client.query(
+    `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_printed_at = NULL,
+     draft_lines = '[]'::jsonb, draft_revision = draft_revision + 1,
+     updated_by = $2, updated_at = now() WHERE id = $3`,
+    [JSON.stringify(snapshot), employeeId, reservationId]
+  );
+  return true;
 }
 
 async function findOrCreateCustomer(client: DbClient, phone: string, name: string | null): Promise<string> {
@@ -299,6 +346,8 @@ export async function runBanquetMigrations(db: DbClient = pool): Promise<void> {
   // Keep the old column nullable so historical reservations can still be read and settled.
   await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS table_id uuid REFERENCES restaurant_tables(id)`);
   await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS preorder_printed_at timestamptz`);
+  await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS draft_lines jsonb NOT NULL DEFAULT '[]'::jsonb`);
+  await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS draft_revision integer NOT NULL DEFAULT 0`);
   await db.query(`ALTER TABLE banquet_reservations ALTER COLUMN hall_id DROP NOT NULL`);
   await db.query(`DO $migration$
     BEGIN
@@ -417,7 +466,8 @@ banquetRouter.get("/reservations", async (req, res) => {
               COALESCE(t.name, h.name, '未指定桌台') AS table_name,
               t.number AS table_number, t.seats AS table_seats,
               r.starts_at, r.ends_at, r.customer_name, r.customer_phone,
-              r.people_count, r.points_earning_enabled, r.status, r.preorder, r.order_id, r.note,
+              r.people_count, r.points_earning_enabled, r.status, r.preorder,
+              jsonb_array_length(r.draft_lines) AS draft_count, r.order_id, r.note,
               COALESCE(d.balance, 0)::bigint AS deposit_balance_fen
        FROM banquet_reservations r
        LEFT JOIN banquet_halls h ON h.id = r.hall_id
@@ -501,6 +551,35 @@ banquetRouter.get("/reservations/:reservationId", async (req, res) => {
   try {
     const result = await withReadOnlySnapshot((client) => reservationDetails(client, routeId(req, "reservationId")));
     res.json({ reservation: result });
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.post("/reservations/:reservationId/draft", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    const reservationId = routeId(req, "reservationId");
+    const key = requestKey(req.body);
+    const payload = payloadWithoutKey(req.body);
+    const result = await withTransaction(async (client) => idempotent(client, `preorder-draft:${reservationId}`, key, user.id, payload, async () => {
+      const current = await client.query<{ status: BanquetState; draft_lines: unknown; draft_revision: number }>(
+        `SELECT status, draft_lines, draft_revision FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
+      );
+      if (!current.rows[0]) reject("宴席预定不存在", 404);
+      if (current.rows[0].status !== "RESERVED") reject("该宴席已开台或取消，不能继续预点菜", 409);
+      if (payload.op === "clear" && payload.expectedRevision !== current.rows[0].draft_revision) {
+        reject("预点菜已被其他设备修改，请刷新后再清空", 409);
+      }
+      const lines = changeDraft(current.rows[0].draft_lines, await prepareDraftPayload(client, payload));
+      const revision = current.rows[0].draft_revision + 1;
+      await client.query(
+        `UPDATE banquet_reservations SET draft_lines = $1::jsonb, draft_revision = $2,
+         updated_by = $3, updated_at = now() WHERE id = $4`,
+        [JSON.stringify(lines), revision, user.id, reservationId]
+      );
+      return { lines: publicDraftLines(lines, false), revision };
+    }));
+    draftBroadcaster?.(reservationId);
+    res.json(result);
   } catch (error) { publicError(res, error); }
 });
 
@@ -617,15 +696,18 @@ banquetRouter.post("/reservations/:reservationId/preorder/items", async (req: Au
     const reservationId = routeId(req, "reservationId");
     const key = requestKey(req.body);
     const payload = payloadWithoutKey(req.body);
-    const rawItems = Array.isArray(payload.items) ? payload.items : [];
-    if (!rawItems.length) reject("请先选择菜品");
-    if (rawItems.length > 300) reject("本次预点菜数量过多");
+    const useDraft = payload.useDraft === true;
+    const submittedItems = Array.isArray(payload.items) ? payload.items : [];
+    if (!useDraft && !submittedItems.length) reject("请先选择菜品");
+    if (submittedItems.length > 300) reject("本次预点菜数量过多");
     const result = await withTransaction(async (client) => idempotent(client, `preorder-add:${reservationId}`, key, user.id, payload, async () => {
-      const current = await client.query<{ status: BanquetState; preorder: Array<Record<string, unknown>> }>(
-        `SELECT status, preorder FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
+      const current = await client.query<{ status: BanquetState; preorder: Array<Record<string, unknown>>; draft_lines: Array<Record<string, unknown>> }>(
+        `SELECT status, preorder, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
       );
       if (!current.rows[0]) reject("宴席预定不存在", 404);
       if (current.rows[0].status !== "RESERVED") reject("该宴席已经开台或取消，不能继续预点菜", 409);
+      const rawItems = useDraft ? current.rows[0].draft_lines : submittedItems;
+      if (!Array.isArray(rawItems) || !rawItems.length) reject("预点菜已被其他设备保留或清空，请刷新后核对", 409);
       const snapshot = Array.isArray(current.rows[0].preorder) ? [...current.rows[0].preorder] : [];
       for (const raw of rawItems) {
         const dishId = text(raw?.dishId);
@@ -649,12 +731,16 @@ banquetRouter.post("/reservations/:reservationId/preorder/items", async (req: Au
         assertPreorderFitsPostgresInteger(snapshot);
       }
       await client.query(
-        `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_printed_at = NULL, updated_by = $2, updated_at = now() WHERE id = $3`,
-        [JSON.stringify(snapshot), user.id, reservationId]
+        `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_printed_at = NULL,
+         draft_lines = CASE WHEN $4 THEN '[]'::jsonb ELSE draft_lines END,
+         draft_revision = draft_revision + CASE WHEN $4 THEN 1 ELSE 0 END,
+         updated_by = $2, updated_at = now() WHERE id = $3`,
+        [JSON.stringify(snapshot), user.id, reservationId, useDraft]
       );
       await logOperation(client, user.id, "ADD_BANQUET_PREORDER_ITEMS", reservationId, { itemCount: rawItems.length });
       return { reservation: await reservationDetails(client, reservationId) };
     }));
+    draftBroadcaster?.(reservationId);
     res.status(201).json(result);
   } catch (error) { publicError(res, error); }
 });
@@ -756,6 +842,12 @@ async function convertReservationToOrder(client: DbClient, reservationId: string
           `宴席预定 ${reservationId}`, reservation.points_earning_enabled]
       );
       const orderId = orderResult.rows[0].id;
+      if (Array.isArray(reservation.draft_lines) && reservation.draft_lines.length) {
+        await client.query(
+          `UPDATE orders SET draft_lines = $1::jsonb, draft_revision = 1 WHERE id = $2`,
+          [JSON.stringify(reservation.draft_lines), orderId]
+        );
+      }
       if (reservation.table_id) {
         await client.query(`UPDATE restaurant_tables SET status = 'OCCUPIED', updated_at = now() WHERE id = $1`, [reservation.table_id]);
       }
@@ -777,7 +869,9 @@ async function convertReservationToOrder(client: DbClient, reservationId: string
         await client.query(`UPDATE orders SET order_version = 1, updated_at = now() WHERE id = $1`, [orderId]);
       }
       await client.query(
-        `UPDATE banquet_reservations SET status = 'CONVERTED', order_id = $1, updated_by = $2, updated_at = now() WHERE id = $3`,
+        `UPDATE banquet_reservations SET status = 'CONVERTED', order_id = $1,
+         draft_lines = '[]'::jsonb, draft_revision = draft_revision + 1,
+         updated_by = $2, updated_at = now() WHERE id = $3`,
         [orderId, employeeId, reservationId]
       );
       await logOperation(client, employeeId, automatic ? "AUTO_OPEN_BANQUET_ORDER" : "CONVERT_BANQUET_TO_ORDER", reservationId, { orderId, itemCount: preorder.length });
@@ -791,6 +885,7 @@ banquetRouter.post("/reservations/:reservationId/convert", async (req: Authentic
     const key = requestKey(req.body);
     const payload = payloadWithoutKey(req.body);
     const response = await withTransaction(async (client) => idempotent(client, `reservation-convert:${reservationId}`, key, user.id, payload, () => convertReservationToOrder(client, reservationId, user.id)));
+    draftBroadcaster?.(reservationId);
     res.status(201).json(response);
   } catch (error) { publicError(res, error); }
 });

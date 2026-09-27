@@ -391,6 +391,88 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   const cashierMenu = await request("/api/dishes", { token: cashierLogin.body.token });
   assert.equal(cashierMenu.status, 200);
   assert.equal(Object.hasOwn(cashierMenu.body.dishes[0], "cost_fen"), false);
+  const draftTable = await request("/api/tables", {
+    token: ownerToken,
+    body: { number: tableNumber + 1, name: "多人草稿测试桌", seats: 4 }
+  });
+  assert.equal(draftTable.status, 201, JSON.stringify(draftTable.body));
+  const draftOrder = await request(`/api/tables/${draftTable.body.tableId}/open`, {
+    token: ownerToken, body: { people: 2, idempotencyKey: randomUUID() }
+  });
+  assert.equal(draftOrder.status, 201, JSON.stringify(draftOrder.body));
+  const draftOrderId = draftOrder.body.order.id;
+  const ownerDish = menu.body.dishes.find((item) => item.id === seededDish.id);
+  const cashierDish = cashierMenu.body.dishes.find((item) => item.id === seededDish.id);
+  const ownerDraftKey = randomUUID();
+  const draftLine = (dish) => ({ dishId: dish.id, quantity: 1, note: "", options: [], dish });
+  const draftAdds = await Promise.all([
+    request(`/api/orders/${draftOrderId}/draft`, { token: ownerToken,
+      body: { op: "adjust", delta: 1, line: draftLine(ownerDish), idempotencyKey: ownerDraftKey } }),
+    request(`/api/orders/${draftOrderId}/draft`, { token: cashierLogin.body.token,
+      body: { op: "adjust", delta: 1, line: draftLine(cashierDish), idempotencyKey: randomUUID() } })
+  ]);
+  assert.deepEqual(draftAdds.map((item) => item.status), [200, 200], JSON.stringify(draftAdds));
+  const repeatedDraftAdd = await request(`/api/orders/${draftOrderId}/draft`, { token: ownerToken,
+    body: { op: "adjust", delta: 1, line: draftLine(ownerDish), idempotencyKey: ownerDraftKey } });
+  assert.equal(repeatedDraftAdd.status, 200);
+  const sharedDraft = await request(`/api/orders/${draftOrderId}`, { token: cashierLogin.body.token });
+  assert.equal(sharedDraft.body.order.draftLines[0].quantity, 2);
+  assert.equal(sharedDraft.body.order.items.length, 0);
+  assert.equal(sharedDraft.body.order.draftLines[0].dish.cost_fen, null);
+  const draftDb = await appPool.query(`SELECT jsonb_array_length(draft_lines)::int AS drafts FROM orders WHERE id = $1`, [draftOrderId]);
+  assert.equal(draftDb.rows[0].drafts, 1);
+  const submitDraftKey = randomUUID();
+  const savedWithoutPrint = await request(`/api/orders/${draftOrderId}/items`, { token: ownerToken,
+    body: { useDraft: true, copies: 0, idempotencyKey: submitDraftKey } });
+  assert.equal(savedWithoutPrint.status, 201, JSON.stringify(savedWithoutPrint.body));
+  assert.equal(savedWithoutPrint.body.order.items[0].quantity, 2);
+  const repeatedDraftSubmit = await request(`/api/orders/${draftOrderId}/items`, { token: ownerToken,
+    body: { useDraft: true, copies: 0, idempotencyKey: submitDraftKey } });
+  assert.equal(repeatedDraftSubmit.status, 201);
+  const savedDraftCounts = await appPool.query(
+    `SELECT (SELECT COUNT(*)::int FROM print_jobs WHERE order_id = $1) AS prints,
+            (SELECT COUNT(*)::int FROM order_items WHERE order_id = $1) AS items,
+            (SELECT jsonb_array_length(draft_lines)::int FROM orders WHERE id = $1) AS drafts`, [draftOrderId]
+  );
+  assert.deepEqual(savedDraftCounts.rows[0], { prints: 0, items: 1, drafts: 0 });
+  const banquetTable = await request("/api/tables", {
+    token: ownerToken, body: { number: tableNumber + 2, name: "预点菜草稿测试桌", seats: 6 }
+  });
+  assert.equal(banquetTable.status, 201, JSON.stringify(banquetTable.body));
+  const startsAt = new Date(Date.now() + 86_400_000).toISOString();
+  const endsAt = new Date(Date.now() + 93_600_000).toISOString();
+  const reservationCreated = await request("/api/banquets/reservations", { token: ownerToken,
+    body: { tableId: banquetTable.body.tableId, startsAt, endsAt, peopleCount: 6,
+      customerName: "预点草稿测试", idempotencyKey: randomUUID() } });
+  assert.equal(reservationCreated.status, 201, JSON.stringify(reservationCreated.body));
+  const reservationId = reservationCreated.body.reservation.id;
+  const preorderDraftAdds = await Promise.all([
+    request(`/api/banquets/reservations/${reservationId}/draft`, { token: ownerToken,
+      body: { op: "adjust", delta: 1, line: draftLine(ownerDish), idempotencyKey: randomUUID() } }),
+    request(`/api/banquets/reservations/${reservationId}/draft`, { token: cashierLogin.body.token,
+      body: { op: "adjust", delta: 1, line: draftLine(cashierDish), idempotencyKey: randomUUID() } })
+  ]);
+  assert.deepEqual(preorderDraftAdds.map((item) => item.status), [200, 200], JSON.stringify(preorderDraftAdds));
+  const sharedPreorder = await request(`/api/banquets/reservations/${reservationId}`, { token: cashierLogin.body.token });
+  assert.equal(sharedPreorder.body.reservation.draft_lines[0].quantity, 2);
+  assert.equal(sharedPreorder.body.reservation.preorder.length, 0);
+  const printZero = await request(`/api/banquets/reservations/${reservationId}/preorder/print`, { token: ownerToken,
+    body: { copies: 0, idempotencyKey: randomUUID() } });
+  assert.equal(printZero.status, 201, JSON.stringify(printZero.body));
+  const confirmedPreorder = await request(`/api/banquets/reservations/${reservationId}`, { token: ownerToken });
+  assert.equal(confirmedPreorder.body.reservation.preorder[0].quantity, 2);
+  assert.equal(confirmedPreorder.body.reservation.draft_lines.length, 0);
+  const preorderPrintCount = await appPool.query(`SELECT COUNT(*)::int AS count FROM print_jobs WHERE payload->>'reservationId' = $1`, [reservationId]);
+  assert.equal(preorderPrintCount.rows[0].count, 0);
+  const laterDraft = await request(`/api/banquets/reservations/${reservationId}/draft`, { token: ownerToken,
+    body: { op: "adjust", delta: 1, line: draftLine(ownerDish), idempotencyKey: randomUUID() } });
+  assert.equal(laterDraft.status, 200);
+  const converted = await request(`/api/banquets/reservations/${reservationId}/convert`, { token: ownerToken,
+    body: { idempotencyKey: randomUUID() } });
+  assert.equal(converted.status, 201, JSON.stringify(converted.body));
+  const convertedOrder = await request(`/api/orders/${converted.body.orderId}`, { token: ownerToken });
+  assert.equal(convertedOrder.body.order.items[0].quantity, 2);
+  assert.equal(convertedOrder.body.order.draftLines[0].quantity, 1);
   const cashierOrder = await request(`/api/orders/${currentOrderId}`, { token: cashierLogin.body.token });
   assert.equal(cashierOrder.status, 200);
   assert.equal(Object.hasOwn(cashierOrder.body.order, "grossProfitFen"), false);

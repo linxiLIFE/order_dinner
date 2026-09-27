@@ -342,16 +342,16 @@ public class PrinterService extends Service {
                 String name = item.optString("name", "菜品");
                 if (receipt) {
                     int unitPriceFen = item.has("priceFen") ? item.optInt("priceFen", 0) : item.optInt("price_fen", 0);
-                    List<String> nameLines = wrapText(name, RECEIPT_DISH_COLUMNS);
-                    line(output, receiptRow(
-                        nameLines.isEmpty() ? "菜品" : nameLines.get(0),
-                        quantity + unit,
-                        money(unitPriceFen),
-                        money(unitPriceFen * quantity)
-                    ));
+                    List<String> nameLines = wrapText(name.isEmpty() ? "菜品" : name, RECEIPT_DISH_COLUMNS / 2);
+                    command(output, 0x1D, 0x21, 0x11);
+                    output.write(receiptCell(nameLines.get(0), RECEIPT_DISH_COLUMNS / 2, "LEFT").getBytes(PRINTER_CHARSET));
+                    command(output, 0x1D, 0x21, 0x01);
+                    line(output, receiptRow("", quantity + unit, money(unitPriceFen), money(unitPriceFen * quantity)).substring(RECEIPT_DISH_COLUMNS));
+                    command(output, 0x1D, 0x21, 0x11);
                     for (int lineIndex = 1; lineIndex < nameLines.size(); lineIndex += 1) {
-                        line(output, receiptCell(nameLines.get(lineIndex), RECEIPT_DISH_COLUMNS, "LEFT"));
+                        line(output, receiptCell(nameLines.get(lineIndex), RECEIPT_DISH_COLUMNS / 2, "LEFT"));
                     }
+                    command(output, 0x1D, 0x21, 0x00);
                 } else {
                     String quantityLabel = "x" + quantity + unit;
                     String note = formatItemNote(item.optString("note", ""));
@@ -393,10 +393,22 @@ public class PrinterService extends Service {
             JSONObject printLine = printLines.optJSONObject(index);
             if (printLine == null) continue;
             command(output, 0x1B, 0x61, "CENTER".equals(printLine.optString("align", "LEFT")) ? 0x01 : 0x00);
-            String size = printLine.optString("size", "NORMAL");
-            int sizeCommand = "LARGE".equals(size) ? 0x11 : "EMPHASIS".equals(size) ? 0x01 : 0x00;
-            command(output, 0x1D, 0x21, sizeCommand);
-            line(output, printLine.optString("text", ""));
+            JSONArray segments = printLine.optJSONArray("segments");
+            if (segments != null && segments.length() > 0) {
+                for (int segmentIndex = 0; segmentIndex < segments.length(); segmentIndex += 1) {
+                    JSONObject segment = segments.optJSONObject(segmentIndex);
+                    if (segment == null) continue;
+                    String segmentSize = segment.optString("size", "NORMAL");
+                    command(output, 0x1D, 0x21, "LARGE".equals(segmentSize) ? 0x11 : "EMPHASIS".equals(segmentSize) ? 0x01 : 0x00);
+                    output.write(segment.optString("text", "").getBytes(PRINTER_CHARSET));
+                }
+                output.write('\n');
+            } else {
+                String size = printLine.optString("size", "NORMAL");
+                int sizeCommand = "LARGE".equals(size) ? 0x11 : "EMPHASIS".equals(size) ? 0x01 : 0x00;
+                command(output, 0x1D, 0x21, sizeCommand);
+                line(output, printLine.optString("text", ""));
+            }
         }
         command(output, 0x1D, 0x21, 0x00);
         command(output, 0x1B, 0x61, 0x00);

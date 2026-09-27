@@ -84,10 +84,10 @@ echo "备份并增加 Caddy 路由"
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" 'bash -s' <<'REMOTE_SCRIPT'
 set -euo pipefail
 caddyfile=/opt/love-web/Caddyfile
-stamp=$(date -u +%Y%m%dT%H%M%SZ)
-backup="/opt/love-web/Caddyfile.before-order-dinner-$stamp"
-sudo cp -a "$caddyfile" "$backup"
 if ! sudo grep -q 'https://43\.142\.138\.108:1316' "$caddyfile"; then
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  backup="/opt/love-web/Caddyfile.before-order-dinner-$stamp"
+  sudo cp -a "$caddyfile" "$backup"
   sudo tee -a "$caddyfile" >/dev/null <<'CADDY_BLOCK'
 
 https://43.142.138.108:1316 {
@@ -95,22 +95,24 @@ https://43.142.138.108:1316 {
   reverse_proxy order-dinner-app:3000
 }
 CADDY_BLOCK
-fi
-if ! sudo docker exec love-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null; then
-  sudo cp -a "$backup" "$caddyfile"
-  echo "Caddy 配置校验失败，已恢复备份；线上配置未重启：$backup" >&2
-  exit 1
-fi
-if ! sudo docker restart love-caddy; then
-  sudo cp -a "$backup" "$caddyfile"
-  if ! sudo docker restart love-caddy; then
-    echo "Caddy 重启失败，已恢复配置备份但恢复重启也失败，请检查 love-caddy；备份：$backup" >&2
-  else
-    echo "Caddy 重启失败，已恢复备份并重新启动：$backup" >&2
+  if ! sudo docker exec love-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null; then
+    sudo cp -a "$backup" "$caddyfile"
+    echo "Caddy 配置校验失败，已恢复备份；线上配置未重启：$backup" >&2
+    exit 1
   fi
-  exit 1
+  if ! sudo docker restart love-caddy; then
+    sudo cp -a "$backup" "$caddyfile"
+    if ! sudo docker restart love-caddy; then
+      echo "Caddy 重启失败，已恢复配置备份但恢复重启也失败，请检查 love-caddy；备份：$backup" >&2
+    else
+      echo "Caddy 重启失败，已恢复备份并重新启动：$backup" >&2
+    fi
+    exit 1
+  fi
+  echo "Caddy 备份：$backup"
+else
+  echo "Caddy 路由已存在，无需重启"
 fi
-echo "Caddy 备份：$backup"
 REMOTE_SCRIPT
 
 echo "安装每日备份任务"

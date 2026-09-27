@@ -8,7 +8,8 @@ import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { pool, withReadOnlySnapshot, withTransaction, type DbClient } from "./db.js";
 import { migrateAndSeed, pruneExpiredIdempotencyKeys } from "./migrate.js";
-import { applyBanquetDepositForCheckout, autoOpenDueBanquets, banquetRouter, reverseBanquetDepositForSettlement, runBanquetMigrations } from "./banquets.js";
+import { changeDraft, prepareDraftPayload, publicDraftLines } from "./draft.js";
+import { applyBanquetDepositForCheckout, autoOpenDueBanquets, banquetRouter, commitBanquetDraft, reverseBanquetDepositForSettlement, runBanquetMigrations, setBanquetDraftBroadcaster } from "./banquets.js";
 import { createToken, requireAuth, requireRole } from "./auth.js";
 import type { AuthenticatedRequest, AuthUser } from "./types.js";
 import {
@@ -76,6 +77,7 @@ function routeParam(req: Request, name: string): string {
 type StoreEvent = {
   type: string;
   orderId?: string;
+  reservationId?: string;
   newOrderId?: string;
   tableId?: string | null;
 };
@@ -138,6 +140,7 @@ function broadcastUpdate(event: StoreEvent): void {
     }
   }
 }
+setBanquetDraftBroadcaster((reservationId) => broadcastUpdate({ type: "banquet.draft.updated", reservationId }));
 
 function printerTokenHash(token: string): string {
   return crypto.createHash("sha256").update(token).digest("hex");
@@ -381,6 +384,8 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     ended_at: string | null;
     end_reason: string;
     order_note: string;
+    draft_lines: Array<Record<string, unknown>>;
+    draft_revision: number;
   }>(
     `SELECT o.*, COALESCE(o.table_number_snapshot, t.number) AS table_number,
             COALESCE(o.table_name_snapshot, t.name) AS table_name,
@@ -462,6 +467,8 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     orderNote: order.order_note,
     banquetDepositBalanceFen: Number(banquetDeposit.rows[0]?.balance_fen || 0),
     banquetPreorderPendingPrint: Boolean(banquetPreorder.rows[0]?.pending_print),
+    draftLines: publicDraftLines(order.draft_lines, includeFinancialDetails),
+    draftRevision: order.draft_revision,
     items: items.map((item) => ({
       id: item.id,
       dishId: item.dish_id,
@@ -810,7 +817,12 @@ function normalizeReprintTitle(value: unknown): string {
   return `${base}（补打）`;
 }
 
-type PrinterLine = { text: string; align: "LEFT" | "CENTER"; size: "NORMAL" | "LARGE" | "EMPHASIS" };
+type PrinterLine = {
+  text: string;
+  align: "LEFT" | "CENTER";
+  size: "NORMAL" | "LARGE" | "EMPHASIS";
+  segments?: Array<{ text: string; size: "NORMAL" | "LARGE" | "EMPHASIS" }>;
+};
 
 function printerDisplayWidth(value: string): number {
   return Array.from(value).reduce((width, character) => width + (character.codePointAt(0)! <= 0x7f ? 1 : 2), 0);
@@ -916,39 +928,34 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     const leadingSpaces = Math.max(0, maxWidth - printerDisplayWidth(value));
     push(`${" ".repeat(leadingSpaces)}${value}`, "LEFT", size, maxWidth);
   };
+  const pushSegments = (segments: NonNullable<PrinterLine["segments"]>, fallbackText: string) => {
+    lines.push({ text: fallbackText, align: "LEFT", size: "EMPHASIS", segments });
+  };
   const stringValue = (value: unknown, fallback = "") => value === null || value === undefined ? fallback : String(value);
   const tableName = stringValue(payload.tableName) || (Number(payload.tableNumber) > 0 ? `${Number(payload.tableNumber)}号桌` : "无桌台");
   const large = "LARGE" as const;
   const emphasis = "EMPHASIS" as const;
   const normal = "NORMAL" as const;
   const center = "CENTER" as const;
-  const dishColumns = printerColumns(emphasis);
+  const dishColumns = printerColumns(large);
   const printNoteAndQuantity = (note: string, quantityLabel: string) => {
     const quantityWidth = printerDisplayWidth(quantityLabel);
-    const maxNoteWidth = dishColumns - quantityWidth - 1;
-    const noteText = `  ${note}`;
-    if (maxNoteWidth < 1) {
-      for (const noteLine of wrapPrinterText(noteText, dishColumns)) push(noteLine, "LEFT", normal, dishColumns);
-      pushRight(quantityLabel, emphasis, dishColumns);
-      return;
-    }
-
-    const noteLines = wrapPrinterText(noteText, dishColumns);
+    const maxNoteWidth = printerColumns(normal) - quantityWidth - 1;
+    const noteLines = wrapPrinterText(`  ${note}`, printerColumns(normal));
     let finalNoteLine = noteLines.pop() || "";
     if (printerDisplayWidth(finalNoteLine) > maxNoteWidth) {
       const wrappedFinalLine = wrapPrinterText(finalNoteLine, maxNoteWidth);
       finalNoteLine = wrappedFinalLine.pop() || "";
       noteLines.push(...wrappedFinalLine);
     }
-    for (const noteLine of noteLines) push(noteLine, "LEFT", normal, dishColumns);
-
-    const gap = dishColumns - printerDisplayWidth(finalNoteLine) - quantityWidth;
+    for (const noteLine of noteLines) push(noteLine, "LEFT", normal);
+    const gap = printerColumns(normal) - printerDisplayWidth(finalNoteLine) - quantityWidth;
     if (gap < 1) {
-      push(finalNoteLine, "LEFT", normal, dishColumns);
-      pushRight(quantityLabel, emphasis, dishColumns);
+      push(finalNoteLine, "LEFT", normal);
+      pushRight(quantityLabel, emphasis, printerColumns(emphasis));
       return;
     }
-    push(`${finalNoteLine}${" ".repeat(gap)}${quantityLabel}`, "LEFT", normal, dishColumns);
+    push(`${finalNoteLine}${" ".repeat(gap)}${quantityLabel}`, "LEFT", normal);
   };
 
   const storeName = receipt ? stringValue(payload.storeName).trim() : "";
@@ -986,28 +993,28 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     if (receipt) {
       const unitPriceFen = Number(item.priceFen ?? item.price_fen ?? 0);
       const subtotalFen = unitPriceFen * quantity;
-      const nameLines = wrapPrinterText(name, RECEIPT_DISH_COLUMNS);
-      push(
-        receiptRow(nameLines[0] || "菜品", quantityLabel, printerMoney(unitPriceFen), printerMoney(subtotalFen)),
-        "LEFT",
-        emphasis,
-        RECEIPT_TOTAL_COLUMNS
-      );
+      const nameLines = wrapPrinterText(name, RECEIPT_DISH_COLUMNS / 2);
+      const values = receiptRow("", quantityLabel, printerMoney(unitPriceFen), printerMoney(subtotalFen)).slice(RECEIPT_DISH_COLUMNS);
+      pushSegments([
+        { text: receiptCell(nameLines[0] || "菜品", RECEIPT_DISH_COLUMNS / 2), size: large },
+        { text: values, size: emphasis }
+      ], receiptRow(nameLines[0] || "菜品", quantityLabel, printerMoney(unitPriceFen), printerMoney(subtotalFen)));
       for (const nameLine of nameLines.slice(1)) {
-        push(receiptCell(nameLine, RECEIPT_DISH_COLUMNS), "LEFT", emphasis, RECEIPT_TOTAL_COLUMNS);
+        pushSegments([{ text: receiptCell(nameLine, RECEIPT_DISH_COLUMNS / 2), size: large }], receiptCell(nameLine, RECEIPT_DISH_COLUMNS));
       }
     } else {
-      const sameDishLine = printerDisplayWidth(name) + 1 + printerDisplayWidth(quantityLabel) <= dishColumns;
+      const sameDishLine = printerDisplayWidth(name) * 2 + 1 + printerDisplayWidth(quantityLabel) <= printerColumns(emphasis);
       if (sameDishLine) {
-        const gap = Math.max(1, dishColumns - printerDisplayWidth(name) - printerDisplayWidth(quantityLabel));
-        push(`${name}${" ".repeat(gap)}${quantityLabel}`, "LEFT", emphasis);
-        if (note) {
-          for (const noteLine of wrapPrinterText(`  ${note}`, dishColumns)) push(noteLine, "LEFT", normal, dishColumns);
-        }
+        const gap = printerColumns(emphasis) - printerDisplayWidth(name) * 2 - printerDisplayWidth(quantityLabel);
+        pushSegments([
+          { text: name, size: large },
+          { text: `${" ".repeat(gap)}${quantityLabel}`, size: emphasis }
+        ], `${name}${" ".repeat(printerColumns(emphasis) - printerDisplayWidth(name) - printerDisplayWidth(quantityLabel))}${quantityLabel}`);
+        if (note) push(`  ${note}`, "LEFT", normal);
       } else {
-        for (const nameLine of wrapPrinterText(name, dishColumns)) push(nameLine, "LEFT", emphasis, dishColumns);
+        push(name, "LEFT", large, dishColumns);
         if (note) printNoteAndQuantity(note, quantityLabel);
-        else pushRight(quantityLabel, emphasis, dishColumns);
+        else pushRight(quantityLabel, emphasis, printerColumns(emphasis));
       }
       if (note && itemIndex < items.length - 1) push("");
     }
@@ -1289,6 +1296,7 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
     const result = await pool.query(
       `SELECT t.id, t.number, t.name, t.seats, t.status, t.sort_order,
               o.id AS order_id, o.people_count, o.opened_at,
+              COALESCE(jsonb_array_length(o.draft_lines), 0) AS draft_count,
               c.id AS customer_id, c.name AS customer_name, c.phone AS customer_phone,
               COALESCE((SELECT SUM((quantity - returned_quantity) * price_fen - gifted_quantity * price_fen)
                         FROM order_items WHERE order_id = o.id), 0) AS current_fen
@@ -1317,6 +1325,7 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
             peopleCount: row.people_count,
             openedAt: row.opened_at,
             currentFen: Number(row.current_fen || 0),
+            draftCount: Number(row.draft_count || 0),
             customer: row.customer_id
               ? { id: row.customer_id, name: row.customer_name, phone: maskPhone(row.customer_phone) }
               : { id: null, name: "散客", phone: null }
@@ -1666,6 +1675,10 @@ app.post("/api/orders/:orderId/end", requireAuth, async (req: AuthenticatedReque
       if (previous) return previous;
       const order = await currentOrder(client, orderId, true);
       if (order.status !== "OPEN") fail("订单已结束，请刷新后操作");
+      const draft = await client.query<{ has_draft: boolean }>(
+        `SELECT jsonb_array_length(draft_lines) > 0 AS has_draft FROM orders WHERE id = $1`, [orderId]
+      );
+      if (draft.rows[0]?.has_draft) fail("还有待打印菜品，请先提交或清空后再结束订单", 409);
       await client.query(
         `UPDATE orders SET status = 'VOID', ended_at = now(), ended_by = $1, end_reason = $2, updated_at = now()
          WHERE id = $3`,
@@ -1690,6 +1703,38 @@ app.post("/api/orders/:orderId/end", requireAuth, async (req: AuthenticatedReque
   }
 });
 
+app.post("/api/orders/:orderId/draft", requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const orderId = routeParam(req, "orderId");
+    const key = requiredIdempotencyKey(req.body?.idempotencyKey);
+    const payload = idempotencyPayload(req.body);
+    const result = await withTransaction(async (client) => {
+      const previous = await readIdempotent(client, `order-draft:${orderId}`, key, user.id, payload, true);
+      if (previous) return previous;
+      const order = await currentOrder(client, orderId, true);
+      if (order.status !== "OPEN") fail("订单已结束，不能修改待打印菜品", 409);
+      const current = await client.query<{ draft_lines: unknown; draft_revision: number }>(
+        `SELECT draft_lines, draft_revision FROM orders WHERE id = $1`, [orderId]
+      );
+      if (payload.op === "clear" && payload.expectedRevision !== current.rows[0].draft_revision) {
+        fail("待打印菜品已被其他设备修改，请刷新后再清空", 409);
+      }
+      const lines = changeDraft(current.rows[0].draft_lines, await prepareDraftPayload(client, payload));
+      const revision = current.rows[0].draft_revision + 1;
+      await client.query(
+        `UPDATE orders SET draft_lines = $1::jsonb, draft_revision = $2, updated_at = now() WHERE id = $3`,
+        [JSON.stringify(lines), revision, orderId]
+      );
+      const response = { lines: publicDraftLines(lines, user.role === "OWNER"), revision };
+      await saveIdempotent(client, `order-draft:${orderId}`, key, user.id, response, payload);
+      return response;
+    });
+    broadcastUpdate({ type: "order.updated", orderId });
+    res.json(result);
+  } catch (error) { publicError(res, error); }
+});
+
 app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const user = currentUser(req);
@@ -1699,13 +1744,19 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
     const printCopies = requestPayload.copies === undefined
       ? 2
       : requireNonNegativeInteger(requestPayload.copies, "备菜单打印份数必须在0到20份之间", 20);
-    const rawItems = Array.isArray(requestPayload.items) ? requestPayload.items : [];
-    if (!rawItems.length) fail("请选择至少一道菜品");
+    const useDraft = requestPayload.useDraft === true;
+    const submittedItems = Array.isArray(requestPayload.items) ? requestPayload.items : [];
+    if (!useDraft && !submittedItems.length) fail("请选择至少一道菜品");
     const response = await withTransaction(async (client) => {
       const previous = await readIdempotent(client, `items:${orderId}`, requestKey, user.id, requestPayload, user.role === "OWNER");
       if (previous) return previous;
       const order = await currentOrder(client, orderId, true);
       if (order.status !== "OPEN") fail("订单已结账或已撤销，请刷新后操作");
+      const draft = useDraft ? await client.query<{ draft_lines: unknown }>(
+        `SELECT draft_lines FROM orders WHERE id = $1`, [orderId]
+      ) : null;
+      const rawItems = useDraft && Array.isArray(draft?.rows[0]?.draft_lines) ? draft.rows[0].draft_lines : submittedItems;
+      if (!rawItems.length) fail("待打印菜品已被其他设备提交或清空，请刷新后核对", 409);
       const banquetPreorder = await client.query<{ id: string }>(
         `SELECT id FROM banquet_reservations
          WHERE order_id = $1
@@ -1755,7 +1806,12 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
         );
         inserted.push({ id: item.rows[0].id, name: dish.name, unit: dish.unit, priceFen: dish.price_fen, quantity, note: options.note });
       }
-      await client.query(`UPDATE orders SET order_version = order_version + 1, updated_at = now() WHERE id = $1`, [orderId]);
+      await client.query(
+        `UPDATE orders SET order_version = order_version + 1,
+         draft_lines = CASE WHEN $2 THEN '[]'::jsonb ELSE draft_lines END,
+         draft_revision = draft_revision + CASE WHEN $2 THEN 1 ELSE 0 END,
+         updated_at = now() WHERE id = $1`, [orderId, useDraft]
+      );
       const printItems = banquetPreorder.rows[0]
         ? (await orderItems(client, orderId)).map((item) => ({
             id: item.id, name: item.dish_name, unit: item.unit, priceFen: item.price_fen,
@@ -1804,6 +1860,7 @@ app.post("/api/banquets/reservations/:reservationId/preorder/print", requireAuth
       const scope = `banquet-preorder-print:${reservationId}`;
       const previous = await readIdempotent(client, scope, requestKey, user.id, requestPayload, user.role === "OWNER");
       if (previous) return previous;
+      await commitBanquetDraft(client, reservationId, user.id);
       const reservationResult = await client.query<{
         id: string; status: string; starts_at: string; customer_name: string; customer_phone: string | null;
         people_count: number; table_name: string; table_number: number | null; note: string; preorder: Array<Record<string, unknown>>;
@@ -1854,6 +1911,7 @@ app.post("/api/banquets/reservations/:reservationId/preorder/print", requireAuth
       await saveIdempotent(client, scope, requestKey, user.id, response, requestPayload);
       return response;
     });
+    broadcastUpdate({ type: "banquet.draft.updated", reservationId });
     res.status(201).json(result);
   } catch (error) {
     publicError(res, error);
@@ -2065,6 +2123,10 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       if (previous) return previous;
       const order = await currentOrder(client, orderId, true);
       if (order.status !== "OPEN") fail("订单已结账或已撤销，请刷新后操作");
+      const outstandingDraft = await client.query<{ has_draft: boolean }>(
+        `SELECT jsonb_array_length(draft_lines) > 0 AS has_draft FROM orders WHERE id = $1`, [orderId]
+      );
+      if (outstandingDraft.rows[0]?.has_draft) fail("还有未打印菜品，请先提交或清空后结账", 409);
       const items = await orderItems(client, orderId);
       const totals = calculateTotals(items);
       const settings = await getSettings(client);
@@ -2746,20 +2808,19 @@ app.patch("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req:
 app.get("/api/customers/search", requireAuth, async (req, res) => {
   try {
     const q = text(req.query.q);
-    if (!q) {
-      res.json({ customers: [] });
-      return;
-    }
+    const offset = req.query.offset === undefined ? 0 : requireNonNegativeInteger(req.query.offset, "查询页码格式不正确");
+    const limit = 20;
     const result = await pool.query(
       `SELECT c.id, c.phone, c.name, c.points_balance, c.created_at,
               COUNT(DISTINCT o.id) FILTER (WHERE o.status = 'SETTLED') AS order_count,
               MAX(o.settled_at) FILTER (WHERE o.status = 'SETTLED') AS last_visit
        FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
-       WHERE c.phone ILIKE $1 OR COALESCE(c.name, '') ILIKE $1
-       GROUP BY c.id ORDER BY c.updated_at DESC LIMIT 30`,
-      [`%${q}%`]
+       WHERE ($1 = '' OR c.phone ILIKE $2 OR COALESCE(c.name, '') ILIKE $2)
+       GROUP BY c.id ORDER BY c.updated_at DESC, c.id DESC LIMIT $3 OFFSET $4`,
+      [q, `%${q}%`, limit + 1, offset]
     );
-    res.json({ customers: result.rows.map((row) => ({ ...row, phone: maskPhone(row.phone) })) });
+    const customers = result.rows.slice(0, limit).map((row) => ({ ...row, phone: maskPhone(row.phone) }));
+    res.json({ customers, hasMore: result.rows.length > limit, nextOffset: offset + customers.length });
   } catch (error) {
     publicError(res, error);
   }
@@ -2829,9 +2890,7 @@ async function statsData(client: DbClient, from: string, to: string) {
   );
   const sales = await client.query(
     `SELECT oi.dish_id,
-            CASE WHEN oi.dish_id IS NULL THEN oi.dish_name
-                 ELSE (ARRAY_AGG(oi.dish_name ORDER BY o.business_date DESC, oi.created_at DESC))[1]
-            END AS dish_name,
+            (ARRAY_AGG(oi.dish_name ORDER BY o.business_date DESC, oi.created_at DESC))[1] AS dish_name,
             SUM(GREATEST(0, oi.quantity - oi.returned_quantity - LEAST(oi.gifted_quantity, oi.quantity - oi.returned_quantity)))::int AS sold_quantity,
             SUM(oi.gifted_quantity)::int AS gifted_quantity,
             SUM(oi.returned_quantity)::int AS returned_quantity,
@@ -2960,13 +3019,13 @@ app.get("/api/notifications/banquet-preorders", requireAuth, async (_req, res) =
       `SELECT r.id, r.starts_at, r.customer_name, r.people_count, r.status,
               COALESCE(t.name, h.name, '未指定桌台') AS table_name,
               t.number AS table_number,
-              jsonb_array_length(r.preorder) AS preorder_count
+              jsonb_array_length(r.preorder) + jsonb_array_length(r.draft_lines) AS preorder_count
        FROM banquet_reservations r
        LEFT JOIN restaurant_tables t ON t.id = r.table_id
        LEFT JOIN banquet_halls h ON h.id = r.hall_id
        WHERE r.status = 'RESERVED'
-         AND r.preorder_printed_at IS NULL
-         AND jsonb_array_length(r.preorder) > 0
+         AND ((r.preorder_printed_at IS NULL AND jsonb_array_length(r.preorder) > 0)
+              OR jsonb_array_length(r.draft_lines) > 0)
          AND r.starts_at <= now() + ($1::int * interval '1 minute')
          AND r.ends_at > now()
        ORDER BY r.starts_at, r.created_at, r.id`,

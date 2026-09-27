@@ -57,7 +57,7 @@ fs.renameSync(stagingDirectory, versionDirectory);
 const manifest = {
   schemaVersion: 1,
   version,
-  notes: "修复宴席过期状态、桌台预约冲突、结账后定金收取和积分抵扣；宴席日期时间统一为上海时区；加强打印服务器地址校验。",
+  notes: "修复营业统计无法查询及导出的问题。",
   android: artifacts.android,
   windows: artifacts.windows
 };
