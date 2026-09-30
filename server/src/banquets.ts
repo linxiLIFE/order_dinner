@@ -31,6 +31,7 @@ type Reservation = {
   points_earning_enabled: boolean;
   status: BanquetState;
   preorder: Array<Record<string, unknown>>;
+  preorder_revision: number;
   draft_lines: Array<Record<string, unknown>>;
   draft_revision: number;
   order_id: string | null;
@@ -229,7 +230,7 @@ export async function commitBanquetDraft(client: DbClient, reservationId: string
   }
   await client.query(
     `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_printed_at = NULL,
-     draft_lines = '[]'::jsonb, draft_revision = draft_revision + 1,
+     preorder_revision = preorder_revision + 1, draft_lines = '[]'::jsonb, draft_revision = draft_revision + 1,
      updated_by = $2, updated_at = now() WHERE id = $3`,
     [JSON.stringify(snapshot), employeeId, reservationId]
   );
@@ -307,6 +308,38 @@ function assertExpectedDishSnapshot(dish: { name: string; unit: string; price_fe
   }
 }
 
+async function appendDraftPreorderItems(
+  client: DbClient,
+  existing: Array<Record<string, unknown>>,
+  rawItems: unknown
+): Promise<Array<Record<string, unknown>>> {
+  if (!Array.isArray(rawItems)) reject("待确认菜品格式不正确");
+  const snapshot = [...existing];
+  for (const raw of rawItems) {
+    const item = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+    const dishId = text(item.dishId);
+    const quantity = positiveInt(item.quantity, "菜品数量", 100_000);
+    const dishResult = await client.query<{
+      id: string; name: string; category_name: string | null; unit: string; price_fen: number; cost_fen: number; points_earning_enabled: boolean | null;
+    }>(
+      `SELECT d.id, d.name, c.name AS category_name, d.unit, d.price_fen, d.cost_fen, c.points_earning_enabled
+       FROM dishes d LEFT JOIN categories c ON c.id = d.category_id WHERE d.id = $1 AND d.on_sale = true
+       FOR SHARE OF d`, [dishId]
+    );
+    const dish = dishResult.rows[0];
+    if (!dish) reject("菜品不存在或已停售", 409);
+    assertExpectedDishSnapshot(dish, item);
+    const options = await snapshotOptions(client, dish.id, item.options, item.note);
+    snapshot.push({
+      dishId: dish.id, name: dish.name, categoryName: dish.category_name || "未分类", unit: dish.unit,
+      priceFen: dish.price_fen, costFen: dish.cost_fen, pointsEarningEnabled: dish.points_earning_enabled !== false,
+      quantity, note: options.note, optionSnapshot: options.snapshot
+    });
+    assertPreorderFitsPostgresInteger(snapshot);
+  }
+  return snapshot;
+}
+
 
 /** Create the banquet tables after the base POS schema has been migrated. Safe to run on every start. */
 export async function runBanquetMigrations(db: DbClient = pool): Promise<void> {
@@ -334,6 +367,7 @@ export async function runBanquetMigrations(db: DbClient = pool): Promise<void> {
       points_earning_enabled boolean NOT NULL DEFAULT true,
       status text NOT NULL DEFAULT 'RESERVED' CHECK (status IN ('RESERVED', 'CANCELLED', 'CONVERTED')),
       preorder jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(preorder) = 'array'),
+      preorder_revision integer NOT NULL DEFAULT 0,
       order_id uuid UNIQUE REFERENCES orders(id),
       note text NOT NULL DEFAULT '',
       created_by uuid REFERENCES employees(id),
@@ -348,6 +382,7 @@ export async function runBanquetMigrations(db: DbClient = pool): Promise<void> {
   await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS preorder_printed_at timestamptz`);
   await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS draft_lines jsonb NOT NULL DEFAULT '[]'::jsonb`);
   await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS draft_revision integer NOT NULL DEFAULT 0`);
+  await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS preorder_revision integer NOT NULL DEFAULT 0`);
   await db.query(`ALTER TABLE banquet_reservations ALTER COLUMN hall_id DROP NOT NULL`);
   await db.query(`DO $migration$
     BEGIN
@@ -682,7 +717,7 @@ banquetRouter.put("/reservations/:reservationId/preorder", async (req: Authentic
         });
         assertPreorderFitsPostgresInteger(snapshot);
       }
-      await client.query(`UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_printed_at = NULL, updated_by = $2, updated_at = now() WHERE id = $3`, [JSON.stringify(snapshot), user.id, reservationId]);
+      await client.query(`UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_revision = preorder_revision + 1, preorder_printed_at = NULL, updated_by = $2, updated_at = now() WHERE id = $3`, [JSON.stringify(snapshot), user.id, reservationId]);
       await logOperation(client, user.id, "SAVE_BANQUET_PREORDER", reservationId, { itemCount: snapshot.length });
       return reservationDetails(client, reservationId);
     });
@@ -731,7 +766,7 @@ banquetRouter.post("/reservations/:reservationId/preorder/items", async (req: Au
         assertPreorderFitsPostgresInteger(snapshot);
       }
       await client.query(
-        `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_printed_at = NULL,
+        `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_revision = preorder_revision + 1, preorder_printed_at = NULL,
          draft_lines = CASE WHEN $4 THEN '[]'::jsonb ELSE draft_lines END,
          draft_revision = draft_revision + CASE WHEN $4 THEN 1 ELSE 0 END,
          updated_by = $2, updated_at = now() WHERE id = $3`,
@@ -742,6 +777,60 @@ banquetRouter.post("/reservations/:reservationId/preorder/items", async (req: Au
     }));
     draftBroadcaster?.(reservationId);
     res.status(201).json(result);
+  } catch (error) { publicError(res, error); }
+});
+
+banquetRouter.post("/reservations/:reservationId/preorder/edit", async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = userOf(req);
+    const reservationId = routeId(req, "reservationId");
+    const key = requestKey(req.body);
+    const payload = payloadWithoutKey(req.body);
+    const retainedItems = Array.isArray(payload.items) ? payload.items : [];
+    if (retainedItems.length > 300) reject("预点菜数量过多");
+    const expectedRevision = nonNegativeInt(payload.expectedRevision, "预点菜版本", 2_147_483_647);
+    const useDraft = payload.useDraft === true;
+    const result = await withTransaction(async (client) => idempotent(client, `preorder-edit:${reservationId}`, key, user.id, payload, async () => {
+      const current = await client.query<{
+        status: BanquetState; preorder: Array<Record<string, unknown>>; preorder_revision: number;
+        draft_lines: unknown;
+      }>(
+        `SELECT status, preorder, preorder_revision, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`,
+        [reservationId]
+      );
+      const reservation = current.rows[0];
+      if (!reservation) reject("宴席预定不存在", 404);
+      if (reservation.status !== "RESERVED") reject("只有待办预定可以修改预点菜", 409);
+      if (expectedRevision !== reservation.preorder_revision) reject("预点菜已在其他设备修改，请刷新后再编辑", 409);
+
+      const previous = Array.isArray(reservation.preorder) ? reservation.preorder : [];
+      const seenIndexes = new Set<number>();
+      const retained: Array<Record<string, unknown>> = [];
+      for (const raw of retainedItems) {
+        const entry = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+        const index = nonNegativeInt(entry.index, "预点菜序号", Math.max(0, previous.length - 1));
+        if (index >= previous.length || seenIndexes.has(index)) reject("预点菜内容已变化，请刷新后再编辑", 409);
+        seenIndexes.add(index);
+        retained.push({ ...previous[index], quantity: positiveInt(entry.quantity, "菜品数量", 100_000) });
+      }
+      const snapshot = await appendDraftPreorderItems(client, retained, useDraft ? reservation.draft_lines : []);
+      assertPreorderFitsPostgresInteger(snapshot);
+      await client.query(
+        `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_revision = preorder_revision + 1,
+         preorder_printed_at = NULL,
+         draft_lines = CASE WHEN $4 THEN '[]'::jsonb ELSE draft_lines END,
+         draft_revision = draft_revision + CASE WHEN $4 THEN 1 ELSE 0 END,
+         updated_by = $2, updated_at = now() WHERE id = $3`,
+        [JSON.stringify(snapshot), user.id, reservationId, useDraft]
+      );
+      await logOperation(client, user.id, "EDIT_BANQUET_PREORDER", reservationId, {
+        itemCount: snapshot.length, removedCount: previous.length - retained.length,
+        addedCount: useDraft && Array.isArray(reservation.draft_lines) ? reservation.draft_lines.length : 0
+      });
+      return { reservation: await reservationDetails(client, reservationId) };
+    }));
+    draftBroadcaster?.(reservationId);
+    res.json(result);
   } catch (error) { publicError(res, error); }
 });
 

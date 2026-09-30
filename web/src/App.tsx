@@ -125,6 +125,7 @@ type BanquetPreorderReservation = {
   starts_at: string;
   status: "RESERVED" | "CANCELLED" | "CONVERTED" | "EXPIRED";
   preorder: BanquetPreorderLine[];
+  preorder_revision: number;
   draft_lines: SavedCartLine[];
   draft_revision: number;
 };
@@ -351,8 +352,10 @@ function cartNeedsMenuReview(cart: Record<string, CartLine>, dishes: Dish[]): bo
   return Object.values(cart).some((line) => {
     const latest = dishes.find((dish) => dish.id === line.dish.id);
     if (!latest) return true;
+    const costChanged = latest.cost_fen != null && line.dish.cost_fen != null
+      && Number(latest.cost_fen) !== Number(line.dish.cost_fen);
     if (latest.name !== line.dish.name || latest.unit !== line.dish.unit
-      || latest.price_fen !== line.dish.price_fen || Number(latest.cost_fen || 0) !== Number(line.dish.cost_fen || 0)
+      || latest.price_fen !== line.dish.price_fen || costChanged
       || latest.category_id !== line.dish.category_id
       || !sameOptionGroups(latest.option_groups, line.dish.option_groups)) return true;
     const selections = new Map(line.selections.map((selection) => [selection.groupId, selection.optionIds]));
@@ -1263,6 +1266,8 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
   const [categoryId, setCategoryId] = useState("");
   const [search, setSearch] = useState("");
   const [cart, setCart] = useState<Record<string, CartLine>>({});
+  const [preorderQuantities, setPreorderQuantities] = useState<number[]>([]);
+  const [preorderConflict, setPreorderConflict] = useState(false);
   const [cartNeedsReview, setCartNeedsReview] = useState(false);
   const [optionTarget, setOptionTarget] = useState<Dish | null>(null);
   const [noteTarget, setNoteTarget] = useState<{ key: string; note: string } | null>(null);
@@ -1272,15 +1277,25 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
   const draftWriteRef = useRef(false);
   const draftRevisionRef = useRef(-1);
   const cartRef = useRef<Record<string, CartLine>>({});
+  const preorderQuantitiesRef = useRef<number[]>([]);
+  const preorderBaselineRef = useRef<number[] | null>(null);
+  const preorderRevisionRef = useRef(-1);
+  const preorderDirtyRef = useRef(false);
   const draftQueueRef = useRef<Array<{ mutation: DraftMutation; idempotencyKey: string }>>([]);
   const draftFlushRef = useRef<Promise<void> | null>(null);
   const draftSaveErrorRef = useRef(false);
 
   useEffect(() => {
     draftRevisionRef.current = -1;
+    preorderQuantitiesRef.current = [];
+    preorderBaselineRef.current = null;
+    preorderRevisionRef.current = -1;
+    preorderDirtyRef.current = false;
     setReservation(null);
     cartRef.current = {};
     setCart({});
+    setPreorderQuantities([]);
+    setPreorderConflict(false);
     setPendingSubmission(null);
     setCartNeedsReview(false);
   }, [reservationId]);
@@ -1298,16 +1313,31 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
         api<{ dishes: Dish[] }>("/api/dishes")
       ]);
       if (requestSequence !== loadRequestSequence.current) return;
-      setReservation(reservationResult.reservation);
       setCategories(categoryResult.categories);
       setDishes(dishResult.dishes);
-      const pending = getPendingIdempotentRequest(`banquet-preorder:${reservationId}`);
-      setPendingSubmission(pending);
-      const nextCart = pending && Array.isArray(pending.payload.items)
-        ? restoreCartLines(pending.payload.items, dishResult.dishes)
-        : restoreCartLines(reservationResult.reservation.draft_lines, dishResult.dishes);
-      if (!draftWriteRef.current && reservationResult.reservation.draft_revision > draftRevisionRef.current) {
-        draftRevisionRef.current = reservationResult.reservation.draft_revision;
+      const oldPending = getPendingIdempotentRequest(`banquet-preorder:${reservationId}`);
+      const editPending = getPendingIdempotentRequest(`banquet-preorder-edit:${reservationId}`);
+      setPendingSubmission(oldPending || editPending);
+      const incoming = reservationResult.reservation;
+      const changedWhileEditing = preorderBaselineRef.current !== null && preorderDirtyRef.current
+        && !oldPending && !editPending && incoming.preorder_revision !== preorderRevisionRef.current;
+      if (!changedWhileEditing) setReservation(incoming);
+      const nextCart = oldPending && Array.isArray(oldPending.payload.items)
+        ? restoreCartLines(oldPending.payload.items, dishResult.dishes)
+        : restoreCartLines(incoming.draft_lines, dishResult.dishes);
+      if (preorderBaselineRef.current === null || !preorderDirtyRef.current) {
+        const quantities = incoming.preorder.map((line) => line.quantity);
+        preorderQuantitiesRef.current = quantities;
+        preorderBaselineRef.current = quantities;
+        preorderRevisionRef.current = incoming.preorder_revision;
+        preorderDirtyRef.current = false;
+        setPreorderQuantities(quantities);
+        setPreorderConflict(false);
+      } else if (changedWhileEditing) {
+        setPreorderConflict(true);
+      }
+      if (!draftWriteRef.current && incoming.draft_revision > draftRevisionRef.current) {
+        draftRevisionRef.current = incoming.draft_revision;
         cartRef.current = nextCart;
         setCart(nextCart);
         setCartNeedsReview(cartNeedsMenuReview(nextCart, dishResult.dishes));
@@ -1345,8 +1375,25 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
       && (!keyword || dish.name.toLowerCase().includes(keyword) || dish.pinyin.toLowerCase().includes(keyword));
   }), [categoryId, dishes, search]);
 
+  function setSavedPreorderQuantity(index: number, quantity: number) {
+    if (busy || pendingSubmission || preorderConflict) return;
+    const next = [...preorderQuantitiesRef.current];
+    next[index] = Math.max(0, Math.min(100_000, quantity));
+    preorderQuantitiesRef.current = next;
+    setPreorderQuantities(next);
+    const baseline = preorderBaselineRef.current || [];
+    preorderDirtyRef.current = next.length !== baseline.length || next.some((value, lineIndex) => value !== baseline[lineIndex]);
+  }
+
+  async function discardPreorderChanges() {
+    preorderDirtyRef.current = false;
+    preorderBaselineRef.current = null;
+    setPreorderConflict(false);
+    await load();
+  }
+
   function updateDraft(mutation: DraftMutation): Promise<void> | undefined {
-    if (busy || reservation?.status !== "RESERVED") return;
+    if (busy || preorderConflict || reservation?.status !== "RESERVED") return;
     draftQueueRef.current.push({ mutation, idempotencyKey: crypto.randomUUID() });
     cartRef.current = applyDraftMutation(cartRef.current, mutation);
     setCart(cartRef.current);
@@ -1398,13 +1445,13 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
   }
 
   function addDish(dish: Dish) {
-    if (busy || pendingSubmission || cartNeedsReview || reservation?.status !== "RESERVED") return;
+    if (busy || pendingSubmission || preorderConflict || cartNeedsReview || reservation?.status !== "RESERVED") return;
     if (dish.option_groups.length) setOptionTarget(dish);
     else addConfiguredDish(dish, []);
   }
 
   function changeCart(key: string, delta: 1 | -1) {
-    if (pendingSubmission || busy) return;
+    if (pendingSubmission || preorderConflict || busy) return;
     if (cartNeedsReview && delta > 0) return;
     const line = cartRef.current[key];
     if (line) void updateDraft({ op: "adjust", delta, line: savedCartLine(line) });
@@ -1421,33 +1468,67 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
 
   async function savePreorder() {
     if (!reservation || reservation.status !== "RESERVED") return;
-    if (draftFlushRef.current) await draftFlushRef.current;
+    const hadSavedPreorder = reservation.preorder.length > 0;
+    const oldScope = `banquet-preorder:${reservationId}`;
+    const editScope = `banquet-preorder-edit:${reservationId}`;
+    const oldPending = getPendingIdempotentRequest(oldScope);
+    const editPending = getPendingIdempotentRequest(editScope);
+    if (draftFlushRef.current && !oldPending && !editPending) await draftFlushRef.current;
     if (draftSaveErrorRef.current) return;
-    const pending = pendingSubmission || getPendingIdempotentRequest(`banquet-preorder:${reservationId}`);
+    const pending = oldPending || editPending;
     if (cartNeedsReview && !pending) {
       setMessage("菜单已更新，请清空并重新加入预点菜后再保留");
       return;
     }
-    if (!Object.keys(cart).length && !pending) return setMessage("请先选择菜品");
+    const hasPreorderChanges = preorderQuantities.length !== reservation.preorder.length
+      || preorderQuantities.some((quantity, index) => quantity !== reservation.preorder[index]?.quantity);
+    if (!Object.keys(cart).length && !hasPreorderChanges && !pending) return;
+    if (preorderConflict && !pending) return;
     setBusy(true);
     try {
-      const result = await idempotentApi<{ reservation: BanquetPreorderReservation }>(
-        `/api/banquets/reservations/${reservationId}/preorder/items`,
-        `banquet-preorder:${reservationId}`,
-        { useDraft: true }
-      );
-      setReservation(result.reservation);
-      draftRevisionRef.current = result.reservation.draft_revision;
-      cartRef.current = restoreCartLines(result.reservation.draft_lines, dishes);
+      let result: { reservation: BanquetPreorderReservation };
+      if (oldPending) {
+        result = await idempotentApi<{ reservation: BanquetPreorderReservation }>(
+          `/api/banquets/reservations/${reservationId}/preorder/items`, oldScope, oldPending.payload
+        );
+      } else {
+        const payload = editPending?.payload || {
+          expectedRevision: preorderRevisionRef.current,
+          items: reservation.preorder.flatMap((_line, index) => {
+            const quantity = preorderQuantities[index] ?? 0;
+            return quantity > 0 ? [{ index, quantity }] : [];
+          }),
+          useDraft: true
+        };
+        result = await idempotentApi<{ reservation: BanquetPreorderReservation }>(
+          `/api/banquets/reservations/${reservationId}/preorder/edit`, editScope, payload
+        );
+      }
+      const updated = result.reservation;
+      setReservation(updated);
+      draftRevisionRef.current = updated.draft_revision;
+      cartRef.current = restoreCartLines(updated.draft_lines, dishes);
       setCart(cartRef.current);
+      const quantities = updated.preorder.map((line) => line.quantity);
+      preorderQuantitiesRef.current = quantities;
+      preorderBaselineRef.current = quantities;
+      preorderRevisionRef.current = updated.preorder_revision;
+      preorderDirtyRef.current = false;
+      setPreorderQuantities(quantities);
+      setPreorderConflict(false);
+      setCartNeedsReview(false);
       setPendingSubmission(null);
-      setMessage("预点菜已保留，不会打印备菜单");
+      setMessage(hadSavedPreorder ? "宴席预点菜修改已保存" : "预点菜已保留");
       goBack();
     } catch (error) {
       if (error instanceof Error && (error.message.includes("菜单已更新") || error.message.includes("菜品备注选项已更新"))) {
         setCartNeedsReview(true);
       }
-      setPendingSubmission(getPendingIdempotentRequest(`banquet-preorder:${reservationId}`));
+      if (error instanceof Error && error.message.includes("预点菜已在其他设备修改")) {
+        setPreorderConflict(true);
+        void load();
+      }
+      setPendingSubmission(getPendingIdempotentRequest(oldScope) || getPendingIdempotentRequest(editScope));
       setMessage(errorText(error));
     } finally {
       setBusy(false);
@@ -1455,9 +1536,15 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
   }
 
   if (!reservation) return <section className="page-section"><div className="loading">正在读取宴席预点菜…</div></section>;
-  const savedTotal = reservation.preorder.reduce((sum, line) => sum + Number(line.priceFen || 0) * Number(line.quantity || 0), 0);
-  const cartTotal = Object.values(cart).reduce((sum, line) => sum + line.dish.price_fen * line.quantity, 0);
   const canEdit = reservation.status === "RESERVED";
+  const savedTotal = reservation.preorder.reduce((sum, line, index) => sum + Number(line.priceFen || 0) * Number(preorderQuantities[index] ?? line.quantity), 0);
+  const savedLineCount = preorderQuantities.filter((quantity) => quantity > 0).length;
+  const cartTotal = Object.values(cart).reduce((sum, line) => sum + line.dish.price_fen * line.quantity, 0);
+  const hasPreorderChanges = preorderQuantities.length !== reservation.preorder.length
+    || preorderQuantities.some((quantity, index) => quantity !== reservation.preorder[index]?.quantity);
+  const hasSaveChanges = Boolean(Object.keys(cart).length || hasPreorderChanges || pendingSubmission);
+  const submitDisabled = !canEdit || busy || !hasSaveChanges || (cartNeedsReview && !pendingSubmission) || (preorderConflict && !pendingSubmission);
+  const submitLabel = pendingSubmission ? "重试确认" : reservation.preorder.length ? "保存修改" : "确认预点菜";
   return <section className={`page-section order-page${Capacitor.isNativePlatform() ? "" : " web-fixed-order-page"}`}>
     <div className="section-heading order-heading"><div><button className="back-button" onClick={goBack}>‹ 宴席预定</button><h2>{reservation.table_name || (reservation.table_number ? `${reservation.table_number}号桌` : "宴席")} · 预点菜</h2><p className="muted">{reservation.customer_name || "未填写姓名"} · {reservation.people_count} 人 · {formatTime(reservation.starts_at)}</p></div></div>
     {!canEdit && <div className="message error">这笔宴席已经开台或取消，不能继续预点菜。</div>}
@@ -1465,20 +1552,31 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
       <div className="catalog-panel">
         <div className="search-row"><input placeholder="搜索菜名、拼音或首字母" value={search} onChange={(event) => setSearch(event.target.value)} /><button className="secondary" onClick={() => setSearch("")}>清空</button></div>
         <div className="category-row"><button className={!categoryId ? "category-chip selected" : "category-chip"} onClick={() => setCategoryId("")}>全部</button>{categories.map((category) => <button className={categoryId === category.id ? "category-chip selected" : "category-chip"} key={category.id} onClick={() => setCategoryId(category.id)}>{category.name}</button>)}</div>
-        <div className="dish-grid">{visibleDishes.map((dish) => { const quantity = Object.values(cart).filter((line) => line.dish.id === dish.id).reduce((sum, line) => sum + line.quantity, 0); return <button className="dish-card" key={dish.id} onClick={() => addDish(dish)} disabled={!canEdit || busy || Boolean(pendingSubmission) || cartNeedsReview}><span className="dish-name">{dish.name}</span><span className="dish-meta">{dish.unit} · {money(dish.price_fen)}</span>{dish.option_groups.length > 0 && <span className="dish-meta">可选口味</span>}{quantity > 0 && <span className="dish-quantity-badge">{quantity}</span>}</button>; })}</div>
+        <div className="dish-grid">{visibleDishes.map((dish) => { const quantity = Object.values(cart).filter((line) => line.dish.id === dish.id).reduce((sum, line) => sum + line.quantity, 0); return <button className="dish-card" key={dish.id} onClick={() => addDish(dish)} disabled={!canEdit || busy || Boolean(pendingSubmission) || preorderConflict || cartNeedsReview}><span className="dish-name">{dish.name}</span><span className="dish-meta">{dish.unit} · {money(dish.price_fen)}</span>{dish.option_groups.length > 0 && <span className="dish-meta">可选口味</span>}{quantity > 0 && <span className="dish-quantity-badge">{quantity}</span>}</button>; })}</div>
         {!visibleDishes.length && <div className="empty">暂无匹配菜品</div>}
       </div>
       <aside className="current-order">
-        <div className="order-card-heading"><h3>已保留预点菜</h3><span>{reservation.preorder.length} 项</span></div>
+        <div className="order-card-heading"><h3>已保留预点菜</h3><span>{savedLineCount} 项</span></div>
         <div className="current-order-scroll">
-          <div className="order-lines">{reservation.preorder.map((item, index) => <div className="order-line" key={`${item.dishId}-${index}`}><div className="line-main"><strong>{item.name}</strong><span>单价 {money(item.priceFen)} × {item.quantity}</span>{item.note && <small>{formatItemNote(item.note)}</small>}</div></div>)}</div>
-          {(Object.keys(cart).length > 0 || pendingSubmission) && <div className="cart-box"><div className="order-card-heading"><h3>{pendingSubmission ? "待确认保留" : "待确认菜品"}</h3><span>{money(cartTotal)}</span></div>{Object.values(cart).map((line) => { const note = cartLineNote(line); return <div className="cart-line" key={line.key}><div><strong>{line.dish.name}</strong><small className="cart-price">单价 {money(line.dish.price_fen)} × {line.quantity} = {money(line.dish.price_fen * line.quantity)}</small><small className={note ? "line-note" : "line-note placeholder"}>{note || "点击备注填写口味"}</small></div><button onClick={() => setNoteTarget({ key: line.key, note: line.customNote })} disabled={Boolean(pendingSubmission) || busy}>备注</button><div className="quantity"><button onClick={() => changeCart(line.key, -1)} disabled={Boolean(pendingSubmission) || busy}>−</button><span>{line.quantity}</span><button onClick={() => changeCart(line.key, 1)} disabled={Boolean(pendingSubmission) || busy || cartNeedsReview}>＋</button></div></div>; })}{pendingSubmission && <small className="pending-submission-hint">上次保留结果尚未确认，重试会沿用原菜品。</small>}</div>}
+          <div className="order-lines">{reservation.preorder.map((item, index) => {
+            const quantity = preorderQuantities[index] ?? item.quantity;
+            const removed = quantity === 0;
+            return <div className={`order-line preorder-line${removed ? " preorder-line-removed" : ""}`} key={`${item.dishId}-${index}`}>
+              <div className="line-main"><strong>{item.name}</strong><span>单价 {money(item.priceFen)} × {removed ? item.quantity : quantity}</span>{item.note && <small>{formatItemNote(item.note)}</small>}{removed && <small>保存后删除</small>}</div>
+              <div className="preorder-line-actions">{removed
+                ? <button type="button" className="text-button" onClick={() => setSavedPreorderQuantity(index, item.quantity)} disabled={!canEdit || busy || Boolean(pendingSubmission) || preorderConflict}>恢复</button>
+                : <><div className="quantity"><button type="button" onClick={() => setSavedPreorderQuantity(index, quantity - 1)} disabled={!canEdit || busy || Boolean(pendingSubmission) || preorderConflict}>−</button><span>{quantity}</span><button type="button" onClick={() => setSavedPreorderQuantity(index, quantity + 1)} disabled={!canEdit || busy || Boolean(pendingSubmission) || preorderConflict || quantity >= 100_000}>＋</button></div><button type="button" className="text-button danger-text" onClick={() => setSavedPreorderQuantity(index, 0)} disabled={!canEdit || busy || Boolean(pendingSubmission) || preorderConflict}>删除</button></>}
+              </div>
+            </div>;
+          })}</div>
+          {(Object.keys(cart).length > 0 || pendingSubmission) && <div className="cart-box"><div className="order-card-heading"><h3>{pendingSubmission ? "待确认保留" : "待确认菜品"}</h3><span>{money(cartTotal)}</span></div>{Object.values(cart).map((line) => { const note = cartLineNote(line); return <div className="cart-line" key={line.key}><div><strong>{line.dish.name}</strong><small className="cart-price">单价 {money(line.dish.price_fen)} × {line.quantity} = {money(line.dish.price_fen * line.quantity)}</small><small className={note ? "line-note" : "line-note placeholder"}>{note || "点击备注填写口味"}</small></div><button onClick={() => setNoteTarget({ key: line.key, note: line.customNote })} disabled={Boolean(pendingSubmission) || busy || preorderConflict}>备注</button><div className="quantity"><button onClick={() => changeCart(line.key, -1)} disabled={Boolean(pendingSubmission) || busy || preorderConflict}>−</button><span>{line.quantity}</span><button onClick={() => changeCart(line.key, 1)} disabled={Boolean(pendingSubmission) || busy || preorderConflict || cartNeedsReview}>＋</button></div></div>; })}{pendingSubmission && <small className="pending-submission-hint">上次保存结果尚未确认，重试会沿用原操作。</small>}</div>}
         </div>
+        {preorderConflict && !pendingSubmission && <div className="message error">预点菜已在其他设备修改，请刷新后再编辑。<button type="button" className="text-button" onClick={() => void discardPreorderChanges()} disabled={busy}>放弃本次修改并刷新</button></div>}
         {cartNeedsReview && !pendingSubmission && <div className="message error">菜单已更新，请清空并重新加入待确认菜品。<button type="button" className="text-button" onClick={() => void updateDraft({ op: "clear" })}>清空待确认菜品</button></div>}
-        <div className="current-order-footer"><div className="order-total"><span>预点合计</span><strong>{money(savedTotal + cartTotal)}</strong></div><div className="preorder-save"><button className="primary wide current-order-action" onClick={() => void savePreorder()} disabled={!canEdit || busy || (!Object.keys(cart).length && !pendingSubmission) || (cartNeedsReview && !pendingSubmission)}>{busy ? "确认中…" : pendingSubmission ? "重试确认" : "确认预点菜"}</button></div></div>
+        <div className="current-order-footer"><div className="order-total"><span>预点合计</span><strong>{money(savedTotal + cartTotal)}</strong></div><div className="preorder-save"><button className="primary wide current-order-action" onClick={() => void savePreorder()} disabled={submitDisabled}>{busy ? "保存中…" : submitLabel}</button></div></div>
       </aside>
     </div>
-    {Capacitor.isNativePlatform() && <div className="mobile-order-quickbar"><div className="mobile-order-total"><small>预点合计</small><strong>{money(savedTotal + cartTotal)}</strong></div><button type="button" className="primary" onClick={() => void savePreorder()} disabled={!canEdit || busy || (!Object.keys(cart).length && !pendingSubmission) || (cartNeedsReview && !pendingSubmission)}>{busy ? "确认中…" : pendingSubmission ? "重试确认" : "确认预点菜"}</button></div>}
+    {Capacitor.isNativePlatform() && <div className="mobile-order-quickbar"><div className="mobile-order-total"><small>预点合计</small><strong>{money(savedTotal + cartTotal)}</strong></div><button type="button" className="primary" onClick={() => void savePreorder()} disabled={submitDisabled}>{busy ? "保存中…" : submitLabel}</button></div>}
     {optionTarget && <DishOptionsDialog dish={optionTarget} onClose={() => setOptionTarget(null)} onSubmit={(selections, note) => { addConfiguredDish(optionTarget, selections, note); setOptionTarget(null); }} />}
     {noteTarget && <NoteDialog note={noteTarget.note} title="填写自定义备注" onClose={() => setNoteTarget(null)} onSubmit={saveNote} />}
   </section>;

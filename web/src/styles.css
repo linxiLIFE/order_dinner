@@ -130,6 +130,11 @@ label small { color: var(--muted); font-size: 0.75rem; }
 .order-card-heading span { color: var(--muted); font-size: 0.8125rem; }
 .order-lines { max-height: 390px; overflow-y: auto; }
 .order-line { display: flex; justify-content: space-between; gap: 10px; padding: 13px 18px; border-bottom: 1px solid #f0f1f2; }
+.preorder-line { align-items: center; }
+.preorder-line .line-main { flex: 1; }
+.preorder-line-removed { opacity: .58; }
+.preorder-line-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.preorder-line-actions .text-button { white-space: nowrap; font-size: .75rem; }
 .line-main { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
 .line-main strong { font-size: 0.9375rem; }
 .line-main span { color: #4f5962; font-size: 0.8125rem; }
