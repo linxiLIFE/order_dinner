@@ -57,7 +57,7 @@ fs.renameSync(stagingDirectory, versionDirectory);
 const manifest = {
   schemaVersion: 1,
   version,
-  notes: "点菜界面可独立滚动并固定合计；增加宴席备菜单提醒和备注编辑；网页、安卓和 Windows 更新。",
+  notes: "修复营业统计无法查询及导出的问题。",
   android: artifacts.android,
   windows: artifacts.windows
 };

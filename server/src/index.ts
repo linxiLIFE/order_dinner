@@ -8,7 +8,8 @@ import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { pool, withReadOnlySnapshot, withTransaction, type DbClient } from "./db.js";
 import { migrateAndSeed, pruneExpiredIdempotencyKeys } from "./migrate.js";
-import { applyBanquetDepositForCheckout, autoOpenDueBanquets, banquetRouter, reverseBanquetDepositForSettlement, runBanquetMigrations } from "./banquets.js";
+import { changeDraft, prepareDraftPayload, publicDraftLines } from "./draft.js";
+import { applyBanquetDepositForCheckout, autoOpenDueBanquets, banquetRouter, commitBanquetDraft, reverseBanquetDepositForSettlement, runBanquetMigrations, setBanquetDraftBroadcaster } from "./banquets.js";
 import { createToken, requireAuth, requireRole } from "./auth.js";
 import type { AuthenticatedRequest, AuthUser } from "./types.js";
 import {
@@ -31,6 +32,8 @@ import {
   settingNumber
 } from "./utils.js";
 
+import { businessAiRouter, runAiMigrations } from "./business-ai.js";
+
 const app = express();
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
@@ -38,6 +41,7 @@ const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.
 const updatesDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../updates");
 
 app.use(cors({ origin: true, credentials: false }));
+app.use("/api/business-ai", businessAiRouter(statsData));
 app.use(express.json({ limit: "2mb" }));
 app.use((_req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -76,6 +80,7 @@ function routeParam(req: Request, name: string): string {
 type StoreEvent = {
   type: string;
   orderId?: string;
+  reservationId?: string;
   newOrderId?: string;
   tableId?: string | null;
 };
@@ -138,6 +143,7 @@ function broadcastUpdate(event: StoreEvent): void {
     }
   }
 }
+setBanquetDraftBroadcaster((reservationId) => broadcastUpdate({ type: "banquet.draft.updated", reservationId }));
 
 function printerTokenHash(token: string): string {
   return crypto.createHash("sha256").update(token).digest("hex");
@@ -204,7 +210,6 @@ type ItemRow = {
   price_fen: number;
   cost_fen: number;
   points_earning_enabled: boolean;
-  current_category_points_earning_enabled?: boolean | null;
   quantity: number;
   gifted_quantity: number;
   returned_quantity: number;
@@ -226,7 +231,7 @@ type Totals = {
 };
 
 function calculateTotals(items: ItemRow[]): Totals {
-  return items.reduce(
+  const totals = items.reduce(
     (total, item) => {
       const returned = Math.min(item.quantity, item.returned_quantity);
       const gifted = Math.min(Math.max(0, item.quantity - returned), item.gifted_quantity);
@@ -245,6 +250,11 @@ function calculateTotals(items: ItemRow[]): Totals {
     },
     { grossFen: 0, giftFen: 0, returnFen: 0, subtotalFen: 0, costFen: 0, lossFen: 0 }
   );
+  const postgresIntegerMax = 2_147_483_647;
+  if (Object.values(totals).some((value) => !Number.isSafeInteger(value) || value > postgresIntegerMax)) {
+    fail("订单金额或数量超过系统支持范围，请调整菜品数量或拆分账单", 409);
+  }
+  return totals;
 }
 
 function marginPercent(revenueFen: number, costFen: number): number {
@@ -286,10 +296,10 @@ function optionSelections(
   for (const group of groups) {
     const row = requested.find((value) => text((value as { groupId?: unknown })?.groupId) === group.id) as { optionIds?: unknown } | undefined;
     const optionIds = Array.from(new Set(Array.isArray(row?.optionIds) ? row.optionIds.map((id) => text(id)).filter(Boolean) : []));
-    if (group.required && !optionIds.length) fail(`请选择${group.name}`);
-    if (!group.allow_multiple && optionIds.length > 1) fail(`${group.name}只能选择一项`);
+    if (group.required && !optionIds.length) fail(`菜品备注选项已更新，请重新选择${group.name}`, 409);
+    if (!group.allow_multiple && optionIds.length > 1) fail(`菜品备注选项已更新，请重新选择${group.name}`, 409);
     const selected = optionIds.map((id) => group.options.find((option) => option.id === id)).filter(Boolean) as Array<{ id: string; label: string }>;
-    if (selected.length !== optionIds.length) fail(`${group.name}包含无效选项`);
+    if (selected.length !== optionIds.length) fail(`菜品备注选项已更新，请重新选择${group.name}`, 409);
     if (selected.length) {
       noteParts.push(`${group.name}：${selected.map((option) => option.label).join("、")}`);
       snapshot.push({ groupId: group.id, groupName: group.name, optionIds, labels: selected.map((option) => option.label) });
@@ -298,6 +308,21 @@ function optionSelections(
   const note = text(customNote).slice(0, 300);
   if (note) noteParts.push(snapshot.length ? `备注：${note}` : note);
   return { note: noteParts.join("，").slice(0, 500), snapshot };
+}
+
+function assertExpectedDishSnapshot(dish: { name: string; unit: string; price_fen: number; cost_fen: number }, raw: unknown): void {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+  const expected = raw as Record<string, unknown>;
+  if (expected.expectedDishName !== undefined && expected.expectedDishName !== dish.name) fail("菜单已更新，请重新确认待提交菜品", 409);
+  if (expected.expectedUnit !== undefined && expected.expectedUnit !== dish.unit) fail("菜单已更新，请重新确认待提交菜品", 409);
+  if (expected.expectedPriceFen !== undefined
+    && (!Number.isSafeInteger(expected.expectedPriceFen) || expected.expectedPriceFen !== dish.price_fen)) {
+    fail("菜单已更新，请重新确认待提交菜品", 409);
+  }
+  if (expected.expectedCostFen !== undefined
+    && (!Number.isSafeInteger(expected.expectedCostFen) || Number(expected.expectedCostFen) !== Number(dish.cost_fen))) {
+    fail("菜单已更新，请重新确认待提交菜品", 409);
+  }
 }
 
 async function replaceDishOptionGroups(client: DbClient, dishId: string, rawGroups: unknown): Promise<void> {
@@ -331,11 +356,9 @@ async function replaceDishOptionGroups(client: DbClient, dishId: string, rawGrou
 
 async function orderItems(client: DbClient, orderId: string): Promise<ItemRow[]> {
   const result = await client.query<ItemRow>(
-    `SELECT oi.*, ob.batch_no, ob.kind AS batch_kind, c.points_earning_enabled AS current_category_points_earning_enabled
+    `SELECT oi.*, ob.batch_no, ob.kind AS batch_kind
      FROM order_items oi
      JOIN order_batches ob ON ob.id = oi.batch_id
-     LEFT JOIN dishes d ON d.id = oi.dish_id
-     LEFT JOIN categories c ON c.id = d.category_id
      WHERE oi.order_id = $1
      ORDER BY ob.batch_no, oi.created_at, oi.id`,
     [orderId]
@@ -364,6 +387,8 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     ended_at: string | null;
     end_reason: string;
     order_note: string;
+    draft_lines: Array<Record<string, unknown>>;
+    draft_revision: number;
   }>(
     `SELECT o.*, COALESCE(o.table_number_snapshot, t.number) AS table_number,
             COALESCE(o.table_name_snapshot, t.name) AS table_name,
@@ -445,6 +470,8 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     orderNote: order.order_note,
     banquetDepositBalanceFen: Number(banquetDeposit.rows[0]?.balance_fen || 0),
     banquetPreorderPendingPrint: Boolean(banquetPreorder.rows[0]?.pending_print),
+    draftLines: publicDraftLines(order.draft_lines, includeFinancialDetails),
+    draftRevision: order.draft_revision,
     items: items.map((item) => ({
       id: item.id,
       dishId: item.dish_id,
@@ -793,7 +820,12 @@ function normalizeReprintTitle(value: unknown): string {
   return `${base}（补打）`;
 }
 
-type PrinterLine = { text: string; align: "LEFT" | "CENTER"; size: "NORMAL" | "LARGE" | "EMPHASIS" };
+type PrinterLine = {
+  text: string;
+  align: "LEFT" | "CENTER";
+  size: "NORMAL" | "LARGE" | "EMPHASIS";
+  segments?: Array<{ text: string; size: "NORMAL" | "LARGE" | "EMPHASIS" }>;
+};
 
 function printerDisplayWidth(value: string): number {
   return Array.from(value).reduce((width, character) => width + (character.codePointAt(0)! <= 0x7f ? 1 : 2), 0);
@@ -899,39 +931,34 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     const leadingSpaces = Math.max(0, maxWidth - printerDisplayWidth(value));
     push(`${" ".repeat(leadingSpaces)}${value}`, "LEFT", size, maxWidth);
   };
+  const pushSegments = (segments: NonNullable<PrinterLine["segments"]>, fallbackText: string) => {
+    lines.push({ text: fallbackText, align: "LEFT", size: "EMPHASIS", segments });
+  };
   const stringValue = (value: unknown, fallback = "") => value === null || value === undefined ? fallback : String(value);
   const tableName = stringValue(payload.tableName) || (Number(payload.tableNumber) > 0 ? `${Number(payload.tableNumber)}号桌` : "无桌台");
   const large = "LARGE" as const;
   const emphasis = "EMPHASIS" as const;
   const normal = "NORMAL" as const;
   const center = "CENTER" as const;
-  const dishColumns = printerColumns(emphasis);
+  const dishColumns = printerColumns(large);
   const printNoteAndQuantity = (note: string, quantityLabel: string) => {
     const quantityWidth = printerDisplayWidth(quantityLabel);
-    const maxNoteWidth = dishColumns - quantityWidth - 1;
-    const noteText = `  ${note}`;
-    if (maxNoteWidth < 1) {
-      for (const noteLine of wrapPrinterText(noteText, dishColumns)) push(noteLine, "LEFT", normal, dishColumns);
-      pushRight(quantityLabel, emphasis, dishColumns);
-      return;
-    }
-
-    const noteLines = wrapPrinterText(noteText, dishColumns);
+    const maxNoteWidth = printerColumns(normal) - quantityWidth - 1;
+    const noteLines = wrapPrinterText(`  ${note}`, printerColumns(normal));
     let finalNoteLine = noteLines.pop() || "";
     if (printerDisplayWidth(finalNoteLine) > maxNoteWidth) {
       const wrappedFinalLine = wrapPrinterText(finalNoteLine, maxNoteWidth);
       finalNoteLine = wrappedFinalLine.pop() || "";
       noteLines.push(...wrappedFinalLine);
     }
-    for (const noteLine of noteLines) push(noteLine, "LEFT", normal, dishColumns);
-
-    const gap = dishColumns - printerDisplayWidth(finalNoteLine) - quantityWidth;
+    for (const noteLine of noteLines) push(noteLine, "LEFT", normal);
+    const gap = printerColumns(normal) - printerDisplayWidth(finalNoteLine) - quantityWidth;
     if (gap < 1) {
-      push(finalNoteLine, "LEFT", normal, dishColumns);
-      pushRight(quantityLabel, emphasis, dishColumns);
+      push(finalNoteLine, "LEFT", normal);
+      pushRight(quantityLabel, emphasis, printerColumns(emphasis));
       return;
     }
-    push(`${finalNoteLine}${" ".repeat(gap)}${quantityLabel}`, "LEFT", normal, dishColumns);
+    push(`${finalNoteLine}${" ".repeat(gap)}${quantityLabel}`, "LEFT", normal);
   };
 
   const storeName = receipt ? stringValue(payload.storeName).trim() : "";
@@ -969,28 +996,28 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     if (receipt) {
       const unitPriceFen = Number(item.priceFen ?? item.price_fen ?? 0);
       const subtotalFen = unitPriceFen * quantity;
-      const nameLines = wrapPrinterText(name, RECEIPT_DISH_COLUMNS);
-      push(
-        receiptRow(nameLines[0] || "菜品", quantityLabel, printerMoney(unitPriceFen), printerMoney(subtotalFen)),
-        "LEFT",
-        emphasis,
-        RECEIPT_TOTAL_COLUMNS
-      );
+      const nameLines = wrapPrinterText(name, RECEIPT_DISH_COLUMNS / 2);
+      const values = receiptRow("", quantityLabel, printerMoney(unitPriceFen), printerMoney(subtotalFen)).slice(RECEIPT_DISH_COLUMNS);
+      pushSegments([
+        { text: receiptCell(nameLines[0] || "菜品", RECEIPT_DISH_COLUMNS / 2), size: large },
+        { text: values, size: emphasis }
+      ], receiptRow(nameLines[0] || "菜品", quantityLabel, printerMoney(unitPriceFen), printerMoney(subtotalFen)));
       for (const nameLine of nameLines.slice(1)) {
-        push(receiptCell(nameLine, RECEIPT_DISH_COLUMNS), "LEFT", emphasis, RECEIPT_TOTAL_COLUMNS);
+        pushSegments([{ text: receiptCell(nameLine, RECEIPT_DISH_COLUMNS / 2), size: large }], receiptCell(nameLine, RECEIPT_DISH_COLUMNS));
       }
     } else {
-      const sameDishLine = printerDisplayWidth(name) + 1 + printerDisplayWidth(quantityLabel) <= dishColumns;
+      const sameDishLine = printerDisplayWidth(name) * 2 + 1 + printerDisplayWidth(quantityLabel) <= printerColumns(emphasis);
       if (sameDishLine) {
-        const gap = Math.max(1, dishColumns - printerDisplayWidth(name) - printerDisplayWidth(quantityLabel));
-        push(`${name}${" ".repeat(gap)}${quantityLabel}`, "LEFT", emphasis);
-        if (note) {
-          for (const noteLine of wrapPrinterText(`  ${note}`, dishColumns)) push(noteLine, "LEFT", normal, dishColumns);
-        }
+        const gap = printerColumns(emphasis) - printerDisplayWidth(name) * 2 - printerDisplayWidth(quantityLabel);
+        pushSegments([
+          { text: name, size: large },
+          { text: `${" ".repeat(gap)}${quantityLabel}`, size: emphasis }
+        ], `${name}${" ".repeat(printerColumns(emphasis) - printerDisplayWidth(name) - printerDisplayWidth(quantityLabel))}${quantityLabel}`);
+        if (note) push(`  ${note}`, "LEFT", normal);
       } else {
-        for (const nameLine of wrapPrinterText(name, dishColumns)) push(nameLine, "LEFT", emphasis, dishColumns);
+        push(name, "LEFT", large, dishColumns);
         if (note) printNoteAndQuantity(note, quantityLabel);
-        else pushRight(quantityLabel, emphasis, dishColumns);
+        else pushRight(quantityLabel, emphasis, printerColumns(emphasis));
       }
       if (note && itemIndex < items.length - 1) push("");
     }
@@ -1048,7 +1075,9 @@ const settingsSchema = z.object({
   points_redeem_tiers: z.array(z.object({
     points: z.number().int().min(1).max(1_000_000_000),
     discountFen: z.number().int().min(1).max(1_000_000_000)
-  }).strict()).min(1).max(20).refine((tiers) => new Set(tiers.map((tier) => tier.points)).size === tiers.length, "积分档位不能重复").optional(),
+  }).strict()).min(1).max(20).refine((tiers) => tiers.every((tier, index) =>
+    index === 0 || (tier.points > tiers[index - 1].points && tier.discountFen > tiers[index - 1].discountFen)
+  ), "积分档位的积分数和抵扣金额都必须严格递增").optional(),
   points_min_spend_fen: z.number().int().min(1).max(1_000_000_000).optional(),
   points_allow_below_minimum: z.boolean().optional(),
   points_redeem_points: z.number().int().min(1).max(1_000_000_000).optional(),
@@ -1062,10 +1091,11 @@ type LoginBucket = { failures: number; resetAt: number; blockedUntil: number; to
 const loginBuckets = new Map<string, LoginBucket>();
 const loginWindowMs = 15 * 60 * 1000;
 
-function loginBucketKey(req: Request, kind: "ip" | "account"): string {
+function loginBucketKey(req: Request, kind: "ip" | "account" | "username"): string {
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   const username = typeof req.body?.username === "string" ? req.body.username.trim().toLowerCase().slice(0, 120) : "";
-  return kind === "ip" ? `ip:${ip}` : `account:${ip}:${username}`;
+  if (kind === "ip") return `ip:${ip}`;
+  return kind === "account" ? `account:${ip}:${username}` : `username:${username || "<empty>"}`;
 }
 
 function checkLoginRateLimit(req: Request, res: Response, next: NextFunction): void {
@@ -1073,7 +1103,7 @@ function checkLoginRateLimit(req: Request, res: Response, next: NextFunction): v
   for (const [key, bucket] of loginBuckets) {
     if (bucket.blockedUntil <= now && bucket.resetAt <= now) loginBuckets.delete(key);
   }
-  for (const key of [loginBucketKey(req, "ip"), loginBucketKey(req, "account")]) {
+  for (const key of [loginBucketKey(req, "ip"), loginBucketKey(req, "account"), loginBucketKey(req, "username")]) {
     const bucket = loginBuckets.get(key);
     if (bucket && bucket.blockedUntil > now) {
       res.setHeader("Retry-After", String(Math.ceil((bucket.blockedUntil - now) / 1000)));
@@ -1088,7 +1118,8 @@ function recordLoginFailure(req: Request): void {
   const now = Date.now();
   const limits: Array<[string, number]> = [
     [loginBucketKey(req, "ip"), 20],
-    [loginBucketKey(req, "account"), 5]
+    [loginBucketKey(req, "account"), 5],
+    [loginBucketKey(req, "username"), 20]
   ];
   for (const [key, limit] of limits) {
     const old = loginBuckets.get(key);
@@ -1108,6 +1139,7 @@ function recordLoginFailure(req: Request): void {
 
 function clearAccountLoginFailures(req: Request): void {
   loginBuckets.delete(loginBucketKey(req, "account"));
+  loginBuckets.delete(loginBucketKey(req, "username"));
 }
 
 app.get("/healthz", async (_req, res) => {
@@ -1267,13 +1299,16 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
     const result = await pool.query(
       `SELECT t.id, t.number, t.name, t.seats, t.status, t.sort_order,
               o.id AS order_id, o.people_count, o.opened_at,
+              COALESCE(jsonb_array_length(o.draft_lines), 0) AS draft_count,
               c.id AS customer_id, c.name AS customer_name, c.phone AS customer_phone,
               COALESCE((SELECT SUM((quantity - returned_quantity) * price_fen - gifted_quantity * price_fen)
                         FROM order_items WHERE order_id = o.id), 0) AS current_fen
               ,(SELECT COUNT(*)::int FROM banquet_reservations br
-                WHERE br.table_id = t.id AND br.status = 'RESERVED' AND br.ends_at > now()) AS banquet_reservation_count
+                WHERE br.table_id = t.id AND br.status = 'RESERVED'
+                  AND br.starts_at <= now() + interval '2 hours' AND br.ends_at > now()) AS banquet_reservation_count
               ,(SELECT MIN(br.starts_at) FROM banquet_reservations br
-                WHERE br.table_id = t.id AND br.status = 'RESERVED' AND br.starts_at >= now()) AS next_banquet_reservation_at
+                WHERE br.table_id = t.id AND br.status = 'RESERVED'
+                  AND br.starts_at >= now() AND br.starts_at <= now() + interval '2 hours' AND br.ends_at > now()) AS next_banquet_reservation_at
        FROM restaurant_tables t
        LEFT JOIN orders o ON o.table_id = t.id AND o.status = 'OPEN'
        LEFT JOIN customers c ON c.id = o.customer_id
@@ -1293,6 +1328,7 @@ app.get("/api/tables", requireAuth, async (_req, res) => {
             peopleCount: row.people_count,
             openedAt: row.opened_at,
             currentFen: Number(row.current_fen || 0),
+            draftCount: Number(row.draft_count || 0),
             customer: row.customer_id
               ? { id: row.customer_id, name: row.customer_name, phone: maskPhone(row.customer_phone) }
               : { id: null, name: "散客", phone: null }
@@ -1345,6 +1381,12 @@ app.post("/api/tables/:tableId/open", requireAuth, async (req: AuthenticatedRequ
       const table = tableResult.rows[0];
       if (!table) fail("桌台不存在", 404);
       if (table.status !== "AVAILABLE") fail("桌台已被占用或停用，请刷新桌台状态", 409);
+      const activeBanquet = await client.query(
+        `SELECT id FROM banquet_reservations
+         WHERE table_id = $1 AND status = 'RESERVED' AND starts_at <= now() AND ends_at > now()
+         LIMIT 1`, [tableId]
+      );
+      if (activeBanquet.rows[0]) fail("该桌台当前有宴席预定，请从宴席详情开台或查看宴席安排", 409);
       let customerId: string | null = null;
       if (phone) {
         customerId = await findOrCreateCustomer(client, phone, customerName);
@@ -1436,6 +1478,8 @@ app.delete("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req
       );
       if (!table.rows[0]) fail("桌台不存在", 404);
       if (table.rows[0].status === "OCCUPIED") fail("使用中的桌台不能删除，请先结束当前账单");
+      const banquetHistory = await client.query(`SELECT 1 FROM banquet_reservations WHERE table_id = $1 LIMIT 1`, [tableId]);
+      if (banquetHistory.rows[0]) fail("已有宴席记录的桌台不能删除，可改名或停用", 409);
       const history = await client.query<{ count: string }>(
         `SELECT COUNT(*)::text AS count FROM orders WHERE table_id = $1`,
         [tableId]
@@ -1634,6 +1678,10 @@ app.post("/api/orders/:orderId/end", requireAuth, async (req: AuthenticatedReque
       if (previous) return previous;
       const order = await currentOrder(client, orderId, true);
       if (order.status !== "OPEN") fail("订单已结束，请刷新后操作");
+      const draft = await client.query<{ has_draft: boolean }>(
+        `SELECT jsonb_array_length(draft_lines) > 0 AS has_draft FROM orders WHERE id = $1`, [orderId]
+      );
+      if (draft.rows[0]?.has_draft) fail("还有待打印菜品，请先提交或清空后再结束订单", 409);
       await client.query(
         `UPDATE orders SET status = 'VOID', ended_at = now(), ended_by = $1, end_reason = $2, updated_at = now()
          WHERE id = $3`,
@@ -1658,6 +1706,38 @@ app.post("/api/orders/:orderId/end", requireAuth, async (req: AuthenticatedReque
   }
 });
 
+app.post("/api/orders/:orderId/draft", requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = currentUser(req);
+    const orderId = routeParam(req, "orderId");
+    const key = requiredIdempotencyKey(req.body?.idempotencyKey);
+    const payload = idempotencyPayload(req.body);
+    const result = await withTransaction(async (client) => {
+      const previous = await readIdempotent(client, `order-draft:${orderId}`, key, user.id, payload, true);
+      if (previous) return previous;
+      const order = await currentOrder(client, orderId, true);
+      if (order.status !== "OPEN") fail("订单已结束，不能修改待打印菜品", 409);
+      const current = await client.query<{ draft_lines: unknown; draft_revision: number }>(
+        `SELECT draft_lines, draft_revision FROM orders WHERE id = $1`, [orderId]
+      );
+      if (payload.op === "clear" && payload.expectedRevision !== current.rows[0].draft_revision) {
+        fail("待打印菜品已被其他设备修改，请刷新后再清空", 409);
+      }
+      const lines = changeDraft(current.rows[0].draft_lines, await prepareDraftPayload(client, payload));
+      const revision = current.rows[0].draft_revision + 1;
+      await client.query(
+        `UPDATE orders SET draft_lines = $1::jsonb, draft_revision = $2, updated_at = now() WHERE id = $3`,
+        [JSON.stringify(lines), revision, orderId]
+      );
+      const response = { lines: publicDraftLines(lines, user.role === "OWNER"), revision };
+      await saveIdempotent(client, `order-draft:${orderId}`, key, user.id, response, payload);
+      return response;
+    });
+    broadcastUpdate({ type: "order.updated", orderId });
+    res.json(result);
+  } catch (error) { publicError(res, error); }
+});
+
 app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const user = currentUser(req);
@@ -1667,13 +1747,19 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
     const printCopies = requestPayload.copies === undefined
       ? 2
       : requireNonNegativeInteger(requestPayload.copies, "备菜单打印份数必须在0到20份之间", 20);
-    const rawItems = Array.isArray(requestPayload.items) ? requestPayload.items : [];
-    if (!rawItems.length) fail("请选择至少一道菜品");
+    const useDraft = requestPayload.useDraft === true;
+    const submittedItems = Array.isArray(requestPayload.items) ? requestPayload.items : [];
+    if (!useDraft && !submittedItems.length) fail("请选择至少一道菜品");
     const response = await withTransaction(async (client) => {
       const previous = await readIdempotent(client, `items:${orderId}`, requestKey, user.id, requestPayload, user.role === "OWNER");
       if (previous) return previous;
       const order = await currentOrder(client, orderId, true);
       if (order.status !== "OPEN") fail("订单已结账或已撤销，请刷新后操作");
+      const draft = useDraft ? await client.query<{ draft_lines: unknown }>(
+        `SELECT draft_lines FROM orders WHERE id = $1`, [orderId]
+      ) : null;
+      const rawItems = useDraft && Array.isArray(draft?.rows[0]?.draft_lines) ? draft.rows[0].draft_lines : submittedItems;
+      if (!rawItems.length) fail("待打印菜品已被其他设备提交或清空，请刷新后核对", 409);
       const banquetPreorder = await client.query<{ id: string }>(
         `SELECT id FROM banquet_reservations
          WHERE order_id = $1
@@ -1705,11 +1791,13 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
           `SELECT d.id, d.name, d.pinyin, d.unit, d.price_fen, d.cost_fen, c.name AS category_name,
                   c.points_earning_enabled
            FROM dishes d LEFT JOIN categories c ON c.id = d.category_id
-           WHERE d.id = $1 AND d.on_sale = true`,
+           WHERE d.id = $1 AND d.on_sale = true
+           FOR SHARE OF d`,
           [dishId]
         );
         const dish = dishResult.rows[0];
         if (!dish) fail("菜品不存在或已停售");
+        assertExpectedDishSnapshot(dish, raw);
         const groups = await dishOptionGroups(client, dish.id);
         const options = optionSelections(groups, raw?.options, raw?.note);
         const item = await client.query<{ id: string }>(
@@ -1721,7 +1809,12 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
         );
         inserted.push({ id: item.rows[0].id, name: dish.name, unit: dish.unit, priceFen: dish.price_fen, quantity, note: options.note });
       }
-      await client.query(`UPDATE orders SET order_version = order_version + 1, updated_at = now() WHERE id = $1`, [orderId]);
+      await client.query(
+        `UPDATE orders SET order_version = order_version + 1,
+         draft_lines = CASE WHEN $2 THEN '[]'::jsonb ELSE draft_lines END,
+         draft_revision = draft_revision + CASE WHEN $2 THEN 1 ELSE 0 END,
+         updated_at = now() WHERE id = $1`, [orderId, useDraft]
+      );
       const printItems = banquetPreorder.rows[0]
         ? (await orderItems(client, orderId)).map((item) => ({
             id: item.id, name: item.dish_name, unit: item.unit, priceFen: item.price_fen,
@@ -1770,6 +1863,7 @@ app.post("/api/banquets/reservations/:reservationId/preorder/print", requireAuth
       const scope = `banquet-preorder-print:${reservationId}`;
       const previous = await readIdempotent(client, scope, requestKey, user.id, requestPayload, user.role === "OWNER");
       if (previous) return previous;
+      await commitBanquetDraft(client, reservationId, user.id);
       const reservationResult = await client.query<{
         id: string; status: string; starts_at: string; customer_name: string; customer_phone: string | null;
         people_count: number; table_name: string; table_number: number | null; note: string; preorder: Array<Record<string, unknown>>;
@@ -1820,6 +1914,7 @@ app.post("/api/banquets/reservations/:reservationId/preorder/print", requireAuth
       await saveIdempotent(client, scope, requestKey, user.id, response, requestPayload);
       return response;
     });
+    broadcastUpdate({ type: "banquet.draft.updated", reservationId });
     res.status(201).json(result);
   } catch (error) {
     publicError(res, error);
@@ -2031,6 +2126,10 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       if (previous) return previous;
       const order = await currentOrder(client, orderId, true);
       if (order.status !== "OPEN") fail("订单已结账或已撤销，请刷新后操作");
+      const outstandingDraft = await client.query<{ has_draft: boolean }>(
+        `SELECT jsonb_array_length(draft_lines) > 0 AS has_draft FROM orders WHERE id = $1`, [orderId]
+      );
+      if (outstandingDraft.rows[0]?.has_draft) fail("还有未打印菜品，请先提交或清空后结账", 409);
       const items = await orderItems(client, orderId);
       const totals = calculateTotals(items);
       const settings = await getSettings(client);
@@ -2039,10 +2138,13 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       const configuredTiers = Array.isArray(settings.points_redeem_tiers)
         ? settings.points_redeem_tiers as Array<{ points: number; discountFen: number }>
         : [{ points: settingNumber(settings, "points_redeem_points", 10), discountFen: settingNumber(settings, "points_redeem_fen", 100) }];
-      const redeemTiers = configuredTiers
+      const sortedRedeemTiers = configuredTiers
         .filter((tier) => Number.isSafeInteger(Number(tier?.points)) && Number(tier.points) > 0 && Number.isSafeInteger(Number(tier?.discountFen)) && Number(tier.discountFen) > 0)
         .map((tier) => ({ points: Number(tier.points), discountFen: Number(tier.discountFen) }))
         .sort((a, b) => a.points - b.points);
+      const redeemTiers = sortedRedeemTiers.every((tier, index) => index === 0 || tier.discountFen > sortedRedeemTiers[index - 1].discountFen)
+        ? sortedRedeemTiers
+        : [];
       const minimumSpendFen = settingNumber(settings, "points_min_spend_fen", redeemTiers[0]?.discountFen || 24000);
       const allowBelowMinimum = settingBoolean(settings, "points_allow_below_minimum", false);
       const manualInput = req.body?.manualDiscountFen === undefined
@@ -2077,7 +2179,7 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       const affordableTiers = redeemTiers.filter((tier) => tier.points <= customerBalance);
       const fittingTiers = affordableTiers.filter((tier) => tier.discountFen <= remainingBeforePoints);
       const selectedTier = usePoints && pointsEligible && remainingBeforePoints > 0
-        ? (fittingTiers.at(-1) || affordableTiers[0])
+        ? fittingTiers.at(-1)
         : undefined;
       const requestedPoints = selectedTier?.points ?? 0;
       const pointsDiscountFen = Math.min(totals.subtotalFen - manualDiscountFen, selectedTier?.discountFen ?? 0);
@@ -2088,8 +2190,7 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
       const paymentMethod = text(req.body?.paymentMethod) || "现金";
       if (!["现金", "微信", "支付宝", "银行卡", "其他"].includes(paymentMethod)) fail("收款方式不正确");
       const pointsEligibleFen = items.reduce((sum, item) => {
-        const categoryRuleEnabled = item.current_category_points_earning_enabled ?? item.points_earning_enabled;
-        if (categoryRuleEnabled === false) return sum;
+        if (item.points_earning_enabled === false) return sum;
         const returned = Math.min(item.quantity, item.returned_quantity);
         const gifted = Math.min(Math.max(0, item.quantity - returned), item.gifted_quantity);
         return sum + Math.max(0, (item.quantity - returned - gifted) * item.price_fen);
@@ -2684,6 +2785,14 @@ app.patch("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req:
       if (!table.rows[0]) fail("桌台不存在", 404);
       const openOrder = await client.query(`SELECT 1 FROM orders WHERE table_id = $1 AND status = 'OPEN' LIMIT 1`, [tableId]);
       if (openOrder.rows[0] || table.rows[0].status === "OCCUPIED") fail("使用中的桌台不能修改，请先处理当前账单");
+      if (text(req.body?.status) === "DISABLED") {
+        const reservation = await client.query(
+          `SELECT 1 FROM banquet_reservations
+           WHERE table_id = $1 AND status = 'RESERVED' AND ends_at > now()
+           LIMIT 1`, [tableId]
+        );
+        if (reservation.rows[0]) fail("该桌台还有未结束的宴席预定，请先改桌或取消宴席", 409);
+      }
       values.push(tableId);
       const result = await client.query(
         `UPDATE restaurant_tables SET ${fields.join(", ")}, updated_at = now() WHERE id = $${values.length} RETURNING id`,
@@ -2702,20 +2811,19 @@ app.patch("/api/tables/:tableId", requireAuth, requireRole("OWNER"), async (req:
 app.get("/api/customers/search", requireAuth, async (req, res) => {
   try {
     const q = text(req.query.q);
-    if (!q) {
-      res.json({ customers: [] });
-      return;
-    }
+    const offset = req.query.offset === undefined ? 0 : requireNonNegativeInteger(req.query.offset, "查询页码格式不正确");
+    const limit = 20;
     const result = await pool.query(
       `SELECT c.id, c.phone, c.name, c.points_balance, c.created_at,
               COUNT(DISTINCT o.id) FILTER (WHERE o.status = 'SETTLED') AS order_count,
               MAX(o.settled_at) FILTER (WHERE o.status = 'SETTLED') AS last_visit
        FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
-       WHERE c.phone ILIKE $1 OR COALESCE(c.name, '') ILIKE $1
-       GROUP BY c.id ORDER BY c.updated_at DESC LIMIT 30`,
-      [`%${q}%`]
+       WHERE ($1 = '' OR c.phone ILIKE $2 OR COALESCE(c.name, '') ILIKE $2)
+       GROUP BY c.id ORDER BY c.updated_at DESC, c.id DESC LIMIT $3 OFFSET $4`,
+      [q, `%${q}%`, limit + 1, offset]
     );
-    res.json({ customers: result.rows.map((row) => ({ ...row, phone: maskPhone(row.phone) })) });
+    const customers = result.rows.slice(0, limit).map((row) => ({ ...row, phone: maskPhone(row.phone) }));
+    res.json({ customers, hasMore: result.rows.length > limit, nextOffset: offset + customers.length });
   } catch (error) {
     publicError(res, error);
   }
@@ -2784,7 +2892,8 @@ async function statsData(client: DbClient, from: string, to: string) {
     [from, to]
   );
   const sales = await client.query(
-    `SELECT oi.dish_name,
+    `SELECT oi.dish_id,
+            (ARRAY_AGG(oi.dish_name ORDER BY o.business_date DESC, oi.created_at DESC))[1] AS dish_name,
             SUM(GREATEST(0, oi.quantity - oi.returned_quantity - LEAST(oi.gifted_quantity, oi.quantity - oi.returned_quantity)))::int AS sold_quantity,
             SUM(oi.gifted_quantity)::int AS gifted_quantity,
             SUM(oi.returned_quantity)::int AS returned_quantity,
@@ -2792,7 +2901,8 @@ async function statsData(client: DbClient, from: string, to: string) {
      FROM order_items oi JOIN orders o ON o.id = oi.order_id
      JOIN settlements s ON s.order_id = o.id AND s.status = 'ACTIVE'
      WHERE o.business_date BETWEEN $1::date AND $2::date
-     GROUP BY oi.dish_name ORDER BY sold_quantity DESC, oi.dish_name`,
+     GROUP BY oi.dish_id, CASE WHEN oi.dish_id IS NULL THEN oi.dish_name END
+     ORDER BY sold_quantity DESC, dish_name`,
     [from, to]
   );
   const customers = await client.query(
@@ -2912,14 +3022,15 @@ app.get("/api/notifications/banquet-preorders", requireAuth, async (_req, res) =
       `SELECT r.id, r.starts_at, r.customer_name, r.people_count, r.status,
               COALESCE(t.name, h.name, '未指定桌台') AS table_name,
               t.number AS table_number,
-              jsonb_array_length(r.preorder) AS preorder_count
+              jsonb_array_length(r.preorder) + jsonb_array_length(r.draft_lines) AS preorder_count
        FROM banquet_reservations r
        LEFT JOIN restaurant_tables t ON t.id = r.table_id
        LEFT JOIN banquet_halls h ON h.id = r.hall_id
-       WHERE r.status IN ('RESERVED', 'CONVERTED')
-         AND r.preorder_printed_at IS NULL
-         AND jsonb_array_length(r.preorder) > 0
+       WHERE r.status = 'RESERVED'
+         AND ((r.preorder_printed_at IS NULL AND jsonb_array_length(r.preorder) > 0)
+              OR jsonb_array_length(r.draft_lines) > 0)
          AND r.starts_at <= now() + ($1::int * interval '1 minute')
+         AND r.ends_at > now()
        ORDER BY r.starts_at, r.created_at, r.id`,
       [reminderMinutes]
     );
@@ -2929,12 +3040,34 @@ app.get("/api/notifications/banquet-preorders", requireAuth, async (_req, res) =
   }
 });
 
+async function ensureNoClaimedPrinterJobs(client: DbClient, deviceIds: string[]): Promise<void> {
+  const ids = [...new Set(deviceIds.filter(Boolean))];
+  if (!ids.length) return;
+  const claimed = await client.query<{ id: string }>(
+    `SELECT id FROM print_jobs
+     WHERE status = 'CLAIMED' AND device_id = ANY($1::text[])
+     LIMIT 1 FOR UPDATE`,
+    [ids]
+  );
+  if (claimed.rows[0]) fail("打印设备正在处理任务，请等任务完成后再切换或重新授权", 409);
+}
+
 app.put("/api/settings", requireAuth, requireRole("OWNER"), async (req: AuthenticatedRequest, res) => {
   try {
     const user = currentUser(req);
     const parsed = settingsSchema.safeParse(req.body);
     if (!parsed.success || !Object.keys(parsed.data || {}).length) fail("设置内容不正确，请检查后重试");
     await withTransaction(async (client) => {
+      if (Object.prototype.hasOwnProperty.call(parsed.data, "printer_device_id")) {
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-printer-selection'))`);
+        const selected = await client.query<{ device_id: string | null }>(
+          `SELECT value #>> '{}' AS device_id FROM store_settings WHERE key = 'printer_device_id' FOR UPDATE`
+        );
+        const previousDeviceId = selected.rows[0]?.device_id || "";
+        if (previousDeviceId !== parsed.data.printer_device_id) {
+          await ensureNoClaimedPrinterJobs(client, [previousDeviceId, parsed.data.printer_device_id || ""]);
+        }
+      }
       if (parsed.data.printer_device_id) {
         const activeDevice = await client.query(
           `SELECT 1 FROM printer_devices WHERE id = $1 AND active = true`,
@@ -3107,6 +3240,11 @@ app.post("/api/print-devices/register", requireAuth, requireRole("OWNER"), async
     const printerToken = crypto.randomBytes(32).toString("hex");
     await withTransaction(async (client) => {
       await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-printer-selection'))`);
+      const affected = await client.query<{ id: string }>(
+        `SELECT id FROM printer_devices WHERE active = true OR id = $1 FOR UPDATE`,
+        [deviceId]
+      );
+      await ensureNoClaimedPrinterJobs(client, affected.rows.map((row) => row.id));
       await client.query(
         `UPDATE printer_devices SET active = false, updated_at = now() WHERE active = true AND id <> $1`,
         [deviceId]
@@ -3159,6 +3297,7 @@ app.post("/api/print-devices/:deviceId/rotate-token", requireAuth, requireRole("
         [deviceId]
       );
       if (!found.rows[0]) fail("打印设备不存在", 404);
+      await ensureNoClaimedPrinterJobs(client, [deviceId]);
       await client.query(
         `UPDATE printer_devices SET token_hash = $1, last_seen_at = NULL, updated_at = now() WHERE id = $2`,
         [printerTokenHash(printerToken), deviceId]
@@ -3185,6 +3324,10 @@ app.patch("/api/print-devices/:deviceId", requireAuth, requireRole("OWNER"), asy
         [deviceId]
       );
       if (!device.rows[0]) fail("打印设备不存在", 404);
+      const affected = req.body.active
+        ? await client.query<{ id: string }>(`SELECT id FROM printer_devices WHERE active = true AND id <> $1`, [deviceId])
+        : { rows: [] as Array<{ id: string }> };
+      await ensureNoClaimedPrinterJobs(client, [deviceId, ...affected.rows.map((row) => row.id)]);
       if (req.body.active) {
         await client.query(`UPDATE printer_devices SET active = false, updated_at = now() WHERE active = true AND id <> $1`, [deviceId]);
       }
@@ -3225,6 +3368,13 @@ app.post("/api/print-jobs/claim", requirePrinterDevice, async (req, res) => {
     const sessionDate = new Date(sessionStartedAt);
     if (!sessionStartedAt || Number.isNaN(sessionDate.getTime())) fail("打印连接时间不正确");
     const result = await withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('order-dinner-printer-selection'))`);
+      const token = text(req.header("x-printer-token"));
+      const authenticated = await client.query<{ id: string }>(
+        `SELECT id FROM printer_devices WHERE id = $1 AND token_hash = $2 AND active = true`,
+        [deviceId, printerTokenHash(token)]
+      );
+      if (!authenticated.rows[0]) fail("打印设备认证已失效，请重新配置", 401);
       const selected = await client.query<{ device_id: string | null }>(
         `SELECT value #>> '{}' AS device_id FROM store_settings WHERE key = 'printer_device_id'`
       );
@@ -3400,6 +3550,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 async function start(): Promise<void> {
   await migrateAndSeed();
   await runBanquetMigrations(pool);
+  await runAiMigrations();
   const idempotencyCleanup = setInterval(() => {
     void pruneExpiredIdempotencyKeys().catch((error) => console.error("幂等记录清理失败", error));
   }, 24 * 60 * 60 * 1000);

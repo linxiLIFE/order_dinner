@@ -17,20 +17,19 @@ echo "已生成数据库备份：$backup_file"
 trash_root="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
 trash_files="$trash_root/files"
 trash_info="$trash_root/info"
-mkdir -p "$trash_files" "$trash_info"
-chmod 700 "$trash_root" "$trash_files" "$trash_info"
+sudo install -d -m 700 "$trash_root" "$trash_files" "$trash_info"
 
 move_to_trash() {
   local source="$1"
   local trash_name
   trash_name="$(basename "$source")"
-  if [[ -e "$trash_files/$trash_name" ]]; then
+  if sudo test -e "$trash_files/$trash_name"; then
     trash_name="${trash_name}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   fi
-  mv "$source" "$trash_files/$trash_name"
-  chmod 600 "$trash_files/$trash_name"
+  sudo mv "$source" "$trash_files/$trash_name"
+  sudo chmod 600 "$trash_files/$trash_name"
   printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' \
-    "$source" "$(date +%Y-%m-%dT%H:%M:%S)" > "$trash_info/$trash_name.trashinfo"
+    "$source" "$(date +%Y-%m-%dT%H:%M:%S)" | sudo tee "$trash_info/$trash_name.trashinfo" >/dev/null
 }
 
 log_file="$backup_dir/backup.log"

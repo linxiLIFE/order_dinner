@@ -29,6 +29,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.time.Instant;
@@ -58,6 +59,7 @@ public class PrinterService extends Service {
     private static final int RECEIPT_QUANTITY_COLUMNS = 6;
     private static final int RECEIPT_UNIT_PRICE_COLUMNS = 8;
     private static final int RECEIPT_SUBTOTAL_COLUMNS = 8;
+    private static final String TRUSTED_SERVER_ORIGIN = "https://43.142.138.108:1316";
     private static final UUID SERIAL_PORT_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final Charset PRINTER_CHARSET = Charset.forName("GB18030");
     private static volatile boolean connected = false;
@@ -218,13 +220,17 @@ public class PrinterService extends Service {
     }
 
     private JSONObject post(String path, JSONObject body) throws Exception {
-        String base = preferences.getString(KEY_SERVER_URL, "").replaceAll("/+$", "");
+        String base = trustedServerBase(preferences.getString(KEY_SERVER_URL, ""));
         String deviceId = preferences.getString(KEY_DEVICE_ID, "");
         String deviceToken = preferences.getString(KEY_DEVICE_TOKEN, "");
         if (base.isEmpty() || deviceId.isEmpty() || deviceToken.isEmpty()) {
             throw new IllegalStateException("打印服务认证未配置");
         }
+        if (path == null || !path.startsWith("/api/")) {
+            throw new IllegalArgumentException("打印服务请求地址不正确");
+        }
         HttpURLConnection connection = (HttpURLConnection) new URL(base + path).openConnection();
+        connection.setInstanceFollowRedirects(false);
         connection.setConnectTimeout(10000);
         connection.setReadTimeout(15000);
         connection.setRequestMethod("POST");
@@ -247,6 +253,22 @@ public class PrinterService extends Service {
             throw new IllegalStateException("服务器返回 " + status + "：" + message);
         }
         return response.isEmpty() ? new JSONObject() : new JSONObject(response);
+    }
+
+    private static String trustedServerBase(String configured) throws Exception {
+        String value = configured == null ? "" : configured.trim().replaceAll("/+$", "");
+        if (value.isEmpty()) throw new IllegalStateException("打印服务认证未配置");
+        URI uri = new URI(value);
+        if (!"https".equalsIgnoreCase(uri.getScheme())
+                || !"43.142.138.108".equalsIgnoreCase(uri.getHost())
+                || uri.getPort() != 1316
+                || (uri.getRawPath() != null && !uri.getRawPath().isEmpty())
+                || uri.getRawQuery() != null
+                || uri.getRawFragment() != null
+                || uri.getRawUserInfo() != null) {
+            throw new IllegalArgumentException("打印服务地址必须是已授权的 HTTPS 服务器");
+        }
+        return TRUSTED_SERVER_ORIGIN;
     }
 
     private String readAll(InputStream input) throws Exception {
@@ -320,16 +342,16 @@ public class PrinterService extends Service {
                 String name = item.optString("name", "菜品");
                 if (receipt) {
                     int unitPriceFen = item.has("priceFen") ? item.optInt("priceFen", 0) : item.optInt("price_fen", 0);
-                    List<String> nameLines = wrapText(name, RECEIPT_DISH_COLUMNS);
-                    line(output, receiptRow(
-                        nameLines.isEmpty() ? "菜品" : nameLines.get(0),
-                        quantity + unit,
-                        money(unitPriceFen),
-                        money(unitPriceFen * quantity)
-                    ));
+                    List<String> nameLines = wrapText(name.isEmpty() ? "菜品" : name, RECEIPT_DISH_COLUMNS / 2);
+                    command(output, 0x1D, 0x21, 0x11);
+                    output.write(receiptCell(nameLines.get(0), RECEIPT_DISH_COLUMNS / 2, "LEFT").getBytes(PRINTER_CHARSET));
+                    command(output, 0x1D, 0x21, 0x01);
+                    line(output, receiptRow("", quantity + unit, money(unitPriceFen), money(unitPriceFen * quantity)).substring(RECEIPT_DISH_COLUMNS));
+                    command(output, 0x1D, 0x21, 0x11);
                     for (int lineIndex = 1; lineIndex < nameLines.size(); lineIndex += 1) {
-                        line(output, receiptCell(nameLines.get(lineIndex), RECEIPT_DISH_COLUMNS, "LEFT"));
+                        line(output, receiptCell(nameLines.get(lineIndex), RECEIPT_DISH_COLUMNS / 2, "LEFT"));
                     }
+                    command(output, 0x1D, 0x21, 0x00);
                 } else {
                     String quantityLabel = "x" + quantity + unit;
                     String note = formatItemNote(item.optString("note", ""));
@@ -371,10 +393,22 @@ public class PrinterService extends Service {
             JSONObject printLine = printLines.optJSONObject(index);
             if (printLine == null) continue;
             command(output, 0x1B, 0x61, "CENTER".equals(printLine.optString("align", "LEFT")) ? 0x01 : 0x00);
-            String size = printLine.optString("size", "NORMAL");
-            int sizeCommand = "LARGE".equals(size) ? 0x11 : "EMPHASIS".equals(size) ? 0x01 : 0x00;
-            command(output, 0x1D, 0x21, sizeCommand);
-            line(output, printLine.optString("text", ""));
+            JSONArray segments = printLine.optJSONArray("segments");
+            if (segments != null && segments.length() > 0) {
+                for (int segmentIndex = 0; segmentIndex < segments.length(); segmentIndex += 1) {
+                    JSONObject segment = segments.optJSONObject(segmentIndex);
+                    if (segment == null) continue;
+                    String segmentSize = segment.optString("size", "NORMAL");
+                    command(output, 0x1D, 0x21, "LARGE".equals(segmentSize) ? 0x11 : "EMPHASIS".equals(segmentSize) ? 0x01 : 0x00);
+                    output.write(segment.optString("text", "").getBytes(PRINTER_CHARSET));
+                }
+                output.write('\n');
+            } else {
+                String size = printLine.optString("size", "NORMAL");
+                int sizeCommand = "LARGE".equals(size) ? 0x11 : "EMPHASIS".equals(size) ? 0x01 : 0x00;
+                command(output, 0x1D, 0x21, sizeCommand);
+                line(output, printLine.optString("text", ""));
+            }
         }
         command(output, 0x1D, 0x21, 0x00);
         command(output, 0x1B, 0x61, 0x00);

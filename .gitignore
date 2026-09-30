@@ -7,7 +7,14 @@ release/
 .env.*
 !.env.example
 android/
-ios/
+ios/App/build/
+ios/DerivedData/
+ios/**/xcuserdata/
+ios/App/App/public/
+ios/App/App/capacitor.config.json
+ios/App/App/config.xml
+ios/capacitor-cordova-ios-plugins/
+ios/App/CapApp-SPM/.build/
 *.log
 .DS_Store
 
@@ -16,3 +23,6 @@ ios/
 doc/LIVE_*.md
 data/
 backups/
+
+# API credentials
+[Aa][Pp][Ii][Kk][Ee][Yy].md

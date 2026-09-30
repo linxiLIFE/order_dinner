@@ -1,3 +1,5 @@
+import { apiUrl, isIos, IosFiles } from "./platform.js";
+
 export type User = { id: string; username: string; name: string; role: "OWNER" | "CASHIER" };
 
 export class ApiError extends Error {
@@ -29,7 +31,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   if (authToken) headers.set("Authorization", `Bearer ${authToken}`);
-  const response = await fetch(path, { ...init, headers });
+  const response = await fetch(apiUrl(path), { ...init, headers });
   const body = await response.json().catch(() => ({}));
   if (response.status === 401) {
     setToken("");
@@ -55,6 +57,14 @@ function requestStorageKey(scope: string): string {
   return `order-dinner-pending-request:${encodeURIComponent(currentEmployeeId())}:${encodeURIComponent(scope)}`;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
 export function getPendingIdempotentRequest(scope: string): PendingIdempotentRequest | null {
   const serialized = localStorage.getItem(requestStorageKey(scope));
   if (!serialized) return null;
@@ -69,7 +79,12 @@ export function getPendingIdempotentRequest(scope: string): PendingIdempotentReq
 
 export function prepareIdempotentRequest(scope: string, payload: Record<string, unknown>): PendingIdempotentRequest {
   const previous = getPendingIdempotentRequest(scope);
-  if (previous) return previous;
+  if (previous) {
+    if (canonicalJson(previous.payload) !== canonicalJson(payload)) {
+      throw new ApiError("上一笔操作结果尚未确认，当前内容与上次不同；请先核对业务状态后再继续", 409);
+    }
+    return previous;
+  }
   const request = { idempotencyKey: crypto.randomUUID(), payload };
   try {
     localStorage.setItem(requestStorageKey(scope), JSON.stringify(request));
@@ -132,7 +147,7 @@ export function formatTime(value: string | null | undefined): string {
 export async function downloadFile(path: string, fallbackName: string): Promise<void> {
   const headers = new Headers();
   if (authToken) headers.set("Authorization", `Bearer ${authToken}`);
-  const response = await fetch(path, { headers });
+  const response = await fetch(apiUrl(path), { headers });
   if (response.status === 401) {
     setToken("");
     window.dispatchEvent(new Event("点单台登录失效"));
@@ -144,7 +159,18 @@ export async function downloadFile(path: string, fallbackName: string): Promise<
   const filenameStar = response.headers.get("Content-Disposition")?.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
   const filenameQuoted = response.headers.get("Content-Disposition")?.match(/filename="?([^";]+)"?/i)?.[1];
   const filename = filenameStar ? decodeURIComponent(filenameStar) : filenameQuoted || fallbackName;
-  const url = URL.createObjectURL(await response.blob());
+  const blob = await response.blob();
+  if (isIos) {
+    const base64 = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(",")[1]);
+      reader.onerror = () => reject(new Error("读取报表失败，请重试"));
+      reader.readAsDataURL(blob);
+    });
+    await IosFiles.shareFile({ filename, base64 });
+    return;
+  }
+  const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = filename;

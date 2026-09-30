@@ -112,6 +112,7 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
     cwd: projectRoot,
     env: {
       ...process.env,
+      DEEPSEEK_API_KEY: "",
       DATABASE_URL: appUrl.toString(),
       JWT_SECRET: jwtSecret,
       BOOTSTRAP_ADMIN_USERNAME: ownerUsername,
@@ -143,6 +144,89 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   const login = await request("/api/auth/login", { body: { username: ownerUsername, password: ownerPassword } });
   assert.equal(login.status, 200, JSON.stringify(login.body));
   const ownerToken = login.body.token;
+
+  const aiCreate = await request("/api/business-ai/chats", {token: ownerToken, body:{from:"2026-01-01",to:"2026-01-07"}});
+  assert.equal(aiCreate.status,200,JSON.stringify(aiCreate.body));
+  const aiDetail = await request(`/api/business-ai/chats/${aiCreate.body.id}`,{token:ownerToken});
+  assert.equal(aiDetail.status,200);
+  assert.equal(aiDetail.body.chat.context.previous.range.to,"2025-12-31");
+  const aiMemory = await request("/api/business-ai/memory/profile",{token:ownerToken,method:"PUT",body:{text:"测试商圈，周末营业"}});
+  assert.equal(aiMemory.status,200);
+  const savedMemory = await request("/api/business-ai/memory",{token:ownerToken});
+  assert.ok(savedMemory.body.memories.some(m=>m.key==="profile" && m.content==="测试商圈，周末营业"));
+  assert.equal((await request("/api/business-ai/chats",{token:ownerToken,body:{from:"2026-02-30",to:"2026-03-01"}})).status,400);
+  assert.equal((await request("/api/business-ai/chats",{token:ownerToken,body:{from:"2026-03-02",to:"2026-03-01"}})).status,400);
+  assert.equal((await request("/api/business-ai/chats")).status,401);
+  assert.equal((await request(`/api/business-ai/chats/${aiCreate.body.id}/messages`,{token:ownerToken,body:{requestId:randomUUID(),text:"测试",images:[]}})).status,503);
+
+  // Exercise the real router and PostgreSQL persistence with a deterministic streaming provider.
+  process.env.DATABASE_URL=appUrl.toString();
+  process.env.JWT_SECRET=jwtSecret;
+  process.env.DEEPSEEK_API_KEY="test-only-not-a-real-key";
+  const [{default:express},{businessAiRouter,runAiMigrations},aiDb]=await Promise.all([import("express"),import("../server/dist/business-ai.js"),import("../server/dist/db.js")]);
+  migrationPool=aiDb.pool;
+  let providerBody, providerMode="complete";
+  const fakeProvider=async (_url,init)=>{
+    providerBody=JSON.parse(init.body);
+    const chunks=[{choices:[{delta:{reasoning_content:"思考"}}]},{choices:[{delta:{content:"## 经营分析\n\n营业额 ¥10"}}]},{choices:[{delta:{content:"0，优先改善复购。"}}]},{choices:[{delta:{},finish_reason:"stop"}],usage:{total_tokens:42}}];
+    const encoded=new TextEncoder().encode(chunks.map(c=>`data: ${JSON.stringify(c)}\n\n`).join("")+(providerMode==="complete"?"data: [DONE]\n\n":""));
+    let i=0;
+    return new Response(new ReadableStream({pull(c){if(i>=encoded.length)return c.close();c.enqueue(encoded.slice(i,i+7));i+=7;}}),{status:200});
+  };
+  const mockApp=express();mockApp.use("/api/business-ai",businessAiRouter(async (_client,from,to)=>({range:{from,to},summary:{revenueFen:10000}}),fakeProvider));
+  const mockServer=mockApp.listen(0,"127.0.0.1");
+  await new Promise(resolve=>mockServer.once("listening",resolve));
+  const mockBase=`http://127.0.0.1:${mockServer.address().port}/api/business-ai`;
+  async function mockRequest(url,body,method){const r=await fetch(mockBase+url,{method:method || (body?"POST":"GET"),headers:{Authorization:`Bearer ${ownerToken}`,"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});return r;}
+  try{
+    const created=await (await mockRequest("/chats",{from:"2026-01-01",to:"2026-01-07"})).json();
+    const requestId=randomUUID();
+    const image="data:image/png;base64,iVBORw0KGgo=";
+    const streamResponse=await mockRequest(`/chats/${created.id}/messages`,{requestId,text:"分析图片",images:[image]});
+    assert.equal(streamResponse.status,200);
+    const streamText=await streamResponse.text();
+    assert.match(streamText,/event: thinking/);assert.match(streamText,/event: delta/);assert.match(streamText,/event: done/);
+    assert.equal(providerBody.model,"deepseek-flash");assert.equal(providerBody.reasoning_effort,"medium");assert.equal(providerBody.max_tokens,393216);
+    assert.equal(providerBody.messages.at(-1).content[1].image_url.url,image);
+    const detail=await (await mockRequest(`/chats/${created.id}`)).json();
+    assert.deepEqual(detail.messages.map(m=>m.role),['user','assistant']);
+    assert.deepEqual(detail.messages.map(m=>Number(m.position)),[1,2]);
+    const automaticMemory=await (await mockRequest('/memory')).json();
+    assert.ok(automaticMemory.memories.some(m=>m.key===`automatic:${created.id}` && m.content.content.includes('¥100')));
+    assert.equal(detail.messages.length,2);assert.equal(detail.messages[1].status,"complete");assert.equal(detail.messages[1].content,"## 经营分析\n\n营业额 ¥100，优先改善复购。");
+    assert.equal(detail.messages[1].usage.total_tokens,42);
+    assert.equal((await mockRequest(`/chats/${created.id}/messages`,{requestId,text:"分析图片",images:[image]})).status,409);
+    assert.equal((await mockRequest("/memory/insight",{messageId:detail.messages[1].id})).status,200);
+    const second=await mockRequest(`/chats/${created.id}/messages`,{requestId:randomUUID(),text:"第三条是第二轮问题",images:[]});
+    assert.match(await second.text(),/event: done/);
+    await appPool.query(`UPDATE business_ai_messages SET created_at='2026-01-01T00:00:00Z' WHERE chat_id=$1`,[created.id]);
+    const multi=await (await mockRequest(`/chats/${created.id}`)).json();
+    assert.deepEqual(multi.messages.map(m=>m.role),['user','assistant','user','assistant']);
+    assert.deepEqual(multi.messages.map(m=>Number(m.position)),[1,2,3,4]);
+    assert.equal(providerBody.messages[2].role,'user');assert.equal(providerBody.messages[3].role,'assistant');
+
+    providerMode="interrupted";
+    const interrupted=await mockRequest(`/chats/${created.id}/messages`,{requestId:randomUUID(),text:"继续",images:[]});
+    assert.match(await interrupted.text(),/event: error/);
+    const saved=await (await mockRequest(`/chats/${created.id}`)).json();
+    assert.equal(saved.messages.at(-1).status,"interrupted");assert.ok(saved.messages.at(-1).content.includes("¥100"));assert.equal(saved.chat.running_until,null);
+    assert.deepEqual(saved.messages.map(m=>m.role),['user','assistant','user','assistant','user','assistant']);
+    assert.equal((await mockRequest(`/chats/${created.id}`,undefined,'DELETE')).status,200);
+    assert.equal((await mockRequest(`/chats/${created.id}`)).status,404);
+    assert.ok(!(await (await mockRequest('/chats')).json()).chats.some(c=>c.id===created.id));
+    assert.ok((await (await mockRequest('/chats?trash=true')).json()).chats.some(c=>c.id===created.id));
+    assert.ok(!(await (await mockRequest('/memory')).json()).memories.some(m=>m.key===`automatic:${created.id}`));
+    assert.equal((await mockRequest(`/chats/${created.id}/restore`,{})).status,200);
+    const restored=await (await mockRequest(`/chats/${created.id}`)).json();
+    assert.deepEqual(restored.messages.map(m=>m.id),saved.messages.map(m=>m.id));
+    assert.ok((await (await mockRequest('/memory')).json()).memories.some(m=>m.key===`automatic:${created.id}`));
+    const legacy=await (await mockRequest('/chats',{from:'2026-01-01',to:'2026-01-07'})).json();
+    await appPool.query(`INSERT INTO business_ai_messages(id,chat_id,role,content,status,created_at) VALUES('ffffffff-ffff-4fff-8fff-ffffffffffff',$1,'user','旧提问','complete','2026-01-01'),('00000000-0000-4000-8000-000000000001',$1,'assistant','旧回答','complete','2026-01-01')`,[legacy.id]);
+    await runAiMigrations();
+    const fixed=await (await mockRequest(`/chats/${legacy.id}`)).json();
+    assert.deepEqual(fixed.messages.map(m=>m.role),['user','assistant']);
+
+  } finally {await new Promise(resolve=>mockServer.close(resolve));process.env.DEEPSEEK_API_KEY="";}
 
   const ticketResult = await request("/api/auth/event-ticket", { token: ownerToken, body: {} });
   assert.equal(ticketResult.status, 200, JSON.stringify(ticketResult.body));
@@ -391,10 +475,94 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   const cashierMenu = await request("/api/dishes", { token: cashierLogin.body.token });
   assert.equal(cashierMenu.status, 200);
   assert.equal(Object.hasOwn(cashierMenu.body.dishes[0], "cost_fen"), false);
+  const draftTable = await request("/api/tables", {
+    token: ownerToken,
+    body: { number: tableNumber + 1, name: "多人草稿测试桌", seats: 4 }
+  });
+  assert.equal(draftTable.status, 201, JSON.stringify(draftTable.body));
+  const draftOrder = await request(`/api/tables/${draftTable.body.tableId}/open`, {
+    token: ownerToken, body: { people: 2, idempotencyKey: randomUUID() }
+  });
+  assert.equal(draftOrder.status, 201, JSON.stringify(draftOrder.body));
+  const draftOrderId = draftOrder.body.order.id;
+  const ownerDish = menu.body.dishes.find((item) => item.id === seededDish.id);
+  const cashierDish = cashierMenu.body.dishes.find((item) => item.id === seededDish.id);
+  const ownerDraftKey = randomUUID();
+  const draftLine = (dish) => ({ dishId: dish.id, quantity: 1, note: "", options: [], dish });
+  const draftAdds = await Promise.all([
+    request(`/api/orders/${draftOrderId}/draft`, { token: ownerToken,
+      body: { op: "adjust", delta: 1, line: draftLine(ownerDish), idempotencyKey: ownerDraftKey } }),
+    request(`/api/orders/${draftOrderId}/draft`, { token: cashierLogin.body.token,
+      body: { op: "adjust", delta: 1, line: draftLine(cashierDish), idempotencyKey: randomUUID() } })
+  ]);
+  assert.deepEqual(draftAdds.map((item) => item.status), [200, 200], JSON.stringify(draftAdds));
+  const repeatedDraftAdd = await request(`/api/orders/${draftOrderId}/draft`, { token: ownerToken,
+    body: { op: "adjust", delta: 1, line: draftLine(ownerDish), idempotencyKey: ownerDraftKey } });
+  assert.equal(repeatedDraftAdd.status, 200);
+  const sharedDraft = await request(`/api/orders/${draftOrderId}`, { token: cashierLogin.body.token });
+  assert.equal(sharedDraft.body.order.draftLines[0].quantity, 2);
+  assert.equal(sharedDraft.body.order.items.length, 0);
+  assert.equal(sharedDraft.body.order.draftLines[0].dish.cost_fen, null);
+  const draftDb = await appPool.query(`SELECT jsonb_array_length(draft_lines)::int AS drafts FROM orders WHERE id = $1`, [draftOrderId]);
+  assert.equal(draftDb.rows[0].drafts, 1);
+  const submitDraftKey = randomUUID();
+  const savedWithoutPrint = await request(`/api/orders/${draftOrderId}/items`, { token: ownerToken,
+    body: { useDraft: true, copies: 0, idempotencyKey: submitDraftKey } });
+  assert.equal(savedWithoutPrint.status, 201, JSON.stringify(savedWithoutPrint.body));
+  assert.equal(savedWithoutPrint.body.order.items[0].quantity, 2);
+  const repeatedDraftSubmit = await request(`/api/orders/${draftOrderId}/items`, { token: ownerToken,
+    body: { useDraft: true, copies: 0, idempotencyKey: submitDraftKey } });
+  assert.equal(repeatedDraftSubmit.status, 201);
+  const savedDraftCounts = await appPool.query(
+    `SELECT (SELECT COUNT(*)::int FROM print_jobs WHERE order_id = $1) AS prints,
+            (SELECT COUNT(*)::int FROM order_items WHERE order_id = $1) AS items,
+            (SELECT jsonb_array_length(draft_lines)::int FROM orders WHERE id = $1) AS drafts`, [draftOrderId]
+  );
+  assert.deepEqual(savedDraftCounts.rows[0], { prints: 0, items: 1, drafts: 0 });
+  const banquetTable = await request("/api/tables", {
+    token: ownerToken, body: { number: tableNumber + 2, name: "预点菜草稿测试桌", seats: 6 }
+  });
+  assert.equal(banquetTable.status, 201, JSON.stringify(banquetTable.body));
+  const startsAt = new Date(Date.now() + 86_400_000).toISOString();
+  const endsAt = new Date(Date.now() + 93_600_000).toISOString();
+  const reservationCreated = await request("/api/banquets/reservations", { token: ownerToken,
+    body: { tableId: banquetTable.body.tableId, startsAt, endsAt, peopleCount: 6,
+      customerName: "预点草稿测试", idempotencyKey: randomUUID() } });
+  assert.equal(reservationCreated.status, 201, JSON.stringify(reservationCreated.body));
+  const reservationId = reservationCreated.body.reservation.id;
+  const preorderDraftAdds = await Promise.all([
+    request(`/api/banquets/reservations/${reservationId}/draft`, { token: ownerToken,
+      body: { op: "adjust", delta: 1, line: draftLine(ownerDish), idempotencyKey: randomUUID() } }),
+    request(`/api/banquets/reservations/${reservationId}/draft`, { token: cashierLogin.body.token,
+      body: { op: "adjust", delta: 1, line: draftLine(cashierDish), idempotencyKey: randomUUID() } })
+  ]);
+  assert.deepEqual(preorderDraftAdds.map((item) => item.status), [200, 200], JSON.stringify(preorderDraftAdds));
+  const sharedPreorder = await request(`/api/banquets/reservations/${reservationId}`, { token: cashierLogin.body.token });
+  assert.equal(sharedPreorder.body.reservation.draft_lines[0].quantity, 2);
+  assert.equal(sharedPreorder.body.reservation.preorder.length, 0);
+  const printZero = await request(`/api/banquets/reservations/${reservationId}/preorder/print`, { token: ownerToken,
+    body: { copies: 0, idempotencyKey: randomUUID() } });
+  assert.equal(printZero.status, 201, JSON.stringify(printZero.body));
+  const confirmedPreorder = await request(`/api/banquets/reservations/${reservationId}`, { token: ownerToken });
+  assert.equal(confirmedPreorder.body.reservation.preorder[0].quantity, 2);
+  assert.equal(confirmedPreorder.body.reservation.draft_lines.length, 0);
+  const preorderPrintCount = await appPool.query(`SELECT COUNT(*)::int AS count FROM print_jobs WHERE payload->>'reservationId' = $1`, [reservationId]);
+  assert.equal(preorderPrintCount.rows[0].count, 0);
+  const laterDraft = await request(`/api/banquets/reservations/${reservationId}/draft`, { token: ownerToken,
+    body: { op: "adjust", delta: 1, line: draftLine(ownerDish), idempotencyKey: randomUUID() } });
+  assert.equal(laterDraft.status, 200);
+  const converted = await request(`/api/banquets/reservations/${reservationId}/convert`, { token: ownerToken,
+    body: { idempotencyKey: randomUUID() } });
+  assert.equal(converted.status, 201, JSON.stringify(converted.body));
+  const convertedOrder = await request(`/api/orders/${converted.body.orderId}`, { token: ownerToken });
+  assert.equal(convertedOrder.body.order.items[0].quantity, 2);
+  assert.equal(convertedOrder.body.order.draftLines[0].quantity, 1);
   const cashierOrder = await request(`/api/orders/${currentOrderId}`, { token: cashierLogin.body.token });
   assert.equal(cashierOrder.status, 200);
   assert.equal(Object.hasOwn(cashierOrder.body.order, "grossProfitFen"), false);
   assert.equal(Object.hasOwn(cashierOrder.body.order.totals, "costFen"), false);
+
+  assert.equal((await request("/api/business-ai/chats", {token:cashierLogin.body.token})).status,403);
 
   const changedCashierPassword = `${cashierPassword}new`;
   const badPasswordChange = await request("/api/auth/change-password", {

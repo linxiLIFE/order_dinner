@@ -232,7 +232,12 @@ function createWindow() {
   });
 
   window.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    try {
+      const parsed = new URL(url);
+      if (["https:", "http:", "mailto:"].includes(parsed.protocol)) shell.openExternal(url);
+    } catch {
+      // Ignore malformed URLs and unsupported schemes.
+    }
     return { action: "deny" };
   });
   window.webContents.on("will-navigate", (event, url) => {

@@ -308,6 +308,8 @@ export async function migrateAndSeed(): Promise<void> {
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_note text NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS table_number_snapshot integer`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS table_name_snapshot text`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS draft_lines jsonb NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS draft_revision integer NOT NULL DEFAULT 0`);
   await pool.query(
     `UPDATE orders o SET table_number_snapshot = t.number, table_name_snapshot = t.name
      FROM restaurant_tables t WHERE t.id = o.table_id
