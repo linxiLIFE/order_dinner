@@ -1,3 +1,4 @@
+import { apiUrl } from "./platform.js";
 import { useEffect, useRef, useState } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -38,7 +39,7 @@ export function BusinessAiPage({initialRange,onBack}:{initialRange:{from:string;
     try{
       if(newChat||!chatId){const created=await api<{id:string}>('/api/business-ai/chats',{method:'POST',body:JSON.stringify({from,to}),signal:abort.signal});chatId=created.id;const detail=await api<{chat:Chat;messages:Message[]}>(`/api/business-ai/chats/${chatId}`);setActive(detail.chat);setMessages([]);activeId.current=chatId;}
       const pending=prepareIdempotentRequest(`business-ai:${chatId}`,{text:value,images:attached});
-      const response=await fetch(`/api/business-ai/chats/${chatId}/messages`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${getToken()}`},body:JSON.stringify({requestId:pending.idempotencyKey,...pending.payload}),signal:abort.signal});
+      const response=await fetch(apiUrl(`/api/business-ai/chats/${chatId}/messages`),{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${getToken()}`},body:JSON.stringify({requestId:pending.idempotencyKey,...pending.payload}),signal:abort.signal});
       if(!response.ok){const body=await response.json();if(response.status>=400&&response.status<500&&response.status!==401&&response.status!==429)clearIdempotentRequest(`business-ai:${chatId}`);if(response.status===401)window.dispatchEvent(new Event('点单台登录失效'));throw new Error(body.error||'分析请求失败');}
       if(!response.body)throw new Error('浏览器未提供流式响应');
       setText('');setImages([]);setStatus('正在思考');

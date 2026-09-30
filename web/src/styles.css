@@ -15,6 +15,24 @@
 
 * { box-sizing: border-box; writing-mode: horizontal-tb; text-orientation: mixed; }
 body { margin: 0; min-width: 320px; background: #f7f8fa; }
+@font-face { font-family: "OrderDinnerChinese"; src: url("/ios-fonts/NotoSansCJKsc-Regular.otf") format("opentype"); font-weight: 400; font-style: normal; font-display: swap; }
+.ios-app { -webkit-text-size-adjust: 100%; font-family: "OrderDinnerChinese", -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
+.ios-app, .ios-app body, .ios-app #root { height: 100%; overflow: hidden; overscroll-behavior: none; }
+/* Keep the header in normal flow; only the content below it may scroll. */
+.ios-app .app-shell { height: var(--app-height, 100dvh); min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+.ios-app .topbar { position: relative; top: auto; flex: 0 0 auto; }
+.ios-app .app-shell > main { flex: 1 1 auto; min-height: 0; width: 100%; overflow-x: hidden; overflow-y: auto; overscroll-behavior: none; -webkit-overflow-scrolling: touch; }
+.ios-app .app-shell-ordering > main { overflow: hidden; }
+.ios-app .web-fixed-order-page .catalog-panel { overflow-x: hidden; overscroll-behavior: none; }
+.ios-app .web-fixed-order-page .current-order-scroll { overscroll-behavior: none; }
+.ios-app .search-row { min-width: 0; }
+.ios-app .search-row > input { min-width: 0; flex: 1 1 0; }
+.ios-app .category-row { min-width: 0; max-width: 100%; overscroll-behavior-x: contain; }
+.ios-app .category-chip { flex: 0 0 auto; }
+.ios-app .dish-card { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.ios-app .login-shell { height: var(--app-height, 100dvh); min-height: 0; overflow-y: auto; padding: max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); }
+.ios-app .modal-backdrop { padding: max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); }
+.ios-app .modal { max-height: calc(var(--app-height, 100dvh) - max(20px, env(safe-area-inset-top)) - max(20px, env(safe-area-inset-bottom))); }
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; white-space: nowrap; word-break: keep-all; }
 button:disabled { cursor: not-allowed; opacity: .55; }
@@ -109,10 +127,14 @@ main { max-width: 1600px; margin: 0 auto; }
 .current-order { position: sticky; top: 84px; overflow: hidden; }
 .search-row { display: flex; gap: 8px; margin-bottom: 17px; }
 .search-row.large { max-width: 620px; }
-input, select, textarea { width: 100%; min-height: 40px; border: 1px solid #cfd6dc; border-radius: 6px; background: #fff; padding: 8px 11px; color: #222; outline: none; }
+input, select, textarea { width: 100%; min-width: 0; max-width: 100%; min-height: 40px; border: 1px solid #cfd6dc; border-radius: 6px; background: #fff; padding: 8px 11px; color: #222; outline: none; }
+/* Safari date controls otherwise keep an intrinsic width larger than their grid column. */
+input[type="date"], input[type="datetime-local"], input[type="time"] { display: block; -webkit-appearance: none; appearance: none; overflow: hidden; }
+input::-webkit-date-and-time-value { min-width: 0; text-align: left; }
+input::-webkit-datetime-edit { min-width: 0; padding: 0; }
 textarea { resize: vertical; min-height: 92px; }
 input:focus, select:focus, textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(23,105,170,.11); }
-label { display: flex; flex-direction: column; gap: 6px; font-size: 0.875rem; color: #4f5962; }
+label { display: flex; min-width: 0; flex-direction: column; gap: 6px; font-size: 0.875rem; color: #4f5962; }
 label small { color: var(--muted); font-size: 0.75rem; }
 .category-row { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 11px; margin-bottom: 11px; -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
 .category-chip { border: 1px solid #d7dde2; background: #fff; color: #59636c; border-radius: 18px; padding: 7px 14px; white-space: nowrap; }
@@ -188,7 +210,7 @@ td { color: #303941; }
 .settings-layout { max-width: 1050px; }
 .font-size-setting { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 14px; align-items: center; margin-bottom: 12px; }
 .font-size-setting output { min-width: 54px; color: var(--primary-dark); font-weight: 700; text-align: center; }
-input[type="range"].font-size-range { width: 100%; min-height: 0; padding: 0; border: 0; accent-color: var(--primary); }
+input[type="range"].font-size-range { width: 100%; min-height: 0; margin: 0; padding: 0; border: 0; accent-color: var(--primary); }
 .settings-layout > .primary { margin-top: 4px; }
 .toggle-row { flex-direction: row; align-items: center; margin-bottom: 18px; }
 .toggle-row input { width: 18px; min-height: 18px; }

@@ -17,7 +17,9 @@
     "package:win": "npm run build:web && electron-builder --win nsis --x64",
     "package:android": "bash scripts/package-android.sh",
     "publish:updates": "node scripts/publish-updates.mjs",
-    "package:all": "npm run package:win && npm run package:android"
+    "package:all": "npm run package:win && npm run package:android",
+    "package:ios": "bash scripts/package-ios.sh",
+    "open:ios": "open ios/App/App.xcodeproj"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -36,6 +38,7 @@
     "@capacitor/android": "^7.2.0",
     "@capacitor/cli": "^7.2.0",
     "@capacitor/core": "^7.2.0",
+    "@capacitor/ios": "^7.6.9",
     "@electron/packager": "^18.3.0",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",

@@ -1,3 +1,4 @@
+import { apiUrl, isIos, usesWebOrderingLayout } from "./platform.js";
 import { lazy, Suspense } from "react";
 const BusinessAiPage = lazy(() => import("./BusinessAiPage.js").then(module => ({default: module.BusinessAiPage})));
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
@@ -1174,9 +1175,9 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack, onReopene
   const activeSettlement = order.settlements.find((settlement) => settlement.status === "ACTIVE");
   const previewTotalFen = open ? displayRevenue : activeSettlement?.received_fen ?? order.totals.subtotalFen;
   const previewTotalLabel = open ? "当前应收" : activeSettlement ? "实收" : "账单金额";
-  return <section className={`page-section order-page${Capacitor.isNativePlatform() ? "" : " web-fixed-order-page"}${previewOpen ? " preview-open" : ""}`}>
+  return <section className={`page-section order-page${usesWebOrderingLayout ? " web-fixed-order-page" : ""}${previewOpen ? " preview-open" : ""}`}>
     <div className="section-heading order-heading"><div><button className="back-button" onClick={goBack}>‹ 桌台</button><h2>{order.tableName || (order.tableNumber ? `${order.tableNumber}号桌` : "账单")} <span className={`status-pill ${open ? "green" : "gray"}`}>{statusText(order.status)}</span></h2><p className="muted">{order.customer.name} · {order.peopleCount} 人 · 开台 {formatTime(order.openedAt)}{order.customer.phone ? ` · ${order.customer.phone}` : " · 未填写手机号"}</p>{order.orderNote && <p className="order-note"><span>本单备注：</span>{order.orderNote}</p>}</div><div className="heading-actions"><button className="secondary preview-full-order-button" onClick={() => setPreviewOpen(true)}>预览全单</button>{open && <button className="secondary" onClick={() => setOrderNoteOpen(true)} disabled={busy}>本单备注</button>}{open && order.tableId && <button className="secondary" onClick={() => setTransferOpen(true)} disabled={busy || Boolean(pendingSubmission)}>换桌台</button>}{order.status === "SETTLED" && user.role === "OWNER" && <button className="secondary" onClick={() => setConfirmAction("reopen")} disabled={busy}>撤销重结</button>}{open && <><button className="secondary danger-outline" onClick={() => setConfirmAction("end")} disabled={busy}>直接结束</button><button className="primary" onClick={() => setCheckoutOpen(true)} disabled={busy || !order.items.length || Boolean(pendingSubmission) || Object.keys(cart).length > 0}>结账 {money(order.totals.subtotalFen)}</button></>}</div></div>
-    <div className={`order-layout${orderPreviewSide === "left" && !Capacitor.isNativePlatform() ? " preview-left" : ""}`}>
+    <div className={`order-layout${orderPreviewSide === "left" && usesWebOrderingLayout ? " preview-left" : ""}`}>
       <div className="catalog-panel">
         <div className="search-row"><input placeholder="搜索菜名、拼音或首字母" value={search} onChange={(event) => setSearch(event.target.value)} /><button className="secondary" onClick={() => setSearch("")}>清空</button></div>
         <div className="category-row" role="group" aria-label="按分类浏览菜品"><button aria-pressed={!categoryId} className={!categoryId ? "category-chip selected" : "category-chip"} onClick={() => setCategoryId("")}>全部</button>{categories.map((category) => <button aria-pressed={categoryId === category.id} className={categoryId === category.id ? "category-chip selected" : "category-chip"} key={category.id} onClick={() => setCategoryId(category.id)}>{category.name}</button>)}</div>
@@ -1194,7 +1195,7 @@ function OrderPage({ orderId, user, refreshTables, setMessage, goBack, onReopene
         <div className="current-order-footer"><div className="order-total"><span>当前应收</span><strong>{money(displayRevenue)}</strong><small>原价 {money(order.totals.grossFen + cartTotal)} · 赠送 {money(order.totals.giftFen)} · 退菜 {money(order.totals.returnFen)}</small>{user.role === "OWNER" && <div className="order-margin">本单毛利率 <strong>{displayMargin}%</strong></div>}</div>{open && (Object.keys(cart).length > 0 || pendingSubmission || order.banquetPreorderPendingPrint) && <button className="primary wide current-order-action" onClick={requestItemsSubmit} disabled={busy}>{pendingSubmission ? "重试上次提交" : order.banquetPreorderPendingPrint && !Object.keys(cart).length ? "打印备菜单" : "提交并打印"}</button>}</div>
       </aside>
     </div>
-    {Capacitor.isNativePlatform() && <div className="mobile-order-quickbar"><div className="mobile-order-total"><small>当前应收</small><strong>{money(displayRevenue)}</strong></div><div className="mobile-order-actions">{open && (Object.keys(cart).length > 0 || pendingSubmission || order.banquetPreorderPendingPrint) && <button type="button" className="primary" onClick={requestItemsSubmit} disabled={busy || Boolean(pendingSubmission) && !open}>{pendingSubmission ? "重试提交" : order.banquetPreorderPendingPrint && !Object.keys(cart).length ? "打印备菜单" : "提交点菜"}</button>}{open && order.items.length > 0 && <button type="button" className="secondary" onClick={() => setCheckoutOpen(true)} disabled={busy || Boolean(pendingSubmission) || Object.keys(cart).length > 0}>结账</button>}</div></div>}
+    {!usesWebOrderingLayout && <div className="mobile-order-quickbar"><div className="mobile-order-total"><small>当前应收</small><strong>{money(displayRevenue)}</strong></div><div className="mobile-order-actions">{open && (Object.keys(cart).length > 0 || pendingSubmission || order.banquetPreorderPendingPrint) && <button type="button" className="primary" onClick={requestItemsSubmit} disabled={busy || Boolean(pendingSubmission) && !open}>{pendingSubmission ? "重试提交" : order.banquetPreorderPendingPrint && !Object.keys(cart).length ? "打印备菜单" : "提交点菜"}</button>}{open && order.items.length > 0 && <button type="button" className="secondary" onClick={() => setCheckoutOpen(true)} disabled={busy || Boolean(pendingSubmission) || Object.keys(cart).length > 0}>结账</button>}</div></div>}
     {previewOpen && <OrderPreviewDialog order={order} cartLines={Object.values(cart)} totalFen={previewTotalFen} totalLabel={previewTotalLabel} onClose={() => setPreviewOpen(false)} />}
     {checkoutOpen && <CheckoutPanel order={order} role={user.role} onClose={() => setCheckoutOpen(false)} onDone={async (nextOrder, message) => { setCurrentOrder(nextOrder); setCheckoutOpen(false); setMessage(message); try { await refreshTables(); } catch { setMessage(`${message}；桌台列表刷新失败，请稍后刷新`); } }} />}
     {optionTarget && <DishOptionsDialog dish={optionTarget} onClose={() => setOptionTarget(null)} onSubmit={(selections, note) => { addConfiguredDish(optionTarget, selections, note); setOptionTarget(null); }} />}
@@ -1547,10 +1548,10 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
   const hasSaveChanges = Boolean(Object.keys(cart).length || hasPreorderChanges || pendingSubmission);
   const submitDisabled = !canEdit || busy || !hasSaveChanges || (cartNeedsReview && !pendingSubmission) || (preorderConflict && !pendingSubmission);
   const submitLabel = pendingSubmission ? "重试确认" : reservation.preorder.length ? "保存修改" : "确认预点菜";
-  return <section className={`page-section order-page${Capacitor.isNativePlatform() ? "" : " web-fixed-order-page"}`}>
+  return <section className={`page-section order-page${usesWebOrderingLayout ? " web-fixed-order-page" : ""}`}>
     <div className="section-heading order-heading"><div><button className="back-button" onClick={goBack}>‹ 宴席预定</button><h2>{reservation.table_name || (reservation.table_number ? `${reservation.table_number}号桌` : "宴席")} · 预点菜</h2><p className="muted">{reservation.customer_name || "未填写姓名"} · {reservation.people_count} 人 · {formatTime(reservation.starts_at)}</p></div></div>
     {!canEdit && <div className="message error">这笔宴席已经开台或取消，不能继续预点菜。</div>}
-    <div className={`order-layout${orderPreviewSide === "left" && !Capacitor.isNativePlatform() ? " preview-left" : ""}`}>
+    <div className={`order-layout${orderPreviewSide === "left" && usesWebOrderingLayout ? " preview-left" : ""}`}>
       <div className="catalog-panel">
         <div className="search-row"><input placeholder="搜索菜名、拼音或首字母" value={search} onChange={(event) => setSearch(event.target.value)} /><button className="secondary" onClick={() => setSearch("")}>清空</button></div>
         <div className="category-row"><button className={!categoryId ? "category-chip selected" : "category-chip"} onClick={() => setCategoryId("")}>全部</button>{categories.map((category) => <button className={categoryId === category.id ? "category-chip selected" : "category-chip"} key={category.id} onClick={() => setCategoryId(category.id)}>{category.name}</button>)}</div>
@@ -1578,7 +1579,7 @@ function BanquetPreorderPage({ reservationId, setMessage, goBack, orderPreviewSi
         <div className="current-order-footer"><div className="order-total"><span>预点合计</span><strong>{money(savedTotal + cartTotal)}</strong></div><div className="preorder-save"><button className="primary wide current-order-action" onClick={() => void savePreorder()} disabled={submitDisabled}>{busy ? "保存中…" : submitLabel}</button></div></div>
       </aside>
     </div>
-    {Capacitor.isNativePlatform() && <div className="mobile-order-quickbar"><div className="mobile-order-total"><small>预点合计</small><strong>{money(savedTotal + cartTotal)}</strong></div><button type="button" className="primary" onClick={() => void savePreorder()} disabled={submitDisabled}>{busy ? "保存中…" : submitLabel}</button></div>}
+    {!usesWebOrderingLayout && <div className="mobile-order-quickbar"><div className="mobile-order-total"><small>预点合计</small><strong>{money(savedTotal + cartTotal)}</strong></div><button type="button" className="primary" onClick={() => void savePreorder()} disabled={submitDisabled}>{busy ? "保存中…" : submitLabel}</button></div>}
     {optionTarget && <DishOptionsDialog dish={optionTarget} onClose={() => setOptionTarget(null)} onSubmit={(selections, note) => { addConfiguredDish(optionTarget, selections, note); setOptionTarget(null); }} />}
     {noteTarget && <NoteDialog note={noteTarget.note} title="填写自定义备注" onClose={() => setNoteTarget(null)} onSubmit={saveNote} />}
   </section>;
@@ -2208,7 +2209,7 @@ function StatsPage({ setMessage, openAi }: { setMessage: (message: string) => vo
   useEffect(() => { void load(); }, []);
   const s = data?.summary;
   return <section className="page-section">
-    <div className="section-heading"><div><h2>营业统计</h2><p className="muted">按北京时间营业日统计有效结账数据；营业额扣除赠送、退菜、人工减免和积分抵扣</p></div><button className="primary" onClick={() => openAi({from, to})}>✦ AI 经营分析</button><button className="secondary" onClick={() => void downloadFile(`/api/stats/export.csv?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, "营业统计.csv").catch((error) => setMessage(errorText(error)))}>导出完整报表</button></div>
+    <div className="section-heading"><div><h2>营业统计</h2><p className="muted">按北京时间营业日统计有效结账数据；营业额扣除赠送、退菜、人工减免和积分抵扣</p></div><button className="primary" onClick={() => openAi({from, to})}><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" style={{ verticalAlign: "middle", marginRight: 5 }}><path fill="currentColor" d="M8 0 10 6 16 8 10 10 8 16 6 10 0 8 6 6Z" /></svg>AI 经营分析</button><button className="secondary" onClick={() => void downloadFile(`/api/stats/export.csv?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, "营业统计.csv").catch((error) => setMessage(errorText(error)))}>导出完整报表</button></div>
     <div className="filter-bar"><label>开始日期<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>结束日期<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label><button className="primary" onClick={() => void load()}>查询</button></div>
     {s && <><div className="metric-grid">
       <Metric label="营业额" value={money(s.revenueFen)} />
@@ -2405,7 +2406,7 @@ function ClientUpdatePanel({ setMessage }: { setMessage: (message: string) => vo
   }
   return <div className="content-card client-update-card"><h3>客户端更新</h3>
     {!isAndroid && !isDesktop
-      ? <p className="muted">当前使用网页版，发布后刷新页面即可使用最新版。</p>
+      ? <p className="muted">{isIos ? "iOS 客户端通过签名安装包或 TestFlight 更新。" : "当前使用网页版，发布后刷新页面即可使用最新版。"}</p>
       : <>
         <p className="muted">{status?.currentVersion ? `当前版本 ${status.currentVersion}` : "检查安卓或 Windows 客户端的新版本"}{status?.latestVersion ? ` · 最新版本 ${status.latestVersion}` : ""}</p>
         {status?.message && <p className="update-message">{status.message}</p>}
@@ -2629,7 +2630,7 @@ function FontSizeCard({ fontSize, setFontSize }: { fontSize: number; setFontSize
 }
 
 function WebOrderingLayoutCard({ orderPreviewSide, setOrderPreviewSide }: { orderPreviewSide: "left" | "right"; setOrderPreviewSide: (side: "left" | "right") => void }) {
-  if (Capacitor.isNativePlatform()) return null;
+  if (!usesWebOrderingLayout) return null;
   return <div className="content-card"><h3>网页版点菜布局</h3><label className="toggle-row"><input type="checkbox" checked={orderPreviewSide === "left"} onChange={(event) => setOrderPreviewSide(event.target.checked ? "left" : "right")} />订单预览放左边，菜单放右边</label><p className="muted">关闭时菜单在左、订单预览在右；此设置保存在当前设备。</p></div>;
 }
 
@@ -2759,7 +2760,7 @@ export default function App() {
           body: "{}"
         });
         if (cancelled) return;
-        const nextSource = new EventSource(`/api/events?ticket=${encodeURIComponent(result.ticket)}`);
+        const nextSource = new EventSource(apiUrl(`/api/events?ticket=${encodeURIComponent(result.ticket)}`));
         source = nextSource;
         nextSource.onopen = () => { retryDelay = 1_000; };
         nextSource.onmessage = (messageEvent) => {
@@ -2831,5 +2832,5 @@ export default function App() {
                     : <DeviceSettingsPage setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} orderPreviewSide={orderPreviewSide} setOrderPreviewSide={setOrderPreviewSide} />;
   const aiMode = page === "business-ai" && user.role === "OWNER";
   const selectedOrderingPage = Boolean(selectedOrderId || selectedBanquetPreorderId);
-  return <div className={`app-shell${aiMode ? " app-shell-ai" : ""}${selectedOrderingPage && !Capacitor.isNativePlatform() ? " app-shell-ordering" : ""}` }>{!aiMode && <Header user={user} page={page} setPage={(next) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); if (next !== "banquets") { setBanquetFocusTableId(""); setBanquetFocusReservationId(""); } setPage(next); }} onOpenBanquetReminder={(reservationId) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); setBanquetFocusTableId(""); setBanquetFocusReservationId(reservationId); setPage("banquets"); }} onLogout={logout} selectedOrder={selectedOrderingPage} />}{message && !aiMode && <div className="toast">{message}<button onClick={() => setMessage("")}>×</button></div>}<main>{content}</main></div>;
+  return <div className={`app-shell${aiMode ? " app-shell-ai" : ""}${selectedOrderingPage && usesWebOrderingLayout ? " app-shell-ordering" : ""}` }>{!aiMode && <Header user={user} page={page} setPage={(next) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); if (next !== "banquets") { setBanquetFocusTableId(""); setBanquetFocusReservationId(""); } setPage(next); }} onOpenBanquetReminder={(reservationId) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); setBanquetFocusTableId(""); setBanquetFocusReservationId(reservationId); setPage("banquets"); }} onLogout={logout} selectedOrder={selectedOrderingPage} />}{message && !aiMode && <div className="toast">{message}<button onClick={() => setMessage("")}>×</button></div>}<main>{content}</main></div>;
 }
