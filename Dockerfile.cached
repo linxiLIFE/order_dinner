@@ -2,9 +2,12 @@
 # This image already contains Node 22 and the locked project toolchain/dependencies.
 FROM order-dinner:local AS build
 WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts --include=dev --include=optional
 COPY tsconfig.json ./
 COPY web ./web
 COPY server ./server
+COPY test ./test
 RUN npm run build:web && npm run build:server
 
 FROM order-dinner:local AS runtime
@@ -12,5 +15,6 @@ WORKDIR /app
 COPY --from=build /app/server/dist ./server/dist
 COPY --from=build /app/web/dist ./web/dist
 COPY package.json ./package.json
+COPY test ./test
 EXPOSE 3000
 CMD ["node", "server/dist/index.js"]

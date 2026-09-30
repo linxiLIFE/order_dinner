@@ -32,6 +32,8 @@ import {
   settingNumber
 } from "./utils.js";
 
+import { businessAiRouter, runAiMigrations } from "./business-ai.js";
+
 const app = express();
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
@@ -39,6 +41,7 @@ const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.
 const updatesDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../updates");
 
 app.use(cors({ origin: true, credentials: false }));
+app.use("/api/business-ai", businessAiRouter(statsData));
 app.use(express.json({ limit: "2mb" }));
 app.use((_req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -3547,6 +3550,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 async function start(): Promise<void> {
   await migrateAndSeed();
   await runBanquetMigrations(pool);
+  await runAiMigrations();
   const idempotencyCleanup = setInterval(() => {
     void pruneExpiredIdempotencyKeys().catch((error) => console.error("幂等记录清理失败", error));
   }, 24 * 60 * 60 * 1000);

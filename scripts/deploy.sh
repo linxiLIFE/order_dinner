@@ -27,6 +27,7 @@ remote_group="$(ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "id -gn '$ssh_user'")
 ssh "${ssh_args[@]}" "$ssh_user@$ssh_host" "sudo chmod o+x /opt && sudo install -d -m 0750 -o '$ssh_user' -g '$remote_group' '$remote_root' '$remote_root/.deploy' '$remote_root/.deploy/releases' '$remote_release' '$remote_root/backups' && sudo chown '$ssh_user':'$remote_group' '$remote_root'"
 COPYFILE_DISABLE=1 tar \
   --exclude='./.git' \
+  --exclude='[Aa][Pp][Ii][Kk][Ee][Yy].md' \
   --exclude='./node_modules' \
   --exclude='./release' \
   --exclude='./.deploy' \

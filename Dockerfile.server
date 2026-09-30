@@ -1,0 +1,9 @@
+# Server-only release from locally validated output. Browser dependencies are bundled.
+FROM order-dinner:local
+WORKDIR /app
+COPY server/dist ./server/dist
+COPY web/dist ./web/dist
+COPY package.json ./package.json
+COPY test ./test
+EXPOSE 3000
+CMD ["node", "server/dist/index.js"]

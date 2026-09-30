@@ -1,3 +1,5 @@
+import { lazy, Suspense } from "react";
+const BusinessAiPage = lazy(() => import("./BusinessAiPage.js").then(module => ({default: module.BusinessAiPage})));
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { Capacitor, registerPlugin } from "@capacitor/core";
 import { BanquetPage } from "./BanquetPage.js";
@@ -18,7 +20,7 @@ import {
   type User
 } from "./api.js";
 
-type Page = "tables" | "banquets" | "orders" | "customers" | "dishes" | "stats" | "print" | "settings";
+type Page = "tables" | "banquets" | "orders" | "customers" | "dishes" | "stats" | "business-ai" | "print" | "settings";
 type Table = {
   id: string;
   number: number;
@@ -2197,7 +2199,7 @@ function PrintPreviewDialog({ job, onClose }: { job: PrintJob; onClose: () => vo
   </Dialog>;
 }
 
-function StatsPage({ setMessage }: { setMessage: (message: string) => void }) {
+function StatsPage({ setMessage, openAi }: { setMessage: (message: string) => void; openAi: (range: {from: string; to: string}) => void }) {
   const today = businessDate();
   const [from, setFrom] = useState(today);
   const [to, setTo] = useState(today);
@@ -2206,7 +2208,7 @@ function StatsPage({ setMessage }: { setMessage: (message: string) => void }) {
   useEffect(() => { void load(); }, []);
   const s = data?.summary;
   return <section className="page-section">
-    <div className="section-heading"><div><h2>营业统计</h2><p className="muted">按北京时间营业日统计有效结账数据；营业额扣除赠送、退菜、人工减免和积分抵扣</p></div><button className="secondary" onClick={() => void downloadFile(`/api/stats/export.csv?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, "营业统计.csv").catch((error) => setMessage(errorText(error)))}>导出完整报表</button></div>
+    <div className="section-heading"><div><h2>营业统计</h2><p className="muted">按北京时间营业日统计有效结账数据；营业额扣除赠送、退菜、人工减免和积分抵扣</p></div><button className="primary" onClick={() => openAi({from, to})}>✦ AI 经营分析</button><button className="secondary" onClick={() => void downloadFile(`/api/stats/export.csv?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, "营业统计.csv").catch((error) => setMessage(errorText(error)))}>导出完整报表</button></div>
     <div className="filter-bar"><label>开始日期<input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label>结束日期<input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></label><button className="primary" onClick={() => void load()}>查询</button></div>
     {s && <><div className="metric-grid">
       <Metric label="营业额" value={money(s.revenueFen)} />
@@ -2659,6 +2661,7 @@ function AddTableForm({ onAdd }: { onAdd: (values: { name: string; number: numbe
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [page, setPage] = useState<Page>("tables");
+  const [aiRange, setAiRange] = useState({from: businessDate(), to: businessDate()});
   const [fontSize, setFontSize] = useState(readFontSizePreference);
   const [orderPreviewSide, setOrderPreviewSide] = useState(readOrderPreviewSidePreference);
   const [selectedOrderId, setSelectedOrderId] = useState("");
@@ -2821,10 +2824,12 @@ export default function App() {
         : page === "orders" ? <OrderQueryPage openOrder={(orderId) => { setPage("tables"); setSelectedOrderId(orderId); }} setMessage={setMessage} isOwner={user.role === "OWNER"} />
         : page === "customers" ? <CustomersPage setMessage={setMessage} />
               : page === "dishes" ? <DishesPage categories={categories} user={user} setMessage={setMessage} reloadCategories={refreshCategories} />
-                : page === "stats" ? <StatsPage setMessage={setMessage} />
+                : page === "business-ai" && user.role === "OWNER" ? <Suspense fallback={<div className="empty">正在打开经营顾问…</div>}><BusinessAiPage initialRange={aiRange} onBack={() => setPage("stats")} /></Suspense>
+                : page === "stats" ? <StatsPage setMessage={setMessage} openAi={(range) => { setAiRange(range); setPage("business-ai"); }} />
                   : page === "print" ? <PrintManagementPage setMessage={setMessage} />
                   : user.role === "OWNER" ? <SettingsPage setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} orderPreviewSide={orderPreviewSide} setOrderPreviewSide={setOrderPreviewSide} />
                     : <DeviceSettingsPage setMessage={setMessage} fontSize={fontSize} setFontSize={setFontSize} orderPreviewSide={orderPreviewSide} setOrderPreviewSide={setOrderPreviewSide} />;
+  const aiMode = page === "business-ai" && user.role === "OWNER";
   const selectedOrderingPage = Boolean(selectedOrderId || selectedBanquetPreorderId);
-  return <div className={`app-shell${selectedOrderingPage && !Capacitor.isNativePlatform() ? " app-shell-ordering" : ""}`}><Header user={user} page={page} setPage={(next) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); if (next !== "banquets") { setBanquetFocusTableId(""); setBanquetFocusReservationId(""); } setPage(next); }} onOpenBanquetReminder={(reservationId) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); setBanquetFocusTableId(""); setBanquetFocusReservationId(reservationId); setPage("banquets"); }} onLogout={logout} selectedOrder={selectedOrderingPage} />{message && <div className="toast">{message}<button onClick={() => setMessage("")}>×</button></div>}<main>{content}</main></div>;
+  return <div className={`app-shell${aiMode ? " app-shell-ai" : ""}${selectedOrderingPage && !Capacitor.isNativePlatform() ? " app-shell-ordering" : ""}` }>{!aiMode && <Header user={user} page={page} setPage={(next) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); if (next !== "banquets") { setBanquetFocusTableId(""); setBanquetFocusReservationId(""); } setPage(next); }} onOpenBanquetReminder={(reservationId) => { setSelectedOrderId(""); setSelectedBanquetPreorderId(""); setBanquetFocusTableId(""); setBanquetFocusReservationId(reservationId); setPage("banquets"); }} onLogout={logout} selectedOrder={selectedOrderingPage} />}{message && !aiMode && <div className="toast">{message}<button onClick={() => setMessage("")}>×</button></div>}<main>{content}</main></div>;
 }
