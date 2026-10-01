@@ -95,29 +95,41 @@ if [[ "$healthy" != true ]]; then
   exit 1
 fi
 # Verify actual public downloads and browser assets, not just HTTP 200.
-sudo docker exec -i order-dinner-app node --input-type=module - <<'NODE'
-import fs from 'node:fs';
-import crypto from 'node:crypto';
-import assert from 'node:assert/strict';
-const base = 'https://43.142.138.108:1316';
-const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
-async function get(path) {
-  const response = await fetch(new URL(path, base), {signal:AbortSignal.timeout(120_000),cache:'no-store'});
-  assert(response.ok, `HTTP ${response.status}: ${path}`);
-  return Buffer.from(await response.arrayBuffer());
-}
-const expected = JSON.parse(fs.readFileSync('/app/updates/latest.json', 'utf8'));
-assert.deepEqual(JSON.parse((await get('/updates/latest.json')).toString()), expected);
-for (const platform of ['android','windows']) {
-  assert.equal(digest(await get(expected[platform].url)), expected[platform].sha256);
-}
-const index = fs.readFileSync('/app/web/dist/index.html');
-assert.equal(digest(await get('/')), digest(index));
-for (const match of index.toString().matchAll(/(?:src|href)="(\/assets\/[^"?#]+)"/g)) {
-  assert.equal(digest(await get(match[1])), digest(fs.readFileSync(`/app/web/dist${match[1]}`)));
-}
-console.log(`已验证网页、APK、EXE 与更新清单：${expected.version}`);
-NODE
+python3 - "$CANDIDATE" <<'PY_VERIFY'
+import hashlib, json, pathlib, re, subprocess, sys, urllib.parse
+root = pathlib.Path(sys.argv[1])
+base = 'https://43.142.138.108:1316'
+def command(path):
+    url = urllib.parse.urljoin(base + '/', path)
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https' or parsed.netloc != '43.142.138.108:1316':
+        raise ValueError('Unexpected public artifact origin')
+    return ['curl', '--fail', '--silent', '--show-error', '--max-time', '120',
+            '--resolve', '43.142.138.108:1316:127.0.0.1', url]
+def get(path):
+    return subprocess.check_output(command(path))
+def remote_digest(path):
+    with subprocess.Popen(command(path), stdout=subprocess.PIPE) as process:
+        digest = hashlib.sha256()
+        while True:
+            block = process.stdout.read(1024 * 1024)
+            if not block: break
+            digest.update(block)
+        if process.wait() != 0: raise RuntimeError('HTTPS download failed')
+        return digest.hexdigest()
+expected = json.loads((root / 'updates/latest.json').read_text())
+if json.loads(get('/updates/latest.json')) != expected:
+    raise ValueError('线上更新清单不一致')
+for platform in ('android', 'windows'):
+    if remote_digest(expected[platform]['url']) != expected[platform]['sha256']:
+        raise ValueError(f'{platform} 线上安装包哈希不一致')
+index = (root / 'web/dist/index.html').read_bytes()
+if get('/') != index: raise ValueError('线上网页不一致')
+for asset in re.findall(r'(?:src|href)="(/assets/[^"?#]+)"', index.decode()):
+    if remote_digest(asset) != hashlib.sha256((root / 'web/dist' / asset.lstrip('/')).read_bytes()).hexdigest():
+        raise ValueError(f'线上资源哈希不一致：{asset}')
+print(f"已验证 HTTPS 入口的网页、APK、EXE 与更新清单：{expected['version']}")
+PY_VERIFY
 # Point the daily backup at the current script before moving old releases.
 sudo tee /etc/cron.d/order-dinner-backup >/dev/null <<CRON
 0 3 * * * $(id -un) ORDER_DINNER_ROOT=$root bash $CANDIDATE/scripts/backup.sh >> $root/backups/backup.log 2>&1
