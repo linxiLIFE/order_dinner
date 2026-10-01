@@ -67,15 +67,16 @@ flock -w 600 9
 old_updates=$(sudo docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/updates"}}{{.Source}}{{end}}{{end}}' order-dinner-app)
 [[ "$old_updates" == "$root/.deploy/releases/"* && -f "$old_updates/latest.json" ]]
 # Refuse stale/repeated releases before touching the running application.
-sudo docker run --rm -i -v "$CANDIDATE/updates:/candidate:ro" -v "$old_updates:/published:ro" --entrypoint node node:22-bookworm-slim - <<'NODE'
-const fs = require('fs');
-const version = (directory) => JSON.parse(fs.readFileSync(`${directory}/latest.json`, 'utf8')).version;
-const code = (value) => {
-  if (!/^\d+\.\d+\.\d+$/.test(value)) throw new Error('Invalid version');
-  const [a,b,c] = value.split('.').map(Number); return a * 1_000_000 + b * 1_000 + c;
-};
-if (code(version('/candidate')) <= code(version('/published'))) throw new Error('拒绝发布旧版本或重复版本');
-NODE
+python3 - "$CANDIDATE/updates/latest.json" "$old_updates/latest.json" <<'PY'
+import json, re, sys
+def version_code(filename):
+    value = json.load(open(filename))['version']
+    if not re.fullmatch(r'\d+\.\d+\.\d+', value): raise ValueError('Invalid version')
+    major, minor, patch = map(int, value.split('.'))
+    return major * 1_000_000 + minor * 1_000 + patch
+if version_code(sys.argv[1]) <= version_code(sys.argv[2]):
+    raise ValueError('拒绝发布旧版本或重复版本')
+PY
 sudo docker build -f "$CANDIDATE/Dockerfile.ci" -t order-dinner:ci-candidate "$CANDIDATE"
 # Deployment and daily backups share the same lock (the CI backup already holds it).
 ORDER_DINNER_BACKUP_LOCK_HELD=1 ORDER_DINNER_ROOT="$root" bash "$CANDIDATE/scripts/backup.sh" </dev/null
