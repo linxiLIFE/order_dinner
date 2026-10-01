@@ -5,6 +5,11 @@ umask 077
 script_root="$(cd "$(dirname "$0")/.." && pwd)"
 project_root="${ORDER_DINNER_ROOT:-$script_root}"
 cd "$project_root"
+if [[ "${ORDER_DINNER_BACKUP_LOCK_HELD:-0}" != 1 ]]; then
+  mkdir -p "$project_root/.deploy"
+  exec 9> "$project_root/.deploy/ci-deploy.lock"
+  flock -w 600 9
+fi
 backup_dir="$project_root/backups"
 if [[ ! -w "$backup_dir" ]]; then
   sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" "$backup_dir"

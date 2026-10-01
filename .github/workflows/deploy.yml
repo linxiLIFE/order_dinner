@@ -1,0 +1,177 @@
+name: 自动发布
+
+on:
+  push:
+    branches: [main, codex/ai]
+
+permissions:
+  contents: read
+
+# Do not interrupt a deployment after it has started changing the server.
+concurrency:
+  group: order-dinner-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - id: version
+        run: node scripts/ci-version.mjs >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci-test-only
+          POSTGRES_DB: order_dinner_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d order_dinner_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      ORDER_DINNER_TEST_DATABASE_URL: postgres://ci:ci-test-only@127.0.0.1:5432/order_dinner_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm version "$RELEASE_VERSION" --no-git-tag-version
+      - run: npm ci
+      - run: npm test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server
+          path: |
+            web/dist
+            server/dist
+            package.json
+            package-lock.json
+          if-no-files-found: error
+          retention-days: 7
+
+  android:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: 恢复现有安卓签名密钥
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64"
+          install -d -m 700 "$HOME/.android"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+      - run: npm version "$RELEASE_VERSION" --no-git-tag-version
+      - run: npm ci
+      - run: npm run package:android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: release/android
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: version
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm version "$RELEASE_VERSION" --no-git-tag-version
+      - run: npm ci
+      - run: npm run package:win -- --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: release/desktop/*/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    needs: [version, test, android, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      SSH_HOST: 43.142.138.108
+      SSH_USER: ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: server
+          path: .
+      - uses: actions/download-artifact@v4
+        with:
+          name: android
+          path: release/android
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: release/desktop
+      - name: 生成发布清单
+        run: |
+          test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
+          npm run publish:updates
+          node --input-type=module -e 'import fs from "node:fs"; fs.writeFileSync("release.json", JSON.stringify({version:process.env.RELEASE_VERSION,commit:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID}) + "\n")'
+      - name: 配置服务器连接
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_KEY" && test -n "$KNOWN_HOSTS"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/order-dinner-ci"
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/order-dinner-ci" "$HOME/.ssh/known_hosts"
+          echo "SSH_KEY=$HOME/.ssh/order-dinner-ci" >> "$GITHUB_ENV"
+      - name: 部署、验证与旧版本清理
+        run: bash scripts/deploy-ci.sh
+      - name: 发布结果
+        run: |
+          echo "已发布 $RELEASE_VERSION，提交 $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo '网页与安装包：https://43.142.138.108:1316' >> "$GITHUB_STEP_SUMMARY"

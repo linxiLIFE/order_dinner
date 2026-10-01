@@ -57,7 +57,7 @@ fs.renameSync(stagingDirectory, versionDirectory);
 const manifest = {
   schemaVersion: 1,
   version,
-  notes: "修复营业统计无法查询及导出的问题。",
+  notes: process.env.UPDATE_NOTES || "功能更新与问题修复。",
   android: artifacts.android,
   windows: artifacts.windows
 };
