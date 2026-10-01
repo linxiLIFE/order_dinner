@@ -6,6 +6,8 @@ Push 到 `main` 或 `codex/ai` 会触发 `.github/workflows/deploy.yml`。部署
 
 CI 版本取源码和线上版本中较高者，再递增一位；仅修改构建工作目录，不回写 Git。数据库备份与部署共用服务器文件锁。候选版本不高于线上版本时拒绝部署。
 
+服务器先将旧安装包复制到候选目录，再通过 rsync 仅上传有变化的数据块，避免每次跨境传输完整 Windows 安装包。运行中的安装包不修改、不使用硬链接；传输完成后仍校验完整文件的 SHA-256。
+
 GitHub 仓库 Secrets：
 
 - `DEPLOY_SSH_KEY`：服务器 SSH 私钥。

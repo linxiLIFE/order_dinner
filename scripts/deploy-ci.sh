@@ -6,11 +6,43 @@ cd "$(dirname "$0")/.."
 [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
 root=/opt/order-dinner
 candidate="$root/.deploy/releases/ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+version="$(node -p 'require("./package.json").version')"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 ssh_args=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -i "$SSH_KEY")
 target="$SSH_USER@$SSH_HOST"
 ssh "${ssh_args[@]}" "$target" "test -f '$root/.env' && test ! -e '$candidate' && install -d -m 750 '$candidate'"
-tar -czf - Dockerfile.ci docker-compose.yml scripts/backup.sh package.json package-lock.json server/dist web/dist updates release.json \
+tar -czf - Dockerfile.ci docker-compose.yml scripts/backup.sh package.json package-lock.json server/dist web/dist updates/latest.json release.json \
   | ssh "${ssh_args[@]}" "$target" "tar -xzf - -C '$candidate'"
+# Seed independent copies of the previous installers, then send changed blocks.
+# Never hardlink or modify installers mounted by the running application.
+ssh "${ssh_args[@]}" "$target" "CANDIDATE='$candidate' bash -s" <<'REMOTE_SEED'
+set -euo pipefail
+old_updates=$(sudo docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/updates"}}{{.Source}}{{end}}{{end}}' order-dinner-app)
+[[ "$old_updates" == /opt/order-dinner/.deploy/releases/* ]]
+python3 - "$CANDIDATE" "$old_updates" <<'PY'
+import json, pathlib, shutil, sys, urllib.parse
+candidate = pathlib.Path(sys.argv[1]) / 'updates'
+published = pathlib.Path(sys.argv[2]).resolve()
+current = json.loads((published / 'latest.json').read_text())
+incoming = json.loads((candidate / 'latest.json').read_text())
+def artifact(root, manifest, platform):
+    path = urllib.parse.unquote(urllib.parse.urlsplit(manifest[platform]['url']).path)
+    if not path.startswith('/updates/'): raise ValueError('Invalid artifact URL')
+    file = (root / path.removeprefix('/updates/')).resolve()
+    if root.resolve() not in file.parents: raise ValueError('Invalid artifact path')
+    return file
+for platform in ('android', 'windows'):
+    source = artifact(published, current, platform)
+    destination = artifact(candidate, incoming, platform)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_file() and not destination.exists():
+        shutil.copy2(source, destination)
+        print(f'已准备 {platform} 增量传输基础文件')
+PY
+REMOTE_SEED
+printf -v rsync_ssh '%q ' ssh "${ssh_args[@]}"
+rsync -az --checksum --no-whole-file --stats -e "$rsync_ssh" \
+  "updates/$version/" "$target:$candidate/updates/$version/"
 ssh "${ssh_args[@]}" "$target" "CANDIDATE='$candidate' bash -s" <<'REMOTE'
 set -euo pipefail
 root=/opt/order-dinner
