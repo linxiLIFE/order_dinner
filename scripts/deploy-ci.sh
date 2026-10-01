@@ -13,36 +13,52 @@ target="$SSH_USER@$SSH_HOST"
 ssh "${ssh_args[@]}" "$target" "test -f '$root/.env' && test ! -e '$candidate' && install -d -m 750 '$candidate'"
 tar -czf - Dockerfile.ci docker-compose.yml scripts/backup.sh package.json package-lock.json server/dist web/dist updates/latest.json release.json \
   | ssh "${ssh_args[@]}" "$target" "tar -xzf - -C '$candidate'"
-# Seed independent copies of the previous installers, then send changed blocks.
-# Never hardlink or modify installers mounted by the running application.
-ssh "${ssh_args[@]}" "$target" "CANDIDATE='$candidate' bash -s" <<'REMOTE_SEED'
+# Use separate TCP connections for chunks: a single cross-border connection is
+# too slow for the ~90 MB Windows installer. Every byte is verified before use.
+transfer_dir=".deploy/ci-transfer/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+mkdir -p "$transfer_dir/parts"
+bundle="$transfer_dir/installers.tar.gz"
+tar -czf "$bundle" "updates/$version"
+bundle_sha="$(sha256sum "$bundle" | cut -d ' ' -f 1)"
+split -b 3145728 -d -a 3 "$bundle" "$transfer_dir/parts/part-"
+ssh "${ssh_args[@]}" "$target" "install -d -m 750 '$candidate/.transfer'"
+pids=()
+wait_transfers() {
+  local failed=false pid
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failed=true
+  done
+  pids=()
+  [[ "$failed" == false ]]
+}
+for part in "$transfer_dir/parts"/part-*; do
+  (
+    for attempt in 1 2 3; do
+      if scp "${ssh_args[@]}" "$part" "$target:$candidate/.transfer/"; then exit 0; fi
+      sleep 2
+    done
+    exit 1
+  ) &
+  pids+=("$!")
+  # Stagger handshakes to avoid sshd's unauthenticated-connection limit.
+  sleep 0.2
+  if (( ${#pids[@]} >= 16 )); then wait_transfers; fi
+done
+wait_transfers
+ssh "${ssh_args[@]}" "$target" "CANDIDATE='$candidate' BUNDLE_SHA='$bundle_sha' bash -s" <<'REMOTE_UNPACK'
 set -euo pipefail
-old_updates=$(sudo docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/updates"}}{{.Source}}{{end}}{{end}}' order-dinner-app)
-[[ "$old_updates" == /opt/order-dinner/.deploy/releases/* ]]
-python3 - "$CANDIDATE" "$old_updates" <<'PY'
-import json, pathlib, shutil, sys, urllib.parse
-candidate = pathlib.Path(sys.argv[1]) / 'updates'
-published = pathlib.Path(sys.argv[2]).resolve()
-current = json.loads((published / 'latest.json').read_text())
-incoming = json.loads((candidate / 'latest.json').read_text())
-def artifact(root, manifest, platform):
-    path = urllib.parse.unquote(urllib.parse.urlsplit(manifest[platform]['url']).path)
-    if not path.startswith('/updates/'): raise ValueError('Invalid artifact URL')
-    file = (root / path.removeprefix('/updates/')).resolve()
-    if root.resolve() not in file.parents: raise ValueError('Invalid artifact path')
-    return file
-for platform in ('android', 'windows'):
-    source = artifact(published, current, platform)
-    destination = artifact(candidate, incoming, platform)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.is_file() and not destination.exists():
-        shutil.copy2(source, destination)
-        print(f'已准备 {platform} 增量传输基础文件')
-PY
-REMOTE_SEED
-printf -v rsync_ssh '%q ' ssh "${ssh_args[@]}"
-rsync -az --checksum --no-whole-file --stats -e "$rsync_ssh" \
-  "updates/$version/" "$target:$candidate/updates/$version/"
+cd "$CANDIDATE"
+actual_sha="$(cat .transfer/part-* | sha256sum | cut -d ' ' -f 1)"
+[[ "$actual_sha" == "$BUNDLE_SHA" ]] || { echo '安装包分块校验失败' >&2; exit 1; }
+cat .transfer/part-* | tar -xzf -
+trash_root="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
+sudo install -d -m 700 "$trash_root" "$trash_root/files" "$trash_root/info"
+name="order-dinner-transfer-$(basename "$CANDIDATE")-$$"
+sudo mv "$CANDIDATE/.transfer" "$trash_root/files/$name"
+printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' "$CANDIDATE/.transfer" "$(date +%Y-%m-%dT%H:%M:%S)" \
+  | sudo tee "$trash_root/info/$name.trashinfo" >/dev/null
+echo '安装包分块传输与完整哈希校验通过'
+REMOTE_UNPACK
 ssh "${ssh_args[@]}" "$target" "CANDIDATE='$candidate' bash -s" <<'REMOTE'
 set -euo pipefail
 root=/opt/order-dinner
