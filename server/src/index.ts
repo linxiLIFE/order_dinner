@@ -1019,8 +1019,9 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
         if (note) printNoteAndQuantity(note, quantityLabel);
         else pushRight(quantityLabel, emphasis, printerColumns(emphasis));
       }
-      if (note && itemIndex < items.length - 1) push("");
     }
+    // 整道菜（含换行菜名和备注）结束后留白，不拆散同一道菜的信息。
+    if (itemIndex < items.length - 1 && (kind === "KITCHEN" || receipt || note)) push("");
   }
 
   if (receipt) {

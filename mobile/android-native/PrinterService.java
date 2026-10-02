@@ -356,8 +356,9 @@ public class PrinterService extends Service {
                     String quantityLabel = "x" + quantity + unit;
                     String note = formatItemNote(item.optString("note", ""));
                     printDishItem(output, name, quantityLabel, note, false);
-                    if (!note.isEmpty() && index < items.length() - 1) line(output, "");
+                    if (!note.isEmpty() && "RETURN".equals(kind) && index < items.length() - 1) line(output, "");
                 }
+                if (index < items.length() - 1 && (receipt || "KITCHEN".equals(kind))) line(output, "");
             }
         }
         if (receipt) {
