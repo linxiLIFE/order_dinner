@@ -622,3 +622,7 @@ input[type="range"].font-size-range { width: 100%; min-height: 0; margin: 0; pad
   .ai-markdown th, .ai-markdown td { padding: 12px; }
   .ai-composer { padding: 14px; }
 }
+
+.banquet-quantity-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; padding: 10px 16px; margin-bottom: 12px; border-radius: 10px; background: #fff3d8; color: #714a0a; }
+.banquet-quantity-notice strong { font-size: 22px; }
+.banquet-quantity-notice span { font-size: 14px; }

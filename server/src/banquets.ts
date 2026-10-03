@@ -1,3 +1,4 @@
+import { assertBanquetTotal, banquetQuantity, banquetTableCount } from "./banquet-quantities.js";
 import express, { type Request, type Response } from "express";
 import crypto from "node:crypto";
 import { pool, withReadOnlySnapshot, withTransaction, type DbClient } from "./db.js";
@@ -28,6 +29,7 @@ type Reservation = {
   customer_name: string;
   customer_phone: string | null;
   people_count: number;
+  table_count: number;
   points_earning_enabled: boolean;
   status: BanquetState;
   preorder: Array<Record<string, unknown>>;
@@ -71,20 +73,14 @@ function nonNegativeInt(value: unknown, label: string, max = 1_000_000_000): num
   return parsed;
 }
 
-function assertPreorderFitsPostgresInteger(items: Array<Record<string, unknown>>): void {
-  let totalFen = 0;
-  for (const item of items) {
-    const quantity = Number(item.quantity);
-    const priceFen = Number(item.priceFen);
-    const lineFen = quantity * priceFen;
-    if (!Number.isSafeInteger(lineFen) || lineFen < 0 || lineFen > 2_147_483_647) {
-      reject("单项宴席预点金额超过系统支持范围，请调整数量或菜价");
-    }
-    totalFen += lineFen;
-    if (!Number.isSafeInteger(totalFen) || totalFen > 2_147_483_647) {
-      reject("宴席预点总额超过系统支持范围，请拆分预点菜");
-    }
-  }
+function assertPreorderFitsPostgresInteger(items: Array<Record<string, unknown>>, tableCount = 1): void {
+  assertBanquetTotal(items, tableCount);
+}
+
+function assertReservationTotal(preorder: Array<Record<string, unknown>>, drafts: Array<Record<string, unknown>>, tableCount: number): void {
+  assertBanquetTotal([...preorder, ...drafts.map((line) => ({
+    quantity: line.quantity, priceFen: (line.dish as { price_fen?: number } | undefined)?.price_fen
+  }))], tableCount);
 }
 
 function validDate(value: unknown, label: string): string {
@@ -199,8 +195,8 @@ async function reservationDetails(client: DbClient, reservationId: string): Prom
 }
 
 export async function commitBanquetDraft(client: DbClient, reservationId: string, employeeId: string): Promise<boolean> {
-  const current = await client.query<{ status: BanquetState; preorder: Array<Record<string, unknown>>; draft_lines: Array<Record<string, unknown>> }>(
-    `SELECT status, preorder, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
+  const current = await client.query<{ status: BanquetState; table_count: number; preorder: Array<Record<string, unknown>>; draft_lines: Array<Record<string, unknown>> }>(
+    `SELECT status, table_count, preorder, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
   );
   if (!current.rows[0]) reject("宴席预定不存在", 404);
   if (current.rows[0].status !== "RESERVED") reject("该宴席已开台或取消，不能保留预点菜", 409);
@@ -226,7 +222,7 @@ export async function commitBanquetDraft(client: DbClient, reservationId: string
       priceFen: dish.price_fen, costFen: dish.cost_fen, pointsEarningEnabled: dish.points_earning_enabled !== false,
       quantity, note: options.note, optionSnapshot: options.snapshot
     });
-    assertPreorderFitsPostgresInteger(snapshot);
+    assertPreorderFitsPostgresInteger(snapshot, current.rows[0].table_count);
   }
   await client.query(
     `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_printed_at = NULL,
@@ -344,6 +340,7 @@ async function appendDraftPreorderItems(
 /** Create the banquet tables after the base POS schema has been migrated. Safe to run on every start. */
 export async function runBanquetMigrations(db: DbClient = pool): Promise<void> {
   await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_earning_enabled boolean NOT NULL DEFAULT true`);
+  await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS banquet_table_count integer CHECK (banquet_table_count BETWEEN 1 AND 1000)`);
   await db.query(`ALTER TABLE settlements ADD COLUMN IF NOT EXISTS deposit_applied_fen integer NOT NULL DEFAULT 0 CHECK (deposit_applied_fen >= 0)`);
   await db.query(`
     CREATE TABLE IF NOT EXISTS banquet_halls (
@@ -378,6 +375,9 @@ export async function runBanquetMigrations(db: DbClient = pool): Promise<void> {
     )`);
   // Older releases used banquet_halls. New reservations bind to an existing POS table.
   // Keep the old column nullable so historical reservations can still be read and settled.
+  await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS reservation_revision integer NOT NULL DEFAULT 0`);
+  await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS table_count integer NOT NULL DEFAULT 1 CHECK (table_count BETWEEN 1 AND 1000)`);
+  await db.query(`UPDATE orders o SET banquet_table_count = r.table_count FROM banquet_reservations r WHERE r.order_id = o.id AND o.banquet_table_count IS NULL`);
   await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS table_id uuid REFERENCES restaurant_tables(id)`);
   await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS preorder_printed_at timestamptz`);
   await db.query(`ALTER TABLE banquet_reservations ADD COLUMN IF NOT EXISTS draft_lines jsonb NOT NULL DEFAULT '[]'::jsonb`);
@@ -501,7 +501,7 @@ banquetRouter.get("/reservations", async (req, res) => {
               COALESCE(t.name, h.name, '未指定桌台') AS table_name,
               t.number AS table_number, t.seats AS table_seats,
               r.starts_at, r.ends_at, r.customer_name, r.customer_phone,
-              r.people_count, r.points_earning_enabled, r.status, r.preorder,
+              r.people_count, r.table_count, r.points_earning_enabled, r.status, r.preorder,
               jsonb_array_length(r.draft_lines) AS draft_count, r.order_id, r.note,
               COALESCE(d.balance, 0)::bigint AS deposit_balance_fen
        FROM banquet_reservations r
@@ -531,6 +531,7 @@ banquetRouter.post("/reservations", async (req: AuthenticatedRequest, res) => {
     const endsAt = validDate(payload.endsAt, "结束时间");
     if (Date.parse(endsAt) <= Date.parse(startsAt)) reject("结束时间必须晚于开始时间");
     const people = positiveInt(payload.peopleCount, "用餐人数", 100_000);
+    const tableCount = payload.tableCount === undefined ? 1 : banquetTableCount(payload.tableCount);
     const customerName = text(payload.customerName).slice(0, 120);
     const customerPhone = normalizeCustomerPhone(payload.customerPhone);
     const pointsEarningEnabled = payload.pointsEarningEnabled === undefined ? true : payload.pointsEarningEnabled;
@@ -571,9 +572,9 @@ banquetRouter.post("/reservations", async (req: AuthenticatedRequest, res) => {
       }
       const inserted = await client.query<{ id: string }>(
         `INSERT INTO banquet_reservations
-         (table_id, hall_id, starts_at, ends_at, customer_name, customer_phone, people_count, points_earning_enabled, note, created_by, updated_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING id`,
-        [tableId || null, tableId ? null : hallId, startsAt, endsAt, customerName, customerPhone, people, pointsEarningEnabled, note, user.id]
+         (table_id, hall_id, starts_at, ends_at, customer_name, customer_phone, people_count, points_earning_enabled, note, table_count, created_by, updated_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11) RETURNING id`,
+        [tableId || null, tableId ? null : hallId, startsAt, endsAt, customerName, customerPhone, people, pointsEarningEnabled, note, tableCount, user.id]
       );
       await logOperation(client, user.id, "CREATE_BANQUET_RESERVATION", inserted.rows[0].id, { tableId: tableId || null, hallId: hallId || null, startsAt, endsAt, peopleCount: people });
       return { reservation: await reservationDetails(client, inserted.rows[0].id) };
@@ -596,8 +597,8 @@ banquetRouter.post("/reservations/:reservationId/draft", async (req: Authenticat
     const key = requestKey(req.body);
     const payload = payloadWithoutKey(req.body);
     const result = await withTransaction(async (client) => idempotent(client, `preorder-draft:${reservationId}`, key, user.id, payload, async () => {
-      const current = await client.query<{ status: BanquetState; draft_lines: unknown; draft_revision: number }>(
-        `SELECT status, draft_lines, draft_revision FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
+      const current = await client.query<{ status: BanquetState; table_count: number; preorder: Array<Record<string, unknown>>; draft_lines: unknown; draft_revision: number }>(
+        `SELECT status, table_count, preorder, draft_lines, draft_revision FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
       );
       if (!current.rows[0]) reject("宴席预定不存在", 404);
       if (current.rows[0].status !== "RESERVED") reject("该宴席已开台或取消，不能继续预点菜", 409);
@@ -605,6 +606,7 @@ banquetRouter.post("/reservations/:reservationId/draft", async (req: Authenticat
         reject("预点菜已被其他设备修改，请刷新后再清空", 409);
       }
       const lines = changeDraft(current.rows[0].draft_lines, await prepareDraftPayload(client, payload));
+      assertReservationTotal(current.rows[0].preorder, lines, current.rows[0].table_count);
       const revision = current.rows[0].draft_revision + 1;
       await client.query(
         `UPDATE banquet_reservations SET draft_lines = $1::jsonb, draft_revision = $2,
@@ -622,65 +624,82 @@ banquetRouter.patch("/reservations/:reservationId", async (req: AuthenticatedReq
   try {
     const user = userOf(req);
     const reservationId = routeId(req, "reservationId");
-    const startsAt = req.body?.startsAt === undefined ? undefined : validDate(req.body.startsAt, "开始时间");
-    const endsAt = req.body?.endsAt === undefined ? undefined : validDate(req.body.endsAt, "结束时间");
-    if (startsAt && Date.parse(startsAt) <= Date.now()) reject("改期后的开始时间必须晚于当前时间");
-    const hasNote = req.body?.note !== undefined;
-    if (hasNote && (typeof req.body.note !== "string" || req.body.note.length > 500)) reject("备注不能超过500字");
-    const note = hasNote ? text(req.body.note) : undefined;
-    if ((startsAt === undefined) !== (endsAt === undefined)) reject("改期时请同时填写开始和结束时间");
-    if (startsAt && endsAt && Date.parse(endsAt) <= Date.parse(startsAt)) reject("结束时间必须晚于开始时间");
-    const cancel = req.body?.status === "CANCELLED";
-    if (req.body?.status !== undefined && !cancel) reject("预定状态不正确");
-    if (!cancel && !startsAt && !hasNote) reject("请填写改期时间、宴席备注或取消预定");
+    const body = req.body || {};
+    const cancel = body.status === "CANCELLED";
+    if (body.status !== undefined && !cancel) reject("预定状态不正确");
+    const changes: Record<string, unknown> = {};
+    if (body.startsAt !== undefined) changes.starts_at = validDate(body.startsAt, "开始时间");
+    if (body.endsAt !== undefined) changes.ends_at = validDate(body.endsAt, "结束时间");
+    if (body.tableId !== undefined) {
+      if (!text(body.tableId)) reject("请选择桌台");
+      changes.table_id = text(body.tableId);
+      changes.hall_id = null;
+    }
+    if (body.customerName !== undefined) {
+      if (typeof body.customerName !== "string" || body.customerName.length > 120) reject("预订人不能超过120字");
+      changes.customer_name = text(body.customerName);
+    }
+    if (body.customerPhone !== undefined) changes.customer_phone = normalizeCustomerPhone(body.customerPhone);
+    if (body.peopleCount !== undefined) changes.people_count = positiveInt(body.peopleCount, "用餐人数", 100_000);
+    if (body.tableCount !== undefined) changes.table_count = banquetTableCount(body.tableCount);
+    if (body.pointsEarningEnabled !== undefined) {
+      if (typeof body.pointsEarningEnabled !== "boolean") reject("积分累计选择不正确");
+      changes.points_earning_enabled = body.pointsEarningEnabled;
+    }
+    if (body.note !== undefined) {
+      if (typeof body.note !== "string" || body.note.length > 500) reject("备注不能超过500字");
+      changes.note = text(body.note);
+    }
+    if (!cancel && !Object.keys(changes).length) reject("请填写要修改的宴席信息");
+    const expectedRevision = body.expectedRevision === undefined ? undefined : nonNegativeInt(body.expectedRevision, "预定版本", 2_147_483_647);
     const response = await withTransaction(async (client) => {
-      const current = await client.query<{ id: string; hall_id: string | null; table_id: string | null; status: BanquetState }>(
-        `SELECT id, hall_id, table_id, status FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
+      const current = await client.query<Reservation & { reservation_revision: number }>(
+        `SELECT * FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
       );
       const reservation = current.rows[0];
       if (!reservation) reject("宴席预定不存在", 404);
-      if (reservation.status !== "RESERVED") reject("只有待办预定可以改期或取消", 409);
+      if (reservation.status !== "RESERVED") reject("只有未开台的预定可以修改或取消", 409);
+      if (expectedRevision !== undefined && expectedRevision !== reservation.reservation_revision) reject("宴席信息已在其他设备修改，请重新打开修改页面", 409);
       if (cancel) {
-        await client.query(`UPDATE banquet_reservations SET status = 'CANCELLED', updated_by = $1, updated_at = now() WHERE id = $2`, [user.id, reservationId]);
-        await logOperation(client, user.id, "CANCEL_BANQUET_RESERVATION", reservationId, { note: text(req.body?.note) });
+        await client.query(`UPDATE banquet_reservations SET status = 'CANCELLED', reservation_revision = reservation_revision + 1, updated_by = $1, updated_at = now() WHERE id = $2`, [user.id, reservationId]);
+        await logOperation(client, user.id, "CANCEL_BANQUET_RESERVATION", reservationId);
       } else {
-        if (startsAt && reservation.table_id) {
-          await client.query(`SELECT id FROM restaurant_tables WHERE id = $1 FOR UPDATE`, [reservation.table_id]);
+        const next = { ...reservation, ...changes } as Reservation;
+        if (Date.parse(next.ends_at) <= Date.parse(next.starts_at)) reject("结束时间必须晚于开始时间");
+        const slotChanged = next.table_id !== reservation.table_id
+          || Date.parse(next.starts_at) !== Date.parse(reservation.starts_at)
+          || Date.parse(next.ends_at) !== Date.parse(reservation.ends_at);
+        if (slotChanged) {
+          if (Date.parse(next.starts_at) <= Date.now()) reject("修改后的开始时间必须晚于当前时间");
+          if (next.table_id) {
+            const table = await client.query<{ status: string }>(`SELECT status FROM restaurant_tables WHERE id = $1 FOR UPDATE`, [next.table_id]);
+            if (!table.rows[0]) reject("桌台不存在", 404);
+            if (table.rows[0].status === "DISABLED") reject("该桌台已停用", 409);
+          } else if (next.hall_id) {
+            await client.query(`SELECT id FROM banquet_halls WHERE id = $1 FOR UPDATE`, [next.hall_id]);
+          } else reject("该宴席没有绑定桌台，无法改期", 409);
           const overlap = await client.query(
             `SELECT id FROM banquet_reservations
-             WHERE table_id = $1 AND id <> $2 AND ${slotBlockingReservationCondition}
-               AND starts_at < $4::timestamptz AND ends_at > $3::timestamptz
-             LIMIT 1`, [reservation.table_id, reservationId, startsAt, endsAt]
+             WHERE ${next.table_id ? "table_id" : "hall_id"} = $1 AND id <> $2 AND ${slotBlockingReservationCondition}
+               AND starts_at < $4::timestamptz AND ends_at > $3::timestamptz LIMIT 1`,
+            [next.table_id || next.hall_id, reservationId, next.starts_at, next.ends_at]
           );
           if (overlap.rows[0]) reject("该桌台在此时间段已有宴席预定", 409);
-        } else if (startsAt && reservation.hall_id) {
-          await client.query(`SELECT id FROM banquet_halls WHERE id = $1 FOR UPDATE`, [reservation.hall_id]);
-          const overlap = await client.query(
-            `SELECT id FROM banquet_reservations
-             WHERE hall_id = $1 AND id <> $2 AND ${slotBlockingReservationCondition}
-               AND starts_at < $4::timestamptz AND ends_at > $3::timestamptz
-             LIMIT 1`, [reservation.hall_id, reservationId, startsAt, endsAt]
-          );
-          if (overlap.rows[0]) reject("该厅在此时间段已有预定", 409);
-        } else if (startsAt) {
-          reject("该宴席没有绑定桌台，无法改期", 409);
         }
-        if (startsAt) {
-          await client.query(
-            `UPDATE banquet_reservations SET starts_at = $1, ends_at = $2, note = COALESCE($3, note), updated_by = $4, updated_at = now() WHERE id = $5`,
-            [startsAt, endsAt, note ?? null, user.id, reservationId]
-          );
-        } else {
-          await client.query(
-            `UPDATE banquet_reservations SET note = $1, updated_by = $2, updated_at = now() WHERE id = $3`,
-            [note, user.id, reservationId]
-          );
-        }
-        const action = startsAt && hasNote ? "UPDATE_BANQUET_RESERVATION" : startsAt ? "RESCHEDULE_BANQUET_RESERVATION" : "UPDATE_BANQUET_NOTE";
-        await logOperation(client, user.id, action, reservationId, { ...(startsAt ? { startsAt, endsAt } : {}), ...(hasNote ? { note } : {}) });
+        assertReservationTotal(next.preorder, next.draft_lines, next.table_count);
+        const entries = Object.entries(changes);
+        const values: unknown[] = entries.map(([, value]) => value);
+        values.push(user.id, reservationId);
+        await client.query(
+          `UPDATE banquet_reservations SET ${entries.map(([column], index) => `${column} = $${index + 1}`).join(", ")},
+           reservation_revision = reservation_revision + 1, preorder_printed_at = NULL,
+           updated_by = $${entries.length + 1}, updated_at = now() WHERE id = $${entries.length + 2}`, values
+        );
+        await logOperation(client, user.id, "UPDATE_BANQUET_RESERVATION", reservationId, changes);
       }
       return { reservation: await reservationDetails(client, reservationId) };
     });
+    draftBroadcaster?.(reservationId);
     res.json(response);
   } catch (error) { publicError(res, error); }
 });
@@ -692,7 +711,7 @@ banquetRouter.put("/reservations/:reservationId/preorder", async (req: Authentic
     const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
     if (rawItems.length > 300) reject("预点菜数量过多");
     const reservation = await withTransaction(async (client) => {
-      const current = await client.query<{ status: BanquetState }>(`SELECT status FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]);
+      const current = await client.query<{ status: BanquetState; table_count: number; draft_lines: Array<Record<string, unknown>> }>(`SELECT status, table_count, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]);
       if (!current.rows[0]) reject("宴席预定不存在", 404);
       if (current.rows[0].status !== "RESERVED") reject("只有待办预定可以修改预点菜", 409);
       const snapshot: Array<Record<string, unknown>> = [];
@@ -715,8 +734,9 @@ banquetRouter.put("/reservations/:reservationId/preorder", async (req: Authentic
           priceFen: dish.price_fen, costFen: dish.cost_fen, pointsEarningEnabled: dish.points_earning_enabled !== false,
           quantity, note: options.note, optionSnapshot: options.snapshot
         });
-        assertPreorderFitsPostgresInteger(snapshot);
+        assertPreorderFitsPostgresInteger(snapshot, current.rows[0].table_count);
       }
+      assertReservationTotal(snapshot, current.rows[0].draft_lines, current.rows[0].table_count);
       await client.query(`UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_revision = preorder_revision + 1, preorder_printed_at = NULL, updated_by = $2, updated_at = now() WHERE id = $3`, [JSON.stringify(snapshot), user.id, reservationId]);
       await logOperation(client, user.id, "SAVE_BANQUET_PREORDER", reservationId, { itemCount: snapshot.length });
       return reservationDetails(client, reservationId);
@@ -736,8 +756,8 @@ banquetRouter.post("/reservations/:reservationId/preorder/items", async (req: Au
     if (!useDraft && !submittedItems.length) reject("请先选择菜品");
     if (submittedItems.length > 300) reject("本次预点菜数量过多");
     const result = await withTransaction(async (client) => idempotent(client, `preorder-add:${reservationId}`, key, user.id, payload, async () => {
-      const current = await client.query<{ status: BanquetState; preorder: Array<Record<string, unknown>>; draft_lines: Array<Record<string, unknown>> }>(
-        `SELECT status, preorder, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
+      const current = await client.query<{ status: BanquetState; table_count: number; preorder: Array<Record<string, unknown>>; draft_lines: Array<Record<string, unknown>> }>(
+        `SELECT status, table_count, preorder, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`, [reservationId]
       );
       if (!current.rows[0]) reject("宴席预定不存在", 404);
       if (current.rows[0].status !== "RESERVED") reject("该宴席已经开台或取消，不能继续预点菜", 409);
@@ -763,8 +783,9 @@ banquetRouter.post("/reservations/:reservationId/preorder/items", async (req: Au
           priceFen: dish.price_fen, costFen: dish.cost_fen, pointsEarningEnabled: dish.points_earning_enabled !== false,
           quantity, note: options.note, optionSnapshot: options.snapshot
         });
-        assertPreorderFitsPostgresInteger(snapshot);
+        assertPreorderFitsPostgresInteger(snapshot, current.rows[0].table_count);
       }
+      assertReservationTotal(snapshot, useDraft ? [] : current.rows[0].draft_lines, current.rows[0].table_count);
       await client.query(
         `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_revision = preorder_revision + 1, preorder_printed_at = NULL,
          draft_lines = CASE WHEN $4 THEN '[]'::jsonb ELSE draft_lines END,
@@ -792,10 +813,10 @@ banquetRouter.post("/reservations/:reservationId/preorder/edit", async (req: Aut
     const useDraft = payload.useDraft === true;
     const result = await withTransaction(async (client) => idempotent(client, `preorder-edit:${reservationId}`, key, user.id, payload, async () => {
       const current = await client.query<{
-        status: BanquetState; preorder: Array<Record<string, unknown>>; preorder_revision: number;
-        draft_lines: unknown;
+        status: BanquetState; table_count: number; preorder: Array<Record<string, unknown>>; preorder_revision: number;
+        draft_lines: Array<Record<string, unknown>>;
       }>(
-        `SELECT status, preorder, preorder_revision, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`,
+        `SELECT status, table_count, preorder, preorder_revision, draft_lines FROM banquet_reservations WHERE id = $1 FOR UPDATE`,
         [reservationId]
       );
       const reservation = current.rows[0];
@@ -814,7 +835,7 @@ banquetRouter.post("/reservations/:reservationId/preorder/edit", async (req: Aut
         retained.push({ ...previous[index], quantity: positiveInt(entry.quantity, "菜品数量", 100_000) });
       }
       const snapshot = await appendDraftPreorderItems(client, retained, useDraft ? reservation.draft_lines : []);
-      assertPreorderFitsPostgresInteger(snapshot);
+      assertReservationTotal(snapshot, useDraft ? [] : reservation.draft_lines, reservation.table_count);
       await client.query(
         `UPDATE banquet_reservations SET preorder = $1::jsonb, preorder_revision = preorder_revision + 1,
          preorder_printed_at = NULL,
@@ -924,24 +945,24 @@ async function convertReservationToOrder(client: DbClient, reservationId: string
       const customerId = phone ? await findOrCreateCustomer(client, phone, reservation.customer_name || null) : null;
       const orderResult = await client.query<{ id: string }>(
         `INSERT INTO orders
-         (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, created_by, order_note, points_earning_enabled)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+         (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, created_by, order_note, points_earning_enabled, banquet_table_count)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
         [reservation.table_id, reservation.table_number, reservation.table_name, customerId,
           customerId ? null : (reservation.customer_name || "宴席客人"), reservation.people_count, employeeId,
-          `宴席预定 ${reservationId}`, reservation.points_earning_enabled]
+          reservation.note, reservation.points_earning_enabled, reservation.table_count]
       );
       const orderId = orderResult.rows[0].id;
       if (Array.isArray(reservation.draft_lines) && reservation.draft_lines.length) {
         await client.query(
           `UPDATE orders SET draft_lines = $1::jsonb, draft_revision = 1 WHERE id = $2`,
-          [JSON.stringify(reservation.draft_lines), orderId]
+          [JSON.stringify(reservation.draft_lines.map((line) => ({ ...line, quantity: banquetQuantity(line.quantity, reservation.table_count) }))), orderId]
         );
       }
       if (reservation.table_id) {
         await client.query(`UPDATE restaurant_tables SET status = 'OCCUPIED', updated_at = now() WHERE id = $1`, [reservation.table_id]);
       }
       const preorder = Array.isArray(reservation.preorder) ? reservation.preorder : [];
-      assertPreorderFitsPostgresInteger(preorder);
+      assertReservationTotal(preorder, reservation.draft_lines, reservation.table_count);
       if (preorder.length) {
         const batch = await client.query<{ id: string }>(
           `INSERT INTO order_batches (order_id, batch_no, kind, created_by) VALUES ($1, 1, 'INITIAL', $2) RETURNING id`, [orderId, employeeId]
@@ -952,7 +973,7 @@ async function convertReservationToOrder(client: DbClient, reservationId: string
              (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, points_earning_enabled, quantity, note, option_snapshot)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)`,
             [batch.rows[0].id, orderId, item.dishId, item.name, item.categoryName || "未分类", item.unit || "份", item.priceFen,
-              item.costFen || 0, item.pointsEarningEnabled !== false, item.quantity, item.note || "", JSON.stringify(item.optionSnapshot || [])]
+              item.costFen || 0, item.pointsEarningEnabled !== false, banquetQuantity(item.quantity, reservation.table_count), item.note || "", JSON.stringify(item.optionSnapshot || [])]
           );
         }
         await client.query(`UPDATE orders SET order_version = 1, updated_at = now() WHERE id = $1`, [orderId]);

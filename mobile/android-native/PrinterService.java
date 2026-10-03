@@ -320,6 +320,14 @@ public class PrinterService extends Service {
             line(output, table);
             command(output, 0x1D, 0x21, 0x00);
         }
+        int banquetTableCount = payload.optInt("banquetTableCount", 0);
+        if (banquetTableCount > 0) {
+            command(output, 0x1B, 0x61, 0x01);
+            command(output, 0x1D, 0x21, 0x11);
+            line(output, "宴席共 " + banquetTableCount + " 桌");
+            command(output, 0x1D, 0x21, 0x00);
+            if (!receipt) line(output, payload.optBoolean("banquetPerTable", false) ? "以下菜量为每桌用量" : "以下菜量为全部桌合计");
+        }
         command(output, 0x1B, 0x61, 0x00);
         line(output, "人数：" + payload.optInt("peopleCount", 0) + "    顾客：" + payload.optString("customer", "散客"));
         if (payload.has("batchNo")) line(output, "批次：第 " + payload.optInt("batchNo") + " 批");

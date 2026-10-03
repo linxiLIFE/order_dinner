@@ -9,7 +9,7 @@ type PreorderLine = {
 type DepositLedgerLine = { id: string; kind: "RECEIVE" | "REFUND" | "APPLY" | "RESTORE"; amount_fen: number; payment_method: string; note: string; created_at: string };
 type BanquetReservation = {
   id: string; table_id: string | null; table_name: string; table_number: number | null; table_seats: number | null;
-  starts_at: string; ends_at: string; customer_name: string; customer_phone: string | null; people_count: number;
+  starts_at: string; ends_at: string; customer_name: string; customer_phone: string | null; people_count: number; table_count: number; reservation_revision: number;
   points_earning_enabled: boolean; status: "RESERVED" | "CANCELLED" | "CONVERTED" | "EXPIRED"; preorder: PreorderLine[];
   draft_lines?: Array<{ quantity: number }>;
   draft_count?: number;
@@ -103,11 +103,15 @@ export function BanquetPage({ onOpenOrder, onPreorder, setMessage, canManageHall
   const [customerName, setCustomerName] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [peopleCount, setPeopleCount] = useState("10");
+  const [tableCount, setTableCount] = useState("1");
   const [pointsEarningEnabled, setPointsEarningEnabled] = useState(true);
   const [bookingNote, setBookingNote] = useState("");
   const createRequestScope = useRef(`banquet:create:${crypto.randomUUID()}`);
-  const [editPeriod, setEditPeriod] = useState({ startsAt: "", endsAt: "" });
-  const [editNote, setEditNote] = useState("");
+  const [editBooking, setEditBooking] = useState<{
+    id: string; expectedRevision: number; tableId: string; startsAt: string; endsAt: string;
+    customerName: string; customerPhone: string; peopleCount: string; tableCount: string;
+    pointsEarningEnabled: boolean; note: string;
+  } | null>(null);
   const [cancelConfirm, setCancelConfirm] = useState(false);
   const [preorderPrintOpen, setPreorderPrintOpen] = useState(false);
   const [preorderPrintCopies, setPreorderPrintCopies] = useState("2");
@@ -211,8 +215,6 @@ export function BanquetPage({ onOpenOrder, onPreorder, setMessage, canManageHall
       const result = await api<{ reservation: BanquetReservation }>(`/api/banquets/reservations/${id}`);
       if (requestSequence !== detailRequestSequence.current) return false;
       setDetail(result.reservation);
-      setEditPeriod({ startsAt: businessDateTime(new Date(result.reservation.starts_at)), endsAt: businessDateTime(new Date(result.reservation.ends_at)) });
-      setEditNote(result.reservation.note || "");
       setCancelConfirm(false);
       return true;
     } catch (error) {
@@ -227,9 +229,9 @@ export function BanquetPage({ onOpenOrder, onPreorder, setMessage, canManageHall
       if (!tableId) throw new Error("请选择桌台");
       const startsAt = toIso(period.startsAt); const endsAt = toIso(period.endsAt);
       if (new Date(endsAt) <= new Date(startsAt)) throw new Error("结束时间必须晚于开始时间");
-      const payload = { tableId, startsAt, endsAt, customerName: customerName.trim(), customerPhone: customerPhone.trim(), peopleCount: Number(peopleCount), pointsEarningEnabled, note: bookingNote.trim() };
+      const payload = { tableId, startsAt, endsAt, customerName: customerName.trim(), customerPhone: customerPhone.trim(), peopleCount: Number(peopleCount), tableCount: Number(tableCount), pointsEarningEnabled, note: bookingNote.trim() };
       const created = await idempotentApi<{ reservation: BanquetReservation }>("/api/banquets/reservations", createRequestScope.current, payload);
-      setCreateOpen(false); setCustomerName(""); setCustomerPhone(""); setBookingNote(""); setPeriod(defaultPeriod());
+      setCreateOpen(false); setCustomerName(""); setCustomerPhone(""); setBookingNote(""); setPeriod(defaultPeriod()); setTableCount("1");
       setMessage("宴席已添加，到点会自动开台");
       try {
         await loadList();
@@ -248,34 +250,31 @@ export function BanquetPage({ onOpenOrder, onPreorder, setMessage, canManageHall
     } catch (error) { setMessage(errorMessage(error)); } finally { setBusy(false); }
   }
 
-  async function saveReschedule(event: FormEvent) {
-    event.preventDefault(); if (!detail) return; setBusy(true);
-    try {
-      const reservationId = detail.id;
-      const startsAt = toIso(editPeriod.startsAt); const endsAt = toIso(editPeriod.endsAt);
-      await api(`/api/banquets/reservations/${reservationId}`, { method: "PATCH", body: JSON.stringify({ startsAt, endsAt }) });
-      setMessage("宴席时间已修改");
-      try {
-        await loadList();
-        if (!await openDetail(reservationId)) setMessage("宴席时间已修改，但详情刷新失败，请稍后刷新");
-      } catch {
-        setMessage("宴席时间已修改，但列表刷新失败，请稍后刷新");
-      }
-    } catch (error) { setMessage(errorMessage(error)); } finally { setBusy(false); }
+  function editReservation() {
+    if (!detail) return;
+    setEditBooking({ id: detail.id, expectedRevision: detail.reservation_revision,
+      tableId: detail.table_id || "", startsAt: businessDateTime(new Date(detail.starts_at)),
+      endsAt: businessDateTime(new Date(detail.ends_at)), customerName: detail.customer_name,
+      customerPhone: detail.customer_phone || "", peopleCount: String(detail.people_count),
+      tableCount: String(detail.table_count || 1), pointsEarningEnabled: detail.points_earning_enabled,
+      note: detail.note || "" });
   }
 
-  async function saveReservationNote(event: FormEvent) {
-    event.preventDefault(); if (!detail) return; setBusy(true);
+  async function saveReservation(event: FormEvent) {
+    event.preventDefault(); if (!editBooking) return; setBusy(true);
     try {
-      const reservationId = detail.id;
-      await api(`/api/banquets/reservations/${reservationId}`, { method: "PATCH", body: JSON.stringify({ note: editNote.trim() }) });
-      setMessage("宴席备注已修改");
+      const reservationId = editBooking.id;
+      await api(`/api/banquets/reservations/${reservationId}`, { method: "PATCH", body: JSON.stringify({
+        ...editBooking, tableId: editBooking.tableId || undefined,
+        startsAt: toIso(editBooking.startsAt), endsAt: toIso(editBooking.endsAt),
+        peopleCount: Number(editBooking.peopleCount), tableCount: Number(editBooking.tableCount)
+      }) });
+      setEditBooking(null);
+      setMessage("宴席信息已修改，请按最新信息打印备菜单");
       try {
         await loadList();
-        if (!await openDetail(reservationId)) setMessage("宴席备注已修改，但详情刷新失败，请稍后刷新");
-      } catch {
-        setMessage("宴席备注已修改，但列表刷新失败，请稍后刷新");
-      }
+        if (!await openDetail(reservationId)) setMessage("宴席已修改，但详情刷新失败，请稍后刷新");
+      } catch { setMessage("宴席已修改，但列表刷新失败，请稍后刷新"); }
     } catch (error) { setMessage(errorMessage(error)); } finally { setBusy(false); }
   }
 
@@ -283,7 +282,7 @@ export function BanquetPage({ onOpenOrder, onPreorder, setMessage, canManageHall
     if (!detail) return; setBusy(true);
     try {
       const reservationId = detail.id;
-      await api(`/api/banquets/reservations/${reservationId}`, { method: "PATCH", body: JSON.stringify({ status: "CANCELLED" }) });
+      await api(`/api/banquets/reservations/${reservationId}`, { method: "PATCH", body: JSON.stringify({ status: "CANCELLED", expectedRevision: detail.reservation_revision }) });
       setMessage("宴席已取消，定金需单独退款");
       try {
         await loadList();
@@ -352,19 +351,32 @@ export function BanquetPage({ onOpenOrder, onPreorder, setMessage, canManageHall
     <div className="metric-grid banquet-metrics"><div className="metric-card"><span>当前结果</span><strong>{counts.all}</strong></div><div className="metric-card"><span>待开台</span><strong>{counts.waiting}</strong></div><div className="metric-card"><span>已开台</span><strong>{counts.opened}</strong></div><div className="metric-card"><span>预计人数</span><strong>{counts.people}</strong></div></div>
     {tableFilterId && <div className="banquet-table-filter"><span>当前只看：{tables.find((table) => table.id === tableFilterId)?.name || "本桌"}</span><button type="button" className="text-button" onClick={() => setTableFilterId("")}>查看全部宴席</button></div>}
     <div className="content-card banquet-filter-card"><form className="filter-grid" onSubmit={(event) => void applyFilters(event)}><label>开始日期<input type="date" value={filters.from} onChange={(event) => setFilters({ ...filters, from: event.target.value })} /></label><label>结束日期<input type="date" value={filters.to} onChange={(event) => setFilters({ ...filters, to: event.target.value })} /></label><label>状态<select value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}><option value="">全部</option><option value="RESERVED">待开台</option><option value="CONVERTED">已开台</option><option value="CANCELLED">已取消</option><option value="EXPIRED">已过期未开台</option></select></label><label>搜索<input value={filters.q} onChange={(event) => setFilters({ ...filters, q: event.target.value })} placeholder="姓名、手机、桌台、备注" /></label><div className="filter-actions"><button className="primary" disabled={busy}>筛选</button><button type="button" className="secondary" onClick={() => { const next = defaultFilters(); appliedFilters.current = next; setFilters(next); void loadList(next); }}>重置</button></div></form></div>
-    <div className="content-card banquet-list-card">{filteredReservations.length ? <div className="banquet-list">{filteredReservations.map((row) => <div className="banquet-row-entry" key={row.id}><button type="button" className="banquet-row" onClick={() => void openDetail(row.id)}><div className="banquet-row-time"><strong>{displayDate(row.starts_at)}</strong><span>至 {displayDate(row.ends_at)}</span></div><div><strong>{row.customer_name || "未填写姓名"}</strong><span>{row.customer_phone || "未填写手机"} · {row.people_count}人</span></div><div><strong>{row.table_name}{row.table_number ? ` · ${row.table_number}号桌` : ""}</strong><span>预点 {(row.preorder?.length || 0) + (row.draft_count || 0)} 项 · 定金 {money(row.deposit_balance_fen)}</span></div><span className={row.status === "RESERVED" ? "status-pill green" : "status-pill gray"}>{statusLabel(row)}</span><span className="banquet-detail-link">查看详情 ›</span></button>{canDeleteRecords && <button type="button" className="text-button danger-text banquet-delete-button" onClick={() => setDeleteTarget(row)}>永久删除</button>}</div>)}</div> : <div className="empty">没有符合条件的宴席</div>}</div>
+    <div className="content-card banquet-list-card">{filteredReservations.length ? <div className="banquet-list">{filteredReservations.map((row) => <div className="banquet-row-entry" key={row.id}><button type="button" className="banquet-row" onClick={() => void openDetail(row.id)}><div className="banquet-row-time"><strong>{displayDate(row.starts_at)}</strong><span>至 {displayDate(row.ends_at)}</span></div><div><strong>{row.customer_name || "未填写姓名"}</strong><span>{row.customer_phone || "未填写手机"} · {row.table_count || 1}桌 · {row.people_count}人</span></div><div><strong>{row.table_name}{row.table_number ? ` · ${row.table_number}号桌` : ""}</strong><span>预点 {(row.preorder?.length || 0) + (row.draft_count || 0)} 项 · 定金 {money(row.deposit_balance_fen)}</span></div><span className={row.status === "RESERVED" ? "status-pill green" : "status-pill gray"}>{statusLabel(row)}</span><span className="banquet-detail-link">查看详情 ›</span></button>{canDeleteRecords && <button type="button" className="text-button danger-text banquet-delete-button" onClick={() => setDeleteTarget(row)}>永久删除</button>}</div>)}</div> : <div className="empty">没有符合条件的宴席</div>}</div>
 
-    {createOpen && <Modal title="添加宴席" onClose={() => setCreateOpen(false)} className="large-modal"><form className="form-grid" onSubmit={(event) => void createReservation(event)}><label>桌台<select value={tableId} onChange={(event) => setTableId(event.target.value)} required><option value="">请选择桌台</option>{availableTables.map((table) => <option key={table.id} value={table.id}>{table.name}（{table.number}号桌，{table.seats}人桌）{table.reservationCount ? ` · 已有${table.reservationCount}条预定` : ""}</option>)}</select></label><label>开始时间<input type="datetime-local" value={period.startsAt} onChange={(event) => setPeriod({ ...period, startsAt: event.target.value })} required /></label><label>结束时间<input type="datetime-local" value={period.endsAt} onChange={(event) => setPeriod({ ...period, endsAt: event.target.value })} required /></label><label>预订人<input value={customerName} onChange={(event) => setCustomerName(event.target.value)} maxLength={120} /></label><label>手机号<input inputMode="tel" value={customerPhone} onChange={(event) => setCustomerPhone(event.target.value)} /></label><label>人数<input type="number" min="1" value={peopleCount} onChange={(event) => setPeopleCount(event.target.value)} required /></label><label>备注<input value={bookingNote} onChange={(event) => setBookingNote(event.target.value)} maxLength={500} /></label><label className="toggle-row"><input type="checkbox" checked={pointsEarningEnabled} onChange={(event) => setPointsEarningEnabled(event.target.checked)} />宴席累计积分</label><p className="muted form-wide">保存后可在详情中预点菜或立即开台；未手动开台时，到开始时间自动开台。</p><div className="modal-actions form-wide"><button type="button" className="secondary" onClick={() => setCreateOpen(false)}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中…" : "保存宴席"}</button></div></form></Modal>}
+    {createOpen && <Modal title="添加宴席" onClose={() => setCreateOpen(false)} className="large-modal"><form className="form-grid" onSubmit={(event) => void createReservation(event)}><label>桌台<select value={tableId} onChange={(event) => setTableId(event.target.value)} required><option value="">请选择桌台</option>{availableTables.map((table) => <option key={table.id} value={table.id}>{table.name}（{table.number}号桌，{table.seats}人桌）{table.reservationCount ? ` · 已有${table.reservationCount}条预定` : ""}</option>)}</select></label><label>开始时间<input type="datetime-local" value={period.startsAt} onChange={(event) => setPeriod({ ...period, startsAt: event.target.value })} required /></label><label>结束时间<input type="datetime-local" value={period.endsAt} onChange={(event) => setPeriod({ ...period, endsAt: event.target.value })} required /></label><label>预订人<input value={customerName} onChange={(event) => setCustomerName(event.target.value)} maxLength={120} /></label><label>手机号<input inputMode="tel" value={customerPhone} onChange={(event) => setCustomerPhone(event.target.value)} /></label><label>宴席桌数<input type="number" min="1" max="1000" step="1" value={tableCount} onChange={(event) => setTableCount(event.target.value)} required /></label><label>总人数<input type="number" min="1" max="100000" step="1" value={peopleCount} onChange={(event) => setPeopleCount(event.target.value)} required /></label><label>备注<input value={bookingNote} onChange={(event) => setBookingNote(event.target.value)} maxLength={500} /></label><label className="toggle-row"><input type="checkbox" checked={pointsEarningEnabled} onChange={(event) => setPointsEarningEnabled(event.target.checked)} />宴席累计积分</label><p className="muted form-wide">预点菜只配置一桌，开台时按桌数计算全部菜量和金额。保存后可修改预定信息，到开始时间自动开台。</p><div className="modal-actions form-wide"><button type="button" className="secondary" onClick={() => setCreateOpen(false)}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中…" : "保存宴席"}</button></div></form></Modal>}
 
-    {detail && <Modal title={`${detail.customer_name || "未填写姓名"} · ${detail.table_name}`} onClose={() => { activeDetailId.current = ""; detailRequestSequence.current += 1; setDetail(null); }} className="banquet-detail-modal"><div className="detail-summary"><div><span>时间</span><strong>{displayDate(detail.starts_at)}<br />至 {displayDate(detail.ends_at)}</strong></div><div><span>人数与联系</span><strong>{detail.people_count}人<br />{detail.customer_phone || "未填写手机"}</strong></div><div><span>状态</span><strong>{statusLabel(detail)}</strong></div><div><span>可抵定金</span><strong>{money(detail.deposit_balance_fen)}</strong></div></div>{detail.note && <p className="order-note"><span>备注：</span>{detail.note}</p>}
-      {detail.status === "RESERVED" && <form className="content-card banquet-note-edit-card" onSubmit={(event) => void saveReservationNote(event)}><label>宴席备注<input value={editNote} onChange={(event) => setEditNote(event.target.value)} maxLength={500} placeholder="可填写宴席要求或接待提醒" /></label><button className="secondary" disabled={busy || editNote.trim() === (detail.note || "")}>保存备注</button></form>}
-      {detail.status === "RESERVED" && <div className="banquet-action-grid"><div className="content-card banquet-preorder-entry"><h3>预点菜</h3><p className="muted">已确认 {detail.preorder?.length || 0} 项，待确认 {detail.draft_lines?.length || 0} 项。可调整数量、删除已保留菜品或继续添加。</p><div className="banquet-preorder-actions"><button type="button" className="primary wide" onClick={() => onPreorder(detail.id)}>{detail.preorder?.length ? "修改预点菜" : "预点菜"}</button>{Boolean((detail.preorder?.length || 0) + (detail.draft_lines?.length || 0)) && <button type="button" className="secondary wide" disabled={busy} onClick={() => { setPreorderPrintCopies("2"); setPreorderPrintError(""); setPreorderPrintOpen(true); }}>提前打印备菜单</button>}</div></div><div className="content-card"><h3>开台</h3><p className="muted">开台只保留菜品，不自动打印。员工进入桌台核对或加菜后再打印备菜单。</p><button type="button" className="primary wide" disabled={busy || !detail.table_id} onClick={() => void convertToOrder()}>现在开台</button></div></div>}
+    {detail && <Modal title={`${detail.customer_name || "未填写姓名"} · ${detail.table_name}`} onClose={() => { activeDetailId.current = ""; detailRequestSequence.current += 1; setDetail(null); }} className="banquet-detail-modal"><div className="detail-summary"><div><span>时间</span><strong>{displayDate(detail.starts_at)}<br />至 {displayDate(detail.ends_at)}</strong></div><div><span>桌数、人数与联系</span><strong>{detail.table_count || 1}桌 · {detail.people_count}人<br />{detail.customer_phone || "未填写手机"}</strong></div><div><span>状态</span><strong>{statusLabel(detail)}</strong></div><div><span>可抵定金</span><strong>{money(detail.deposit_balance_fen)}</strong></div></div>{detail.note && <p className="order-note"><span>备注：</span>{detail.note}</p>}
+      {detail.status === "RESERVED" && <div className="banquet-record-actions"><button type="button" className="secondary" disabled={busy} onClick={editReservation}>修改预定信息</button></div>}
+      {detail.status === "RESERVED" && <div className="banquet-action-grid"><div className="content-card banquet-preorder-entry"><h3>预点菜</h3><p className="muted">共 {detail.table_count || 1} 桌，预点菜按每桌配置。已确认 {detail.preorder?.length || 0} 项，待确认 {detail.draft_lines?.length || 0} 项。可调整、删除或添加菜品。</p><div className="banquet-preorder-actions"><button type="button" className="primary wide" onClick={() => onPreorder(detail.id)}>{detail.preorder?.length ? "修改预点菜" : "预点菜"}</button>{Boolean((detail.preorder?.length || 0) + (detail.draft_lines?.length || 0)) && <button type="button" className="secondary wide" disabled={busy} onClick={() => { setPreorderPrintCopies("2"); setPreorderPrintError(""); setPreorderPrintOpen(true); }}>提前打印备菜单</button>}</div></div><div className="content-card"><h3>开台</h3><p className="muted">开台只保留菜品，不自动打印。员工进入桌台核对或加菜后再打印备菜单。</p><button type="button" className="primary wide" disabled={busy || !detail.table_id} onClick={() => void convertToOrder()}>现在开台</button></div></div>}
       {detail.status === "CONVERTED" && <div className="content-card"><h3>宴席已开台</h3><p className="muted">预点菜已进入正式订单，可继续点菜、打印和结账。</p><button type="button" className="primary" disabled={!detail.order_id} onClick={() => detail.order_id && onOpenOrder(detail.order_id)}>打开宴席账单</button></div>}
       {canDeleteRecords && <div className="banquet-record-actions"><button type="button" className="danger-button" disabled={busy} onClick={() => setDeleteTarget(detail)}>永久删除此宴席</button></div>}
       <div className="content-card banquet-deposit-card"><h3>定金账本</h3>{canOperateDeposit && <form className="form-grid" onSubmit={(event) => void operateDeposit(event)}><label>操作<select value={depositAction} onChange={(event) => setDepositAction(event.target.value as "receive" | "refund")}><option value="receive" disabled={!canReceiveDeposit}>收取定金</option>{canRefundDeposit && <option value="refund">退还定金</option>}</select></label><label>金额（元）<input inputMode="decimal" value={depositAmount} onChange={(event) => setDepositAmount(event.target.value)} required /></label><label>方式<select value={depositPaymentMethod} onChange={(event) => setDepositPaymentMethod(event.target.value)}><option>现金</option><option>微信</option><option>支付宝</option><option>银行卡</option><option>其他</option></select></label><label>备注<input value={depositNote} onChange={(event) => setDepositNote(event.target.value)} /></label><button className="secondary" disabled={busy}>确认记账</button></form>}{!canReceiveDeposit && detail.status === "CONVERTED" && detail.order_status !== "OPEN" && <p className="muted">关联账单已结束，不能再收取定金。</p>}{!canReceiveDeposit && detail.status === "EXPIRED" && <p className="muted">宴席已过期，不能再收取定金。</p>}{detail.deposit_ledger?.length ? <div className="employee-list">{detail.deposit_ledger.map((entry) => <div className="employee-row" key={entry.id}><div><strong>{({ RECEIVE: "收定金", REFUND: "退定金", APPLY: "结账抵扣", RESTORE: "撤销恢复" } as const)[entry.kind]}</strong><span>{displayDate(entry.created_at)} · {entry.note || entry.payment_method}</span></div><span>{entry.kind === "REFUND" || entry.kind === "APPLY" ? "−" : "+"}{money(entry.amount_fen)}</span></div>)}</div> : <div className="empty">暂无定金记录</div>}</div>
-      {detail.status === "RESERVED" && <div className="content-card banquet-reschedule-card"><div className="banquet-reschedule-heading"><div><h3>改期或取消</h3><p className="muted">未开台前可调整宴席时间；取消后该桌台时段立即释放。</p></div><span className="banquet-section-kicker">预定管理</span></div><form className="banquet-reschedule-form" onSubmit={(event) => void saveReschedule(event)}><label>开始时间<input type="datetime-local" value={editPeriod.startsAt} onChange={(event) => setEditPeriod({ ...editPeriod, startsAt: event.target.value })} /></label><label>结束时间<input type="datetime-local" value={editPeriod.endsAt} onChange={(event) => setEditPeriod({ ...editPeriod, endsAt: event.target.value })} /></label><button className="secondary" disabled={busy}>保存改期</button></form><div className="banquet-cancel-area">{cancelConfirm ? <><span>取消后不能恢复，请确认。</span><div className="modal-actions"><button type="button" className="secondary" onClick={() => setCancelConfirm(false)}>返回</button><button type="button" className="danger-button" disabled={busy} onClick={() => void cancelReservation()}>确认取消</button></div></> : <><span>如不再需要此宴席，可释放预定时段。</span><button type="button" className="text-button danger-text" onClick={() => setCancelConfirm(true)}>取消宴席</button></>}</div></div>}
+      {detail.status === "RESERVED" && <div className="content-card banquet-reschedule-card"><h3>取消宴席</h3><div className="banquet-cancel-area">{cancelConfirm ? <><span>取消后不能恢复，请确认。</span><div className="modal-actions"><button type="button" className="secondary" onClick={() => setCancelConfirm(false)}>返回</button><button type="button" className="danger-button" disabled={busy} onClick={() => void cancelReservation()}>确认取消</button></div></> : <><span>如不再需要此宴席，可释放预定时段。</span><button type="button" className="text-button danger-text" onClick={() => setCancelConfirm(true)}>取消宴席</button></>}</div></div>}
     </Modal>}
-    {detail && preorderPrintOpen && <Modal title="提前打印宴席备菜单" onClose={() => setPreorderPrintOpen(false)} className="confirm-modal"><p className="muted">打印当前 {(detail.preorder?.length || 0) + (detail.draft_lines?.length || 0)} 项预点菜。</p><form onSubmit={(event) => void printPreorder(event)} noValidate><label>打印份数<input type="number" min="0" max="20" step="1" value={preorderPrintCopies} onChange={(event) => setPreorderPrintCopies(event.target.value)} autoFocus disabled={busy} /><small>填 0 将只保留预点菜，不生成打印任务。</small></label>{preorderPrintError && <div className="message error">{preorderPrintError}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={() => setPreorderPrintOpen(false)} disabled={busy}>返回</button><button type="submit" className="primary" disabled={busy}>{busy ? "生成中…" : "确认"}</button></div></form></Modal>}
+    {editBooking && <Modal title="修改宴席预定" onClose={() => !busy && setEditBooking(null)} className="large-modal"><form className="form-grid" onSubmit={(event) => void saveReservation(event)}>
+      <label>桌台<select value={editBooking.tableId} onChange={(event) => setEditBooking({ ...editBooking, tableId: event.target.value })} required={Boolean(detail?.table_id)}><option value="">{detail?.table_id ? "请选择桌台" : "保留原宴会厅"}</option>{availableTables.map((table) => <option key={table.id} value={table.id}>{table.name}（{table.number}号桌）</option>)}</select></label>
+      <label>宴席桌数<input type="number" min="1" max="1000" step="1" value={editBooking.tableCount} onChange={(event) => setEditBooking({ ...editBooking, tableCount: event.target.value })} required /></label>
+      <label>开始时间<input type="datetime-local" value={editBooking.startsAt} onChange={(event) => setEditBooking({ ...editBooking, startsAt: event.target.value })} required /></label>
+      <label>结束时间<input type="datetime-local" value={editBooking.endsAt} onChange={(event) => setEditBooking({ ...editBooking, endsAt: event.target.value })} required /></label>
+      <label>预订人<input value={editBooking.customerName} onChange={(event) => setEditBooking({ ...editBooking, customerName: event.target.value })} maxLength={120} /></label>
+      <label>手机号<input inputMode="tel" value={editBooking.customerPhone} onChange={(event) => setEditBooking({ ...editBooking, customerPhone: event.target.value })} /></label>
+      <label>总人数<input type="number" min="1" max="100000" step="1" value={editBooking.peopleCount} onChange={(event) => setEditBooking({ ...editBooking, peopleCount: event.target.value })} required /></label>
+      <label>备注<input value={editBooking.note} onChange={(event) => setEditBooking({ ...editBooking, note: event.target.value })} maxLength={500} /></label>
+      <label className="toggle-row"><input type="checkbox" checked={editBooking.pointsEarningEnabled} onChange={(event) => setEditBooking({ ...editBooking, pointsEarningEnabled: event.target.checked })} />宴席累计积分</label>
+      <p className="muted form-wide">修改桌数后，每桌预点菜保持原配置，总菜量和金额随桌数重新计算。</p>
+      <div className="modal-actions form-wide"><button type="button" className="secondary" disabled={busy} onClick={() => setEditBooking(null)}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中…" : "保存修改"}</button></div>
+    </form></Modal>}
+    {detail && preorderPrintOpen && <Modal title="提前打印宴席备菜单" onClose={() => setPreorderPrintOpen(false)} className="confirm-modal"><p className="muted">宴席共 {detail.table_count || 1} 桌；打印一桌的菜量，共 {(detail.preorder?.length || 0) + (detail.draft_lines?.length || 0)} 项。</p><form onSubmit={(event) => void printPreorder(event)} noValidate><label>打印份数<input type="number" min="0" max="20" step="1" value={preorderPrintCopies} onChange={(event) => setPreorderPrintCopies(event.target.value)} autoFocus disabled={busy} /><small>填 0 将只保留预点菜，不生成打印任务。</small></label>{preorderPrintError && <div className="message error">{preorderPrintError}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={() => setPreorderPrintOpen(false)} disabled={busy}>返回</button><button type="submit" className="primary" disabled={busy}>{busy ? "生成中…" : "确认"}</button></div></form></Modal>}
     {deleteTarget && <Modal title="永久删除宴席预定" onClose={() => !busy && setDeleteTarget(null)} className="confirm-modal"><p className="muted">此操作无法恢复。系统会删除宴席预定和定金账本；如果已经开台，还会一并永久删除关联订单、结账、积分流水和打印记录，并释放桌台。</p><div className="modal-actions"><button type="button" className="secondary" onClick={() => setDeleteTarget(null)} disabled={busy}>返回</button><button type="button" className="danger-button" onClick={() => void permanentlyDeleteReservation()} disabled={busy}>{busy ? "删除中…" : "确认永久删除"}</button></div></Modal>}
   </section>;
 }

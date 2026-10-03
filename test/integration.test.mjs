@@ -526,7 +526,7 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   const startsAt = new Date(Date.now() + 86_400_000).toISOString();
   const endsAt = new Date(Date.now() + 93_600_000).toISOString();
   const reservationCreated = await request("/api/banquets/reservations", { token: ownerToken,
-    body: { tableId: banquetTable.body.tableId, startsAt, endsAt, peopleCount: 6,
+    body: { tableId: banquetTable.body.tableId, startsAt, endsAt, peopleCount: 6, tableCount: 3,
       customerName: "预点草稿测试", idempotencyKey: randomUUID() } });
   assert.equal(reservationCreated.status, 201, JSON.stringify(reservationCreated.body));
   const reservationId = reservationCreated.body.reservation.id;
@@ -548,6 +548,28 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   assert.equal(confirmedPreorder.body.reservation.draft_lines.length, 0);
   const preorderPrintCount = await appPool.query(`SELECT COUNT(*)::int AS count FROM print_jobs WHERE payload->>'reservationId' = $1`, [reservationId]);
   assert.equal(preorderPrintCount.rows[0].count, 0);
+  const editedReservation = await request(`/api/banquets/reservations/${reservationId}`, { method: "PATCH", token: ownerToken,
+    body: { customerName: "八桌宴席", customerPhone: "13812345678", peopleCount: 80, tableCount: 8,
+      pointsEarningEnabled: false, note: "先上冷菜", expectedRevision: confirmedPreorder.body.reservation.reservation_revision } });
+  assert.equal(editedReservation.status, 200, JSON.stringify(editedReservation.body));
+  assert.equal(editedReservation.body.reservation.table_count, 8);
+  assert.equal(editedReservation.body.reservation.customer_name, "八桌宴席");
+  assert.equal(editedReservation.body.reservation.people_count, 80);
+  assert.equal(editedReservation.body.reservation.points_earning_enabled, false);
+  assert.equal(editedReservation.body.reservation.preorder[0].quantity, 2);
+  const conflictingEdit = await request(`/api/banquets/reservations/${reservationId}`, { method: "PATCH", token: ownerToken,
+    body: { tableCount: 9, expectedRevision: confirmedPreorder.body.reservation.reservation_revision } });
+  assert.equal(conflictingEdit.status, 409);
+  const preprint = await request(`/api/banquets/reservations/${reservationId}/preorder/print`, { token: ownerToken,
+    body: { copies: 1, idempotencyKey: randomUUID() } });
+  assert.equal(preprint.status, 201, JSON.stringify(preprint.body));
+  const preprintJob = await appPool.query(`SELECT payload FROM print_jobs WHERE payload->>'reservationId' = $1`, [reservationId]);
+  assert.equal(preprintJob.rows[0].payload.banquetTableCount, 8);
+  assert.equal(preprintJob.rows[0].payload.items[0].quantity, 2);
+  assert.ok(preprintJob.rows[0].payload.printLines.some((line) => line.text === "宴席共 8 桌" && line.size === "LARGE"));
+  assert.ok(preprintJob.rows[0].payload.printLines.some((line) => line.text === "以下菜量为每桌用量"));
+  const invalidCount = await request(`/api/banquets/reservations/${reservationId}`, { method: "PATCH", token: ownerToken, body: { tableCount: 0 } });
+  assert.equal(invalidCount.status, 400);
   const laterDraft = await request(`/api/banquets/reservations/${reservationId}/draft`, { token: ownerToken,
     body: { op: "adjust", delta: 1, line: draftLine(ownerDish), idempotencyKey: randomUUID() } });
   assert.equal(laterDraft.status, 200);
@@ -555,8 +577,36 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
     body: { idempotencyKey: randomUUID() } });
   assert.equal(converted.status, 201, JSON.stringify(converted.body));
   const convertedOrder = await request(`/api/orders/${converted.body.orderId}`, { token: ownerToken });
-  assert.equal(convertedOrder.body.order.items[0].quantity, 2);
-  assert.equal(convertedOrder.body.order.draftLines[0].quantity, 1);
+  assert.equal(convertedOrder.body.order.items[0].quantity, 16);
+  assert.equal(convertedOrder.body.order.draftLines[0].quantity, 8);
+  assert.equal(convertedOrder.body.order.banquetTableCount, 8);
+  assert.equal(convertedOrder.body.order.totals.grossFen, 16 * ownerDish.price_fen);
+  assert.equal(convertedOrder.body.order.orderNote, "先上冷菜");
+  const repeatedConvert = await request(`/api/banquets/reservations/${reservationId}/convert`, { token: ownerToken, body: { idempotencyKey: randomUUID() } });
+  assert.equal(repeatedConvert.body.orderId, converted.body.orderId);
+  const expandedSubmit = await request(`/api/orders/${converted.body.orderId}/items`, { token: ownerToken,
+    body: { useDraft: true, printCopies: 1, idempotencyKey: randomUUID() } });
+  assert.equal(expandedSubmit.status, 201, JSON.stringify(expandedSubmit.body));
+  assert.equal(expandedSubmit.body.order.totals.grossFen, 24 * ownerDish.price_fen);
+  const banquetKitchen = await appPool.query(`SELECT payload FROM print_jobs WHERE order_id = $1 AND kind = 'KITCHEN'`, [converted.body.orderId]);
+  assert.ok(banquetKitchen.rows[0].payload.printLines.some((line) => line.text === "宴席共 8 桌" && line.size === "LARGE"));
+  assert.ok(banquetKitchen.rows[0].payload.printLines.some((line) => line.text === "以下菜量为全部桌合计"));
+  const banquetDeposit = await request(`/api/banquets/reservations/${reservationId}/deposits/receive`, { token: ownerToken,
+    body: { amountFen: 100, paymentMethod: "现金", idempotencyKey: randomUUID() } });
+  assert.equal(banquetDeposit.status, 201, JSON.stringify(banquetDeposit.body));
+  const banquetCheckout = await request(`/api/orders/${converted.body.orderId}/checkout`, { token: ownerToken,
+    body: { receivedFen: 24 * ownerDish.price_fen - 100, paymentMethod: "现金", usePoints: false, receiptCopies: 1, idempotencyKey: randomUUID() } });
+  assert.equal(banquetCheckout.status, 201, JSON.stringify(banquetCheckout.body));
+  assert.equal(banquetCheckout.body.order.settlements[0].deposit_applied_fen, 100);
+  assert.equal(banquetCheckout.body.order.settlements[0].earned_points, 0);
+  const banquetReceipt = await appPool.query(`SELECT payload FROM print_jobs WHERE order_id = $1 AND kind = 'RECEIPT'`, [converted.body.orderId]);
+  assert.equal(banquetReceipt.rows[0].payload.totals.receivedFen, 24 * ownerDish.price_fen - 100);
+  assert.ok(banquetReceipt.rows[0].payload.printLines.some((line) => line.text === "宴席共 8 桌" && line.size === "LARGE"));
+  const banquetReopened = await request(`/api/orders/${converted.body.orderId}/reopen`, { token: ownerToken, body: { idempotencyKey: randomUUID() } });
+  assert.equal(banquetReopened.status, 200, JSON.stringify(banquetReopened.body));
+  assert.equal(banquetReopened.body.order.banquetTableCount, 8);
+  assert.equal(banquetReopened.body.order.totals.grossFen, 24 * ownerDish.price_fen);
+  assert.equal(banquetReopened.body.order.banquetDepositBalanceFen, 100);
   const cashierOrder = await request(`/api/orders/${currentOrderId}`, { token: cashierLogin.body.token });
   assert.equal(cashierOrder.status, 200);
   assert.equal(Object.hasOwn(cashierOrder.body.order, "grossProfitFen"), false);

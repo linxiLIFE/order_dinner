@@ -1,3 +1,4 @@
+import { banquetPrintNotice } from "./banquet-quantities.js";
 import "dotenv/config";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -378,6 +379,7 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     points_balance: number | null;
     guest_label: string | null;
     people_count: number;
+    banquet_table_count: number | null;
     status: string;
     order_version: number;
     business_date: string;
@@ -459,6 +461,7 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
       ? { id: order.customer_id, name: order.customer_name, phone: maskPhone(order.customer_phone), points: order.points_balance }
       : { id: null, name: order.guest_label || "散客", phone: null, points: 0 },
     peopleCount: order.people_count,
+    banquetTableCount: order.banquet_table_count,
     status: order.status,
     orderVersion: order.order_version,
     businessDate: order.business_date,
@@ -792,6 +795,7 @@ function printOrderPayload(order: Record<string, unknown>, items: Array<Record<s
     tableNumber: order.tableNumber,
     tableName: order.tableName,
     peopleCount: order.peopleCount,
+    banquetTableCount: order.banquetTableCount,
     customer: (order.customer as { name?: string; phone?: string | null } | undefined)?.name || "散客",
     phone: (order.customer as { phone?: string | null } | undefined)?.phone || null,
     orderNote: title === "结账小票" ? "" : text(order.orderNote),
@@ -972,6 +976,11 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     : `${tableName}~${kind === "RETURN" ? "退菜单" : rawTitle.includes("换桌") ? "换桌备菜单" : "备菜单"}${reprintSuffix}`;
   push(title, center, large);
   if (receipt) push(tableName, center, large);
+  const banquetNotice = banquetPrintNotice(payload.banquetTableCount, payload.banquetPerTable === true);
+  if (banquetNotice) {
+    push(banquetNotice.title, center, large);
+    if (!receipt) push(banquetNotice.quantities, center, emphasis);
+  }
   push(`人数：${Number(payload.peopleCount) || 0}    顾客：${stringValue(payload.customer, "散客")}`);
   if (payload.batchNo !== undefined && payload.batchNo !== null) push(`批次：第 ${Number(payload.batchNo) || 0} 批`);
   if (receipt) {
@@ -1867,9 +1876,9 @@ app.post("/api/banquets/reservations/:reservationId/preorder/print", requireAuth
       await commitBanquetDraft(client, reservationId, user.id);
       const reservationResult = await client.query<{
         id: string; status: string; starts_at: string; customer_name: string; customer_phone: string | null;
-        people_count: number; table_name: string; table_number: number | null; note: string; preorder: Array<Record<string, unknown>>;
+        people_count: number; table_count: number; table_name: string; table_number: number | null; note: string; preorder: Array<Record<string, unknown>>;
       }>(
-        `SELECT r.id, r.status, r.starts_at, r.customer_name, r.customer_phone, r.people_count,
+        `SELECT r.id, r.status, r.starts_at, r.customer_name, r.customer_phone, r.people_count, r.table_count,
                 r.note, COALESCE(t.name, h.name, '未指定桌台') AS table_name, t.number AS table_number, r.preorder
          FROM banquet_reservations r
          LEFT JOIN restaurant_tables t ON t.id = r.table_id
@@ -1888,6 +1897,7 @@ app.post("/api/banquets/reservations/:reservationId/preorder/print", requireAuth
           tableNumber: reservation.table_number,
           tableName: reservation.table_name,
           peopleCount: reservation.people_count,
+          banquetTableCount: reservation.table_count,
           customer: { name: reservation.customer_name || "宴席客人", phone: reservation.customer_phone },
           orderNote: reservation.note,
           openedAt: reservation.starts_at,
@@ -1905,7 +1915,7 @@ app.post("/api/banquets/reservations/:reservationId/preorder/print", requireAuth
           null,
           null,
           "KITCHEN",
-          { ...printOrderPayload(details, printItems, "宴席预点菜备菜单"), reservationId },
+          { ...printOrderPayload(details, printItems, "宴席预点菜备菜单"), reservationId, banquetPerTable: true },
           copies
         );
         await client.query(`UPDATE banquet_reservations SET preorder_printed_at = now(), updated_at = now() WHERE id = $1`, [reservationId]);
@@ -2367,14 +2377,14 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
       const newOrder = await client.query<{ id: string }>(
         `INSERT INTO orders
          (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, points_earning_enabled, status,
-          parent_order_id, created_by, business_date, order_note, order_version)
+          parent_order_id, created_by, business_date, order_note, order_version, banquet_table_count)
          SELECT CASE WHEN t.status = 'DISABLED' OR EXISTS (
                   SELECT 1 FROM orders occupied WHERE occupied.table_id = source.table_id AND occupied.status = 'OPEN'
                 ) THEN NULL ELSE source.table_id END,
                 COALESCE(source.table_number_snapshot, t.number), COALESCE(source.table_name_snapshot, t.name),
                 source.customer_id, source.guest_label, source.people_count, source.points_earning_enabled, 'OPEN', $1, $2,
                 source.business_date, source.order_note,
-                COALESCE((SELECT MAX(batch_no) FROM order_batches WHERE order_id = source.id), 0)
+                COALESCE((SELECT MAX(batch_no) FROM order_batches WHERE order_id = source.id), 0), source.banquet_table_count
          FROM orders source LEFT JOIN restaurant_tables t ON t.id = source.table_id WHERE source.id = $3
          RETURNING id`,
         [orderId, user.id, orderId]
