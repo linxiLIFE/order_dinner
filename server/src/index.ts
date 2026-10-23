@@ -171,32 +171,17 @@ function normalizedPhone(value: unknown): string | null {
   return normalizeCustomerPhone(value);
 }
 
-async function findOrCreateCustomer(client: DbClient, phone: string, name: string | null): Promise<string> {
+async function findOrCreateCustomer(client: DbClient, phone: string, name: string | null, forceNew = false): Promise<string> {
   await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`customer-phone:${phone}`]);
-  const digits = `regexp_replace(phone, '[^0-9]', '', 'g')`;
-  const matches = await client.query<{ id: string; phone: string }>(
-    `SELECT id, phone FROM customers
-     WHERE CASE
-       WHEN ${digits} LIKE '0086%' THEN substring(${digits} FROM 5)
-       WHEN length(${digits}) = 13 AND ${digits} LIKE '86%' THEN substring(${digits} FROM 3)
-       ELSE ${digits}
-     END = $1
-     FOR UPDATE`,
-    [phone]
-  );
-  if (matches.rows.length > 1) fail("该手机号存在多条旧顾客档案，请先核对后再开台", 409);
-  if (matches.rows[0]) {
-    const updated = await client.query<{ id: string }>(
-      `UPDATE customers SET phone = $1, name = COALESCE($2, name), updated_at = now()
-       WHERE id = $3 RETURNING id`,
-      [phone, name, matches.rows[0].id]
-    );
-    return updated.rows[0].id;
+  if (!forceNew) {
+    const matches = await client.query<{ id: string }>(
+      `SELECT id FROM customers WHERE phone = $1 AND ($2::text IS NULL OR name = $2) FOR UPDATE`, [phone, name]);
+    if (matches.rows.length > 1) fail("该尾号有多位顾客，请选择顾客姓名", 409);
+    if (matches.rows[0]) return matches.rows[0].id;
   }
+  if (!name) fail("新顾客请输入姓名");
   const inserted = await client.query<{ id: string }>(
-    `INSERT INTO customers (phone, name) VALUES ($1, $2) RETURNING id`,
-    [phone, name]
-  );
+    `INSERT INTO customers (phone, name) VALUES ($1, $2) RETURNING id`, [phone, name]);
   return inserted.rows[0].id;
 }
 
@@ -377,6 +362,7 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     customer_name: string | null;
     customer_phone: string | null;
     points_balance: number | null;
+    points_earning_enabled: boolean;
     guest_label: string | null;
     people_count: number;
     banquet_table_count: number | null;
@@ -422,6 +408,8 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
      WHERE reservation.order_id = $1`,
     [orderId]
   );
+  const banquetContact = await client.query<{ customer_phone: string | null; customer_name: string }>(
+    `SELECT customer_phone, customer_name FROM banquet_reservations WHERE order_id = $1 LIMIT 1`, [orderId]);
   const banquetPreorder = await client.query<{ pending_print: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM banquet_reservations reservation
@@ -458,8 +446,9 @@ async function orderDetails(client: DbClient, orderId: string, includeFinancialD
     tableNumber: order.table_number,
     tableName: order.table_name,
     customer: order.customer_id
-      ? { id: order.customer_id, name: order.customer_name, phone: maskPhone(order.customer_phone), points: order.points_balance }
-      : { id: null, name: order.guest_label || "散客", phone: null, points: 0 },
+      ? { id: order.customer_id, name: order.guest_label ?? order.customer_name, phone: maskPhone(order.customer_phone), points: order.points_balance }
+      : { id: null, name: order.guest_label || "散客", phone: order.status === "OPEN" ? banquetContact.rows[0]?.customer_phone || null : null, points: 0 },
+    pointsEarningEnabled: order.points_earning_enabled,
     peopleCount: order.people_count,
     banquetTableCount: order.banquet_table_count,
     status: order.status,
@@ -2131,12 +2120,46 @@ app.post("/api/orders/:orderId/checkout", requireAuth, async (req: Authenticated
     const requestPayload = idempotencyPayload(req.body);
     const receiptCopies = requestPayload.receiptCopies === undefined
       ? 1
-      : requirePositiveInteger(requestPayload.receiptCopies, "小票打印份数必须在1到20份之间", 20);
+      : requireNonNegativeInteger(requestPayload.receiptCopies, "小票打印份数必须在0到20份之间", 20);
     const response = await withTransaction(async (client) => {
       const previous = await readIdempotent(client, `checkout:${orderId}`, requestKey, user.id, requestPayload, user.role === "OWNER");
       if (previous) return previous;
       const order = await currentOrder(client, orderId, true);
       if (order.status !== "OPEN") fail("订单已结账或已撤销，请刷新后操作");
+      // Customer reassignment and points settlement share the same transaction and idempotency key.
+      if (requestPayload.phone !== undefined || requestPayload.customerName !== undefined || requestPayload.customerId !== undefined) {
+        const existing = await client.query<{ phone: string | null; name: string | null }>(
+          `SELECT c.phone, COALESCE(o.guest_label, c.name) AS name FROM orders o
+           LEFT JOIN customers c ON c.id = o.customer_id WHERE o.id = $1`, [orderId]);
+        const phone = requestPayload.phone === undefined ? existing.rows[0].phone : normalizedPhone(requestPayload.phone);
+        if (requestPayload.customerName !== undefined && (typeof requestPayload.customerName !== "string" || requestPayload.customerName.length > 120)) fail("姓名不能超过120字");
+        let name = requestPayload.customerName === undefined ? existing.rows[0].name : text(requestPayload.customerName);
+        if (requestPayload.customerId !== undefined && requestPayload.customerId !== null) {
+          if (!z.string().uuid().safeParse(requestPayload.customerId).success) fail("请选择有效的顾客");
+          const selected = await client.query<{ id: string; phone: string; name: string | null }>(
+            `SELECT id, phone, name FROM customers WHERE id = $1 FOR UPDATE`, [requestPayload.customerId]);
+          if (!selected.rows[0] || !phone || selected.rows[0].phone !== phone) fail("顾客与手机尾号不匹配，请重新选择", 409);
+          order.customer_id = selected.rows[0].id;
+          name = selected.rows[0].name;
+        } else {
+          order.customer_id = phone ? await findOrCreateCustomer(client, phone, name || null, requestPayload.customerId === null) : null;
+        }
+        await client.query(`UPDATE orders SET customer_id = $1, guest_label = $2 WHERE id = $3`,
+          [order.customer_id, name || "", orderId]);
+      }
+      if (requestPayload.pointsEarningEnabled !== undefined) {
+        if (typeof requestPayload.pointsEarningEnabled !== "boolean") fail("积分累计选择不正确");
+        order.points_earning_enabled = requestPayload.pointsEarningEnabled;
+        await client.query(`UPDATE orders SET points_earning_enabled = $1 WHERE id = $2`, [order.points_earning_enabled, orderId]);
+      }
+      if (requestPayload.peopleCount !== undefined) {
+        const people = requirePositiveInteger(requestPayload.peopleCount, "人数格式不正确", 100000);
+        await client.query(`UPDATE orders SET people_count = $1 WHERE id = $2`, [people, orderId]);
+      }
+      if (requestPayload.orderNote !== undefined) {
+        if (typeof requestPayload.orderNote !== "string" || requestPayload.orderNote.length > 500) fail("备注不能超过500字");
+        await client.query(`UPDATE orders SET order_note = $1 WHERE id = $2`, [text(requestPayload.orderNote), orderId]);
+      }
       const outstandingDraft = await client.query<{ has_draft: boolean }>(
         `SELECT jsonb_array_length(draft_lines) > 0 AS has_draft FROM orders WHERE id = $1`, [orderId]
       );
@@ -2838,6 +2861,16 @@ app.get("/api/customers/search", requireAuth, async (req, res) => {
   } catch (error) {
     publicError(res, error);
   }
+});
+
+app.get("/api/customers/phone-tail/:tail", requireAuth, async (req, res) => {
+  try {
+    const tail = routeParam(req, "tail");
+    if (!/^\d{4}$/.test(tail)) fail("请输入手机4位尾号");
+    const result = await pool.query(`SELECT id, name, points_balance FROM customers WHERE phone = $1 ORDER BY name NULLS LAST, created_at, id`, [tail]);
+    // The legacy singular field is safe only when the tail has one candidate.
+    res.json({ customers: result.rows, customer: result.rows.length === 1 ? result.rows[0] : null });
+  } catch (error) { publicError(res, error); }
 });
 
 app.get("/api/customers/:customerId", requireAuth, async (req, res) => {

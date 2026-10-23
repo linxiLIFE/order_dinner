@@ -44,8 +44,8 @@ export function normalizeCustomerPhone(value: unknown): string | null {
   } else if (digits.length === 13 && digits.startsWith("86")) {
     digits = digits.slice(2);
   }
-  if (digits.length < 7 || digits.length > 15) throw new InputError("手机号格式不正确");
-  return digits;
+  if (digits.length !== 4 && (digits.length < 7 || digits.length > 15)) throw new InputError("请输入手机4位尾号");
+  return digits.slice(-4);
 }
 
 export function requirePositiveInteger(value: unknown, message: string, max = 2_147_483_647): number {

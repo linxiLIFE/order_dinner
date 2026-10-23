@@ -596,7 +596,7 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   assert.equal(banquetDeposit.status, 201, JSON.stringify(banquetDeposit.body));
   const banquetCheckout = await request(`/api/orders/${converted.body.orderId}/checkout`, { token: ownerToken,
     body: { receivedFen: 24 * ownerDish.price_fen - 100, paymentMethod: "现金", usePoints: false, receiptCopies: 1, idempotencyKey: randomUUID() } });
-  assert.equal(banquetCheckout.status, 201, JSON.stringify(banquetCheckout.body));
+  assert.equal(banquetCheckout.status, 200, JSON.stringify(banquetCheckout.body));
   assert.equal(banquetCheckout.body.order.settlements[0].deposit_applied_fen, 100);
   assert.equal(banquetCheckout.body.order.settlements[0].earned_points, 0);
   const banquetReceipt = await appPool.query(`SELECT payload FROM print_jobs WHERE order_id = $1 AND kind = 'RECEIPT'`, [converted.body.orderId]);
@@ -613,6 +613,140 @@ test("PostgreSQL 集成回归：并发开台、幂等加菜、撤销重结、打
   assert.equal(Object.hasOwn(cashierOrder.body.order.totals, "costFen"), false);
 
   assert.equal((await request("/api/business-ai/chats", {token:cashierLogin.body.token})).status,403);
+
+  await t.test("结账顾客信息：尾号、改名、清空、积分选择和失败回滚", async () => {
+    const createdTable = await request("/api/tables", { token: ownerToken,
+      body: { number: tableNumber + 4, name: "结账尾号测试桌", seats: 6 } });
+    assert.equal(createdTable.status, 201, JSON.stringify(createdTable.body));
+    const checkoutTable = createdTable.body.tableId;
+    const makeOrder = async () => {
+      const opened = await request(`/api/tables/${checkoutTable}/open`, { token: ownerToken,
+        body: { people: 2, idempotencyKey: randomUUID() } });
+      assert.equal(opened.status, 201, JSON.stringify(opened.body));
+      assert.equal(opened.body.order.customer.id, null);
+      const added = await request(`/api/orders/${opened.body.order.id}/items`, { token: ownerToken,
+        body: { items: [{ dishId: ownerDish.id, quantity: 1 }], copies: 0, idempotencyKey: randomUUID() } });
+      assert.equal(added.status, 201, JSON.stringify(added.body));
+      return opened.body.order.id;
+    };
+    const id = await makeOrder();
+    const payload = { phone: "0012", customerName: "尾号测试顾客", pointsEarningEnabled: true,
+      peopleCount: 4, orderNote: "结账修改备注", receivedFen: ownerDish.price_fen,
+      paymentMethod: "现金", usePoints: false, receiptCopies: 1, idempotencyKey: randomUUID() };
+    const failed = await request(`/api/orders/${id}/checkout`, { token: ownerToken,
+      body: { ...payload, receivedFen: 1 } });
+    assert.equal(failed.status, 400, JSON.stringify(failed.body));
+    assert.equal((await appPool.query(`SELECT customer_id FROM orders WHERE id=$1`, [id])).rows[0].customer_id, null);
+    const settled = await request(`/api/orders/${id}/checkout`, { token: ownerToken, body: payload });
+    assert.equal(settled.status, 200, JSON.stringify(settled.body));
+    assert.equal(settled.body.order.customer.phone, "0012");
+    assert.equal(settled.body.order.peopleCount, 4);
+    assert.equal(settled.body.order.orderNote, "结账修改备注");
+    assert.ok(settled.body.order.settlements[0].earned_points > 0);
+    const replay = await request(`/api/orders/${id}/checkout`, { token: ownerToken, body: payload });
+    assert.equal(replay.body.settlement.id, settled.body.settlement.id);
+    const lookup = await request("/api/customers/phone-tail/0012", { token: ownerToken });
+    assert.equal(lookup.body.customer.points_balance, settled.body.settlement.pointsBalance);
+    assert.equal((await appPool.query(`SELECT phone FROM customers WHERE id=$1`, [settled.body.order.customer.id])).rows[0].phone, "0012");
+
+    const booking = await request("/api/banquets/reservations", { token: ownerToken,
+      body: { tableId: checkoutTable, startsAt, endsAt, peopleCount: 6, tableCount: 2,
+        customerName: "预订姓名", customerPhone: "0012", pointsEarningEnabled: false, idempotencyKey: randomUUID() } });
+    assert.equal(booking.status, 201, JSON.stringify(booking.body));
+    const converted = await request(`/api/banquets/reservations/${booking.body.reservation.id}/convert`, {
+      token: ownerToken, body: { idempotencyKey: randomUUID() } });
+    assert.equal(converted.status, 201, JSON.stringify(converted.body));
+    const banquetId = converted.body.orderId;
+    await request(`/api/orders/${banquetId}/items`, { token: ownerToken,
+      body: { items: [{ dishId: ownerDish.id, quantity: 1 }], copies: 0, idempotencyKey: randomUUID() } });
+    const changed = await request(`/api/orders/${banquetId}/checkout`, { token: ownerToken,
+      body: { ...payload, phone: "9876", customerName: "结账姓名", pointsEarningEnabled: true, idempotencyKey: randomUUID() } });
+    assert.equal(changed.status, 200, JSON.stringify(changed.body));
+    assert.equal(changed.body.order.customer.phone, "9876");
+    assert.equal(changed.body.order.customer.name, "结账姓名");
+    assert.ok(changed.body.order.settlements[0].earned_points > 0);
+    assert.equal((await request("/api/customers/phone-tail/0012", { token: ownerToken })).body.customer.points_balance, lookup.body.customer.points_balance);
+
+    const reopened = await request(`/api/orders/${banquetId}/reopen`, { token: ownerToken,
+      body: { reason: "核对顾客", idempotencyKey: randomUUID() } });
+    assert.equal(reopened.status, 200, JSON.stringify(reopened.body));
+    const reopenedId = reopened.body.order.id;
+    const cleared = await request(`/api/orders/${reopenedId}/checkout`, { token: ownerToken,
+      body: { ...payload, phone: "", customerName: "", pointsEarningEnabled: false, idempotencyKey: randomUUID() } });
+    assert.equal(cleared.status, 200, JSON.stringify(cleared.body));
+    assert.equal(cleared.body.order.customer.id, null);
+    assert.equal(cleared.body.order.settlements[0].earned_points, 0);
+
+    const noEarnId = await makeOrder();
+    for (const receiptCopies of [-1, 1.5, 21]) {
+      const invalid = await request(`/api/orders/${noEarnId}/checkout`, { token: ownerToken,
+        body: { ...payload, receiptCopies, idempotencyKey: randomUUID() } });
+      assert.equal(invalid.status, 400);
+    }
+    const noEarn = await request(`/api/orders/${noEarnId}/checkout`, { token: ownerToken,
+      body: { ...payload, pointsEarningEnabled: false, receiptCopies: 0, idempotencyKey: randomUUID() } });
+    assert.equal(noEarn.status, 200, JSON.stringify(noEarn.body));
+    assert.equal(noEarn.body.order.customer.phone, "0012");
+    assert.equal(noEarn.body.order.settlements[0].earned_points, 0);
+    assert.equal((await appPool.query(`SELECT count(*)::int AS n FROM print_jobs WHERE order_id=$1 AND kind='RECEIPT'`, [noEarnId])).rows[0].n, 0);
+    assert.equal(noEarn.body.order.status, "SETTLED");
+
+    // Same tail, separate profiles: only the explicitly selected customer receives points.
+    const originalCustomerId = settled.body.order.customer.id;
+    const originalPoints = (await appPool.query(`SELECT points_balance FROM customers WHERE id=$1`, [originalCustomerId])).rows[0].points_balance;
+    const secondOrderId = await makeOrder();
+    const missingName = await request(`/api/orders/${secondOrderId}/checkout`, { token: ownerToken,
+      body: { ...payload, customerId: null, customerName: "", idempotencyKey: randomUUID() } });
+    assert.equal(missingName.status, 400);
+    const secondPayload = { ...payload, customerId: null, customerName: "同尾号另一位", receiptCopies: 0, idempotencyKey: randomUUID() };
+    const second = await request(`/api/orders/${secondOrderId}/checkout`, { token: ownerToken, body: secondPayload });
+    assert.equal(second.status, 200, JSON.stringify(second.body));
+    const secondCustomerId = second.body.order.customer.id;
+    assert.notEqual(secondCustomerId, originalCustomerId);
+    const secondReplay = await request(`/api/orders/${secondOrderId}/checkout`, { token: ownerToken, body: secondPayload });
+    assert.equal(secondReplay.body.order.customer.id, secondCustomerId);
+    const duplicates = await request("/api/customers/phone-tail/0012", { token: ownerToken });
+    assert.equal(duplicates.body.customers.length, 2);
+    assert.equal(duplicates.body.customer, null);
+    assert.deepEqual(new Set(duplicates.body.customers.map(c => c.name)), new Set(["尾号测试顾客", "同尾号另一位"]));
+    assert.equal((await appPool.query(`SELECT points_balance FROM customers WHERE id=$1`, [originalCustomerId])).rows[0].points_balance, originalPoints);
+    const secondPoints = second.body.order.customer.points;
+    const selectedOrderId = await makeOrder();
+    const ambiguous = await request(`/api/orders/${selectedOrderId}/checkout`, { token: ownerToken,
+      body: { ...payload, customerName: "", idempotencyKey: randomUUID() } });
+    assert.equal(ambiguous.status, 409);
+    const mismatch = await request(`/api/orders/${selectedOrderId}/checkout`, { token: ownerToken,
+      body: { ...payload, phone: "5555", customerId: originalCustomerId, idempotencyKey: randomUUID() } });
+    assert.equal(mismatch.status, 409);
+    const selected = await request(`/api/orders/${selectedOrderId}/checkout`, { token: ownerToken,
+      body: { ...payload, customerId: originalCustomerId, customerName: "不能覆盖旧姓名", receiptCopies: 0, idempotencyKey: randomUUID() } });
+    assert.equal(selected.status, 200, JSON.stringify(selected.body));
+    assert.equal(selected.body.order.customer.name, "尾号测试顾客");
+    assert.equal(selected.body.order.customer.id, originalCustomerId);
+    assert.equal((await appPool.query(`SELECT points_balance FROM customers WHERE id=$1`, [secondCustomerId])).rows[0].points_balance, secondPoints);
+
+    const sameTailBooking = await request("/api/banquets/reservations", { token: ownerToken,
+      body: { tableId: checkoutTable, startsAt, endsAt, peopleCount: 6, tableCount: 2,
+        customerName: "同尾号另一位", customerPhone: "0012", idempotencyKey: randomUUID() } });
+    assert.equal(sameTailBooking.status, 201, JSON.stringify(sameTailBooking.body));
+    const sameTailConverted = await request(`/api/banquets/reservations/${sameTailBooking.body.reservation.id}/convert`, {
+      token: ownerToken, body: { idempotencyKey: randomUUID() } });
+    assert.equal(sameTailConverted.status, 201, JSON.stringify(sameTailConverted.body));
+    const sameTailOrderId = sameTailConverted.body.orderId;
+    const contactOrder = await request(`/api/orders/${sameTailOrderId}`, { token: ownerToken });
+    assert.equal(contactOrder.body.order.customer.phone, "0012");
+    assert.equal(contactOrder.body.order.customer.id, null, "宴席开台不应凭尾号分配积分档案");
+    await request(`/api/orders/${sameTailOrderId}/items`, { token: ownerToken,
+      body: { items: [{ dishId: ownerDish.id, quantity: 1 }], copies: 0, idempotencyKey: randomUUID() } });
+    const banquetSelected = await request(`/api/orders/${sameTailOrderId}/checkout`, { token: ownerToken,
+      body: { ...payload, customerId: secondCustomerId, customerName: "", receiptCopies: 0, idempotencyKey: randomUUID() } });
+    assert.equal(banquetSelected.status, 200, JSON.stringify(banquetSelected.body));
+    assert.equal(banquetSelected.body.order.customer.id, secondCustomerId);
+    assert.equal(banquetSelected.body.order.customer.name, "同尾号另一位");
+
+  });
+
+
 
   const changedCashierPassword = `${cashierPassword}new`;
   const badPasswordChange = await request("/api/auth/change-password", {

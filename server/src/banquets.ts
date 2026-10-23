@@ -233,31 +233,7 @@ export async function commitBanquetDraft(client: DbClient, reservationId: string
   return true;
 }
 
-async function findOrCreateCustomer(client: DbClient, phone: string, name: string | null): Promise<string> {
-  await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`customer-phone:${phone}`]);
-  const digits = `regexp_replace(phone, '[^0-9]', '', 'g')`;
-  const matches = await client.query<{ id: string }>(
-    `SELECT id FROM customers
-     WHERE CASE
-       WHEN ${digits} LIKE '0086%' THEN substring(${digits} FROM 5)
-       WHEN length(${digits}) = 13 AND ${digits} LIKE '86%' THEN substring(${digits} FROM 3)
-       ELSE ${digits}
-     END = $1 FOR UPDATE`,
-    [phone]
-  );
-  if (matches.rows.length > 1) reject("该手机号存在多条旧顾客档案，请先核对后再开宴席", 409);
-  if (matches.rows[0]) {
-    const updated = await client.query<{ id: string }>(
-      `UPDATE customers SET phone = $1, name = COALESCE($2, name), updated_at = now() WHERE id = $3 RETURNING id`,
-      [phone, name, matches.rows[0].id]
-    );
-    return updated.rows[0].id;
-  }
-  const inserted = await client.query<{ id: string }>(
-    `INSERT INTO customers (phone, name) VALUES ($1, $2) RETURNING id`, [phone, name]
-  );
-  return inserted.rows[0].id;
-}
+
 
 type OptionGroup = { id: string; name: string; required: boolean; allow_multiple: boolean; options: Array<{ id: string; label: string }> };
 
@@ -941,8 +917,8 @@ async function convertReservationToOrder(client: DbClient, reservationId: string
       } else if (!reservation.hall_id) {
         reject("该宴席没有绑定桌台，请重新建立预定", 409);
       }
-      const phone = normalizeCustomerPhone(reservation.customer_phone);
-      const customerId = phone ? await findOrCreateCustomer(client, phone, reservation.customer_name || null) : null;
+      // Reservation contact is not proof of customer identity; choose the profile at checkout.
+      const customerId: string | null = null;
       const orderResult = await client.query<{ id: string }>(
         `INSERT INTO orders
          (table_id, table_number_snapshot, table_name_snapshot, customer_id, guest_label, people_count, created_by, order_note, points_earning_enabled, banquet_table_count)

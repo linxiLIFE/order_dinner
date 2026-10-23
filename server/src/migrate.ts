@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS customers (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- A phone tail identifies a candidate set, never a unique customer.
+ALTER TABLE customers DROP CONSTRAINT IF EXISTS customers_phone_key;
+CREATE INDEX IF NOT EXISTS customers_phone_idx ON customers(phone);
+
 CREATE TABLE IF NOT EXISTS categories (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name text NOT NULL UNIQUE,

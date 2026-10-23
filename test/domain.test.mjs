@@ -32,13 +32,15 @@ test("收银员重放旧幂等响应时也会递归隐藏历史成本和毛利�
   });
 });
 
-test("手机号先做国家区号与分隔符归一化，并拒绝只有标点的输入", () => {
-  assert.equal(normalizeCustomerPhone("+86 138-1234-5678"), "13812345678");
-  assert.equal(normalizeCustomerPhone("86 138 1234 5678"), "13812345678");
-  assert.equal(normalizeCustomerPhone("0086 (138) 1234 5678"), "13812345678");
-  assert.equal(normalizeCustomerPhone("00 (86) 138 1234 5678"), "13812345678");
-  assert.equal(normalizeCustomerPhone("861234567"), "861234567");
-  assert.equal(normalizeCustomerPhone("13812345678"), "13812345678");
+test("手机号仅保留四位尾号，兼容旧客户端并拒绝无效输入", () => {
+  assert.equal(normalizeCustomerPhone("+86 138-1234-5678"), "5678");
+  assert.equal(normalizeCustomerPhone("86 138 1234 5678"), "5678");
+  assert.equal(normalizeCustomerPhone("0086 (138) 1234 5678"), "5678");
+  assert.equal(normalizeCustomerPhone("00 (86) 138 1234 5678"), "5678");
+  assert.equal(normalizeCustomerPhone("861234567"), "4567");
+  assert.equal(normalizeCustomerPhone("13812345678"), "5678");
+  assert.equal(normalizeCustomerPhone("0012"), "0012");
+  for (const value of ["123", "12345", "12ab", "123456"]) assert.throws(() => normalizeCustomerPhone(value));
   assert.equal(normalizeCustomerPhone(undefined), null);
   assert.equal(normalizeCustomerPhone(null), null);
   assert.equal(normalizeCustomerPhone("散客"), null);

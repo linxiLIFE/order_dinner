@@ -626,3 +626,7 @@ input[type="range"].font-size-range { width: 100%; min-height: 0; margin: 0; pad
 .banquet-quantity-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; padding: 10px 16px; margin-bottom: 12px; border-radius: 10px; background: #fff3d8; color: #714a0a; }
 .banquet-quantity-notice strong { font-size: 22px; }
 .banquet-quantity-notice span { font-size: 14px; }
+
+.checkout-customer-field { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.checkout-customer-balance { font-size: 13px; color: #64748b; }
+.checkout-customer-balance strong { color: #2563eb; font-variant-numeric: tabular-nums; }
