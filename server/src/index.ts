@@ -346,7 +346,7 @@ async function orderItems(client: DbClient, orderId: string): Promise<ItemRow[]>
      FROM order_items oi
      JOIN order_batches ob ON ob.id = oi.batch_id
      WHERE oi.order_id = $1
-     ORDER BY ob.batch_no, oi.created_at, oi.id`,
+     ORDER BY ob.batch_no, oi.batch_position NULLS LAST, oi.created_at, oi.id`,
     [orderId]
   );
   return result.rows;
@@ -802,7 +802,8 @@ function printOrderPayload(order: Record<string, unknown>, items: Array<Record<s
       quantity: item.quantity,
       unit: item.unit,
       priceFen: Number(item.priceFen ?? item.price_fen ?? 0),
-      note: item.note || ""
+      note: item.note || "",
+      ...(item.returnedQuantity === undefined ? {} : { returnedQuantity: item.returnedQuantity })
     }))
   };
 }
@@ -993,7 +994,8 @@ function buildPrinterLines(kind: "KITCHEN" | "RETURN" | "RECEIPT", payload: Reco
     const note = receipt ? "" : printerItemNote(item.note);
     if (receipt) {
       const unitPriceFen = Number(item.priceFen ?? item.price_fen ?? 0);
-      const subtotalFen = unitPriceFen * quantity;
+      const returnedQuantity = Number(item.returnedQuantity) || 0;
+      const subtotalFen = unitPriceFen * Math.max(0, quantity - returnedQuantity);
       const nameLines = wrapPrinterText(name, RECEIPT_DISH_COLUMNS / 2);
       const values = receiptRow("", quantityLabel, printerMoney(unitPriceFen), printerMoney(subtotalFen)).slice(RECEIPT_DISH_COLUMNS);
       pushSegments([
@@ -1773,7 +1775,7 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
         [orderId, order.order_version + 1, order.order_version === 0 ? "INITIAL" : "ADD", user.id]
       );
       const inserted: Array<Record<string, unknown>> = [];
-      for (const raw of rawItems) {
+      for (const [position, raw] of rawItems.entries()) {
         const dishId = text(raw?.dishId);
         const quantity = requirePositiveInteger(raw?.quantity, "菜品数量不正确", 100_000);
         if (!dishId || quantity < 1) fail("菜品数量不正确");
@@ -1801,10 +1803,10 @@ app.post("/api/orders/:orderId/items", requireAuth, async (req: AuthenticatedReq
         const options = optionSelections(groups, raw?.options, raw?.note);
         const item = await client.query<{ id: string }>(
           `INSERT INTO order_items
-           (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, points_earning_enabled, quantity, note, option_snapshot)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb) RETURNING id`,
+           (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, points_earning_enabled, quantity, note, option_snapshot, batch_position)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13) RETURNING id`,
           [batch.rows[0].id, orderId, dish.id, dish.name, dish.category_name || "未分类", dish.unit, dish.price_fen, dish.cost_fen,
-            dish.points_earning_enabled !== false, quantity, options.note, JSON.stringify(options.snapshot)]
+            dish.points_earning_enabled !== false, quantity, options.note, JSON.stringify(options.snapshot), position + 1]
         );
         inserted.push({ id: item.rows[0].id, name: dish.name, unit: dish.unit, priceFen: dish.price_fen, quantity, note: options.note });
       }
@@ -2434,18 +2436,18 @@ app.post("/api/orders/:orderId/reopen", requireAuth, requireRole("OWNER"), async
         );
         batchIds.set(batch.id, copied.rows[0].id);
       }
-      const oldItems = await client.query<ItemRow>(`SELECT * FROM order_items WHERE order_id = $1 ORDER BY created_at, id`, [orderId]);
-      for (const item of oldItems.rows) {
+      const oldItems = await orderItems(client, orderId);
+      for (const [position, item] of oldItems.entries()) {
         const copiedBatchId = batchIds.get(item.batch_id);
         if (!copiedBatchId) continue;
         await client.query(
           `INSERT INTO order_items
            (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, points_earning_enabled, quantity,
-            gifted_quantity, returned_quantity, returned_made_quantity, note, option_snapshot)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb)`,
+            gifted_quantity, returned_quantity, returned_made_quantity, note, option_snapshot, batch_position)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16)`,
           [copiedBatchId, newOrderId, item.dish_id, item.dish_name, item.category_name, item.unit, item.price_fen, item.cost_fen,
             item.points_earning_enabled !== false, item.quantity, item.gifted_quantity, item.returned_quantity,
-            item.returned_made_quantity, item.note, JSON.stringify(item.option_snapshot || [])]
+            item.returned_made_quantity, item.note, JSON.stringify(item.option_snapshot || []), position + 1]
         );
       }
       await logOperation(client, user.id, "REOPEN_ORDER", "ORDER", orderId, { newOrderId, settlementId: settlement.id });

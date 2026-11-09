@@ -180,6 +180,18 @@ label small { color: var(--muted); font-size: 0.75rem; }
 .banquet-print-pending span { color: #735c2c; font-size: .8125rem; line-height: 1.5; }
 .order-total { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px; padding: 17px 18px; }
 .order-total strong { font-size: 1.6875rem; color: var(--primary-dark); margin-left: auto; }
+.order-total-label { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.order-total-label .order-dish-count {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--primary-light, #e8f1f8);
+  color: var(--primary-dark);
+  font-size: 1rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+  white-space: nowrap;
+}
 .order-total small { width: 100%; color: var(--muted); font-size: 0.75rem; }
 .order-margin { width: 100%; color: #47545f; font-size: 0.8125rem; display: flex; justify-content: space-between; align-items: baseline; }
 .order-margin strong { color: var(--green); font-size: 1.0625rem; margin-left: 0; }

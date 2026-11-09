@@ -323,6 +323,26 @@ export async function migrateAndSeed(): Promise<void> {
   await pool.query(`ALTER TABLE categories ADD COLUMN IF NOT EXISTS points_earning_enabled boolean NOT NULL DEFAULT true`);
   await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS points_earning_enabled boolean NOT NULL DEFAULT true`);
   await pool.query(`ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS manual_requested_at timestamptz`);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'order_items'::regclass AND attname = 'batch_position' AND NOT attisdropped
+      ) THEN
+        ALTER TABLE order_items ADD COLUMN batch_position integer;
+        -- Recover the original submission order where the add-items log is still available.
+        UPDATE order_items AS item
+        SET batch_position = logged.position
+        FROM operation_logs AS log
+        CROSS JOIN LATERAL jsonb_array_elements(
+          CASE WHEN jsonb_typeof(log.detail->'items') = 'array' THEN log.detail->'items' ELSE '[]'::jsonb END
+        ) WITH ORDINALITY AS logged(entry, position)
+        WHERE log.action = 'ADD_ITEMS' AND log.entity_type = 'ORDER'
+          AND item.order_id = log.entity_id AND item.id::text = logged.entry->>'id';
+      END IF;
+    END $$;
+  `);
   await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS auth_version integer NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS payload_hash text`);
 

@@ -943,13 +943,13 @@ async function convertReservationToOrder(client: DbClient, reservationId: string
         const batch = await client.query<{ id: string }>(
           `INSERT INTO order_batches (order_id, batch_no, kind, created_by) VALUES ($1, 1, 'INITIAL', $2) RETURNING id`, [orderId, employeeId]
         );
-        for (const item of preorder) {
+        for (const [position, item] of preorder.entries()) {
           await client.query(
             `INSERT INTO order_items
-             (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, points_earning_enabled, quantity, note, option_snapshot)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)`,
+             (batch_id, order_id, dish_id, dish_name, category_name, unit, price_fen, cost_fen, points_earning_enabled, quantity, note, option_snapshot, batch_position)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)`,
             [batch.rows[0].id, orderId, item.dishId, item.name, item.categoryName || "未分类", item.unit || "份", item.priceFen,
-              item.costFen || 0, item.pointsEarningEnabled !== false, banquetQuantity(item.quantity, reservation.table_count), item.note || "", JSON.stringify(item.optionSnapshot || [])]
+              item.costFen || 0, item.pointsEarningEnabled !== false, banquetQuantity(item.quantity, reservation.table_count), item.note || "", JSON.stringify(item.optionSnapshot || []), position + 1]
           );
         }
         await client.query(`UPDATE orders SET order_version = 1, updated_at = now() WHERE id = $1`, [orderId]);
